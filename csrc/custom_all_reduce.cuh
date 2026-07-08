@@ -248,13 +248,20 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
-    // Latency = 1 p2p write
+    // Latency = 1 p2p write.
+    // RDNA3/PCIe: publish this ranks input-buffer writes (from the preceding
+    // kernel) to peer-visible memory BEFORE raising the ready flag, else a peer
+    // can observe the flag while our data is still in the write-combine buffer
+    // and read stale input, giving a wrong reduction.
+    __threadfence_system();
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
                             flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    // also flush the flag store itself out of the write-combine buffer
+    __threadfence_system();
     // wait until we got true from all ranks
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                   __ATOMIC_RELAXED,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
+                                  __MEMORY_SCOPE_SYSTEM) < flag);
   }
   __syncthreads();
   // use one thread to update flag
@@ -267,16 +274,18 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
-    // Latency = 1 p2p write
+    // Latency = 1 p2p write. Publish partials before raising the flag (RDNA3).
+    __threadfence_system();
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
                             flag,
                             final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
                             __MEMORY_SCOPE_SYSTEM);
+    __threadfence_system();
     // wait until we got true from all ranks
     while (
         __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                               __MEMORY_SCOPE_DEVICE) < flag);
+                               __MEMORY_SCOPE_SYSTEM) < flag);
   }
   if constexpr (!final_sync) __syncthreads();
   // use one thread to update flag
