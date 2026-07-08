@@ -16,6 +16,7 @@ transposes tiles in-register). No dual weight storage.
 from contextlib import nullcontext
 
 import torch
+import os
 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
@@ -311,6 +312,24 @@ def triton_w4a16_skinny_fmt_gemm(
             f"zp shape mismatch: {zp.shape} vs ({N}, {num_groups})"
         )
     has_zp = zp is not None
+
+    # gfx1100 WMMA fused int4-dequant GEMM: fastest batched-decode path for
+    # 8<=M<=64 with 64-aligned K. Wins the per-layer GEMM aggregate ~5-13% vs
+    # the bigbk Triton path (down/qkv/o win, gate_up ~parity at M>=24). Gated so
+    # single-stream (skinny, M<=5), prefill, and other GPUs never reach it.
+    if (
+        8 <= M <= 64
+        and group_size in (32, 64, 128)
+        and K % 64 == 0
+        and N % 16 == 0
+        and _on_gfx1x()
+        and not _on_gfx12x()
+        and not _on_gfx1151()
+        and os.environ.get("VLLM_W4A16_NO_WMMA") != "1"
+    ):
+        import vllm._custom_ops as _ops
+        if hasattr(_ops, "wvSplitK_int4_wmma"):
+            return _ops.wvSplitK_int4_wmma(b_q, a, scales, group_size, zp, None)
 
     # gfx1100 batched-decode fast path (isolated: prefill / other GPUs / single
     # stream are unaffected). Bigger BLOCK_K recovers ~1.15-1.35x here.
