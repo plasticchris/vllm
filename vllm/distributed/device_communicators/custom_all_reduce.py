@@ -192,6 +192,11 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
+        # RDNA3 (gfx11) reaches peers over PCIe P2P. The registered graph-buffer
+        # path (get_graph_buffer_ipc_meta base-addr + offset) resolves wrong
+        # peer pointers under cudagraph replay there, so we use the copy path.
+        self._rdna3 = current_platform.is_rocm() and "gfx11" in getattr(
+            torch.cuda.get_device_properties(self.device), "gcnArchName", "")
 
     @contextmanager
     def capture(self):
@@ -268,7 +273,10 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                # On RDNA3 the registered graph-buffer path corrupts output
+                # (see __init__); use the copy path there. Elsewhere keep the
+                # zero-copy registered path.
+                return self.all_reduce(input, registered=not self._rdna3)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
