@@ -34,6 +34,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int group_size) -> Tensor");
   rocm_ops.impl("wvSplitK_int4_g", torch::kCUDA, &wvSplitK_int4_g);
 
+  // W4A16 fused int4-dequant WMMA GEMM for gfx1100 batched decode (M=8..64)
+  rocm_ops.def(
+      "wvSplitK_int4_wmma(Tensor weight, Tensor activation, Tensor scale, "
+      "Tensor? zero_points, Tensor? bias, int group_size) -> Tensor");
+  rocm_ops.impl("wvSplitK_int4_wmma", torch::kCUDA, &wvSplitK_int4_wmma);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitKrc(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "
