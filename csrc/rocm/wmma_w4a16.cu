@@ -90,7 +90,8 @@ template <typename T, int WM, int WN, int NB>
 __global__ void __launch_bounds__(WM * WN * 32)
     wmma_w4a16_kernel(const int* __restrict__ Wpk, const T* __restrict__ A,
                       const T* __restrict__ scale, const T* __restrict__ zp,
-                      float* __restrict__ Cf32, int M, int N, int K, int gs, int nksteps) {
+                      float* __restrict__ Cf32, T* __restrict__ Cdirect,
+                      const T* __restrict__ biasp, int M, int N, int K, int gs, int nksteps) {
   using E = typename Nat<T>::E;
   using V = typename Nat<T>::V;
   constexpr int BN = WN * NB * 16;
@@ -209,7 +210,15 @@ __global__ void __launch_bounds__(WM * WN * 32)
 #pragma unroll
     for (int i = 0; i < 8; i++) {
       const int gmo = tileM + wm * 16 + 2 * i + lane_hi;
-      if (gmo < M) atomicAdd(&Cf32[(size_t)gmo * N + gn], acc[j][i]);
+      if (gmo < M) {
+        if (Cdirect) {  // SK==1: single writer, store activation dtype directly
+          float v = acc[j][i];
+          if (biasp) v += to_f(biasp[gn]);
+          Cdirect[(size_t)gmo * N + gn] = (T)v;
+        } else {
+          atomicAdd(&Cf32[(size_t)gmo * N + gn], acc[j][i]);
+        }
+      }
     }
   }
 }
@@ -253,15 +262,12 @@ torch::Tensor wvSplitK_int4_wmma(const at::Tensor& weight, const at::Tensor& act
 
   auto out = torch::empty({M, N},
                           torch::TensorOptions().dtype(activation.dtype()).device(activation.device()));
-  auto acc32 = torch::zeros({M, N},
-                            torch::TensorOptions().dtype(torch::kFloat32).device(activation.device()));
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(activation));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int* wp = weight.data_ptr<int>();
   const bool has_zp = zero_points.has_value();
   const bool has_bias = bias.has_value() && bias->numel() > 0;
-  float* cf32 = acc32.data_ptr<float>();
 
   // 2D wave grid: WM waves cover M-rows, WN waves cover N (keeps ~128 threads
   // per block loading weights even when M is small). NB N-tiles per wave.
@@ -281,16 +287,29 @@ torch::Tensor wvSplitK_int4_wmma(const at::Tensor& weight, const at::Tensor& act
   const int nksteps = (nkt_total + SK - 1) / SK;
   SK = (nkt_total + nksteps - 1) / nksteps;
   dim3 grid(gx, gy, SK);
+  // SK==1 => one block writes each output element: store fp16/bf16 directly and
+  // skip the zeroed fp32 workspace, atomics, and convert pass entirely.
+  const bool direct = (SK == 1);
+  torch::Tensor acc32;
+  float* cf32 = nullptr;
+  if (!direct) {
+    acc32 = torch::zeros({M, N},
+        torch::TensorOptions().dtype(torch::kFloat32).device(activation.device()));
+    cf32 = acc32.data_ptr<float>();
+  }
 
 #define LAUNCH(T, _WM, _WN, _NB)                                               \
   do {                                                                         \
     wmma_w4a16_kernel<T, _WM, _WN, _NB><<<grid, _WM * _WN * 32, 0, stream>>>(   \
         wp, (const T*)activation.data_ptr(), (const T*)scale.data_ptr(),      \
-        has_zp ? (const T*)zero_points->data_ptr() : nullptr, cf32, M, N, K,  \
-        group_size, nksteps);                                          \
-    wmma_w4a16_convert<T><<<(M * N + 255) / 256, 256, 0, stream>>>(           \
-        cf32, has_bias ? (const T*)bias->data_ptr() : nullptr,               \
-        (T*)out.data_ptr(), M* N, N);                                         \
+        has_zp ? (const T*)zero_points->data_ptr() : nullptr, cf32,          \
+        direct ? (T*)out.data_ptr() : nullptr,                               \
+        has_bias ? (const T*)bias->data_ptr() : nullptr, M, N, K,            \
+        group_size, nksteps);                                                 \
+    if (!direct)                                                              \
+      wmma_w4a16_convert<T><<<(M * N + 255) / 256, 256, 0, stream>>>(         \
+          cf32, has_bias ? (const T*)bias->data_ptr() : nullptr,             \
+          (T*)out.data_ptr(), M* N, N);                                       \
   } while (0)
 #define DISP_NB(T, _WM, _WN)                                                   \
   do {                                                                        \
