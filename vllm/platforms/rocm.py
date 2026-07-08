@@ -218,6 +218,7 @@ _ON_GFX9 = any(arch in _GCN_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
 _ON_GFX90A = "gfx90a" in _GCN_ARCH
 _ON_GFX942 = "gfx942" in _GCN_ARCH
 _ON_GFX950 = "gfx950" in _GCN_ARCH
+_ON_GFX1151 = "gfx1151" in _GCN_ARCH
 
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
@@ -427,8 +428,13 @@ def _get_backend_priorities(
             ]
 
     backends = []
-    # Keep ROCM_ATTN disabled for KV connectors until connector transfer
-    # semantics are validated for its asymmetric native K/V cache views.
+    # ROCM_PREFER_TRITON_ATTN=1 front-loads TRITON_ATTN (3D segmented flash-
+    # decoding / split-KV) ahead of ROCM_ATTN, whose decode/prefix kernels
+    # serialize over KV and cliff on long context.
+    if os.environ.get("ROCM_PREFER_TRITON_ATTN") == "1":
+        backends.append(AttentionBackendEnum.TRITON_ATTN)
+    # ROCM_ATTN uses (2, num_blocks, ...) KV cache layout which is
+    # incompatible with KV connectors that require blocks-first layout.
     if not use_kv_connector:
         backends.append(AttentionBackendEnum.ROCM_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
@@ -462,6 +468,7 @@ class RocmPlatform(Platform):
         "awq_marlin",  # will be overwritten with awq
         "gptq",
         "auto_gptq",
+        "inc",  # AutoRound mixed-precision (delegates to gptq/awq kernels)
         "fp8",
         "deepseek_v4_fp8",
         "compressed-tensors",

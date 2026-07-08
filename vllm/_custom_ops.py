@@ -2196,7 +2196,6 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g
         CuCount: int,
         group_size: int,
     ) -> torch.Tensor:
-        # Kernel returns {in_b.size(0), in_a.size(0)} = [num_tokens, out_features].
         num_tokens = in_b.size(0)
         out_features = in_a.size(0)
         return torch.empty(
