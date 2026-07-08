@@ -186,6 +186,88 @@ _GFX1X_PREFILL_OVERRIDES: dict[tuple[int, int, int], tuple[int, int, int, int, i
 }
 
 
+@triton.jit
+def _triton_w4a16_bigbk_kernel(
+    a_ptr, b_ptr, scales_ptr, zp_ptr, c_ptr,
+    M, N, K, K8, num_groups, group_size,
+    ZP_BIAS: tl.constexpr, HAS_ZP: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """W4A16 GEMM allowing BLOCK_K > group_size by gathering the per-subgroup
+    scale/zp for each K element. Removes the BLOCK_K<=group_size clamp of
+    _triton_w4a16_skinny_fmt_kernel, giving larger K-tiles (fewer iterations,
+    better weight-load throughput) for gfx1100 batched decode. Requires
+    BLOCK_K % group_size == 0."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    exllama_shifts_row = (tl.arange(0, 8) // 2) * 4 + (tl.arange(0, 8) % 2) * 16
+    shifts_1d = tl.reshape(
+        tl.broadcast_to(exllama_shifts_row[None, :], (BLOCK_K // 8, 8)), (BLOCK_K,)
+    )
+    shifts_full = tl.broadcast_to(shifts_1d[None, :], (BLOCK_N, BLOCK_K))
+    gk = tl.arange(0, BLOCK_K) // group_size  # per-k subgroup within tile
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & mask_k[None, :], other=0.0)
+        offs_k8 = k_start * (BLOCK_K // 8) + tl.arange(0, BLOCK_K // 8)
+        b_ptrs = b_ptr + offs_n[:, None] * K8 + offs_k8[None, :]
+        b_packed = tl.load(
+            b_ptrs, mask=(offs_n[:, None] < N) & (offs_k8[None, :] < K8), other=0
+        )
+        b = tl.interleave(b_packed, b_packed)
+        b = tl.interleave(b, b)
+        b = tl.interleave(b, b)
+        b = (b >> shifts_full) & 0xF
+        g_base = (k_start * BLOCK_K) // group_size
+        s_cols = g_base + gk
+        s_mask = (offs_n[:, None] < N) & (s_cols[None, :] < num_groups)
+        s_ptrs = scales_ptr + offs_n[:, None] * num_groups + s_cols[None, :]
+        scales = tl.load(s_ptrs, mask=s_mask, other=1.0)
+        if HAS_ZP:
+            z_ptrs = zp_ptr + offs_n[:, None] * num_groups + s_cols[None, :]
+            zp_raw = tl.load(z_ptrs, mask=s_mask, other=0.0)
+            b_fp = (b.to(scales.dtype) - zp_raw) * scales
+        else:
+            b_fp = (b - ZP_BIAS).to(scales.dtype) * scales
+        accumulator += tl.dot(a, tl.trans(b_fp), out_dtype=tl.float32)
+    c = accumulator.to(c_ptr.type.element_ty)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def _bigbk_gemm(a, b_q, scales, zp, group_size, zp_bias=8):
+    """gfx1100 batched-decode path (6<=M<=64). BLOCK_K is a multiple of
+    group_size so the big-K kernel gathers scales per subgroup."""
+    M, K = a.shape
+    N = b_q.shape[0]
+    K8 = K // 8
+    num_groups = K // group_size
+    has_zp = zp is not None
+    if M <= 16:
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 16, 64, 128, 4
+    elif M <= 32:
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 32, 32, 128, 4
+    else:
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 4
+    BLOCK_K = min(BLOCK_K, (K // group_size) * group_size)  # keep multiple of gs, <=K
+    if BLOCK_K % group_size != 0 or BLOCK_K < group_size:
+        BLOCK_K = group_size
+    c = torch.empty((M, N), dtype=a.dtype, device=a.device)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _triton_w4a16_bigbk_kernel[grid](
+        a, b_q, scales, zp if has_zp else scales, c,
+        M, N, K, K8, num_groups, group_size,
+        ZP_BIAS=zp_bias, HAS_ZP=has_zp,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=num_warps,
+    )
+    return c
+
+
 def triton_w4a16_skinny_fmt_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
     b_q: torch.Tensor,  # [N, K//8] int32 (ExLlama shuffle packed)
@@ -229,6 +311,18 @@ def triton_w4a16_skinny_fmt_gemm(
             f"zp shape mismatch: {zp.shape} vs ({N}, {num_groups})"
         )
     has_zp = zp is not None
+
+    # gfx1100 batched-decode fast path (isolated: prefill / other GPUs / single
+    # stream are unaffected). Bigger BLOCK_K recovers ~1.15-1.35x here.
+    if (
+        6 <= M <= 64
+        and group_size in (32, 64, 128)
+        and K % group_size == 0
+        and _on_gfx1x()
+        and not _on_gfx12x()
+        and not _on_gfx1151()
+    ):
+        return _bigbk_gemm(a, b_q, scales, zp, group_size, zp_bias)
 
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 
