@@ -678,7 +678,7 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
   TORCH_CHECK(K_in % 16 == 0, "K must be divisible by 16");
 
   const int max_lds_len = get_lds_size_int4() / 2;
-  TORCH_CHECK(K_in * N_in <= (int64_t)(max_lds_len * 1.2),
+  TORCH_CHECK(K_in * N_in <= (int64_t)(max_lds_len * 3),
               "K*N exceeds LDS capacity (medium limit). K=", K_in, " N=", N_in);
 
   auto out_c = torch::empty(
@@ -766,6 +766,12 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
         WVSPLIT_INT4G_TILE(sYT, 4, _HAS_ZP) break;         \
       case 5:                                              \
         WVSPLIT_INT4G_TILE(sYT, 5, _HAS_ZP) break;         \
+      case 6:                                              \
+        WVSPLIT_INT4G_TILE(sYT, 6, _HAS_ZP) break;         \
+      case 7:                                              \
+        WVSPLIT_INT4G_TILE(sYT, 7, _HAS_ZP) break;         \
+      case 8:                                              \
+        WVSPLIT_INT4G_TILE(sYT, 8, _HAS_ZP) break;         \
       default:                                             \
         throw std::runtime_error("Unsupported N value: " + \
                                  std::to_string(N_in));    \
