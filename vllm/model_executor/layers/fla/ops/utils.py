@@ -27,6 +27,32 @@ FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
+# --- ROCm startup workaround -------------------------------------------------
+# FLA @triton.autotune kernels enumerate BK x BV x num_warps x num_stages
+# configs (often 12-24 each). On ROCm every config is compiled via make_amdgcn,
+# which is very slow, so first-time startup of a model with many linear-attention
+# layers (e.g. qwen3_5_moe: 30 GDN layers) effectively never finishes. When
+# FLA_AUTOTUNE_MINIMAL=1 we keep only the first config per kernel: one compile
+# instead of N, startup drops from never to ~1-2 min. Runtime perf is slightly
+# below the tuned optimum but correct. All FLA ops do from vllm.triton_utils
+# import triton (this same object) before importing this module, so patching
+# triton.autotune here applies to every FLA kernel decorated afterwards.
+if os.getenv("FLA_AUTOTUNE_MINIMAL", "0") == "1":
+    _fla_orig_autotune = triton.autotune
+
+    def _fla_minimal_autotune(*args, **kwargs):
+        cfgs = kwargs.get("configs")
+        if cfgs is not None and len(cfgs) > 1:
+            kwargs["configs"] = list(cfgs)[:1]
+        return _fla_orig_autotune(*args, **kwargs)
+
+    triton.autotune = _fla_minimal_autotune
+    logger.warning(
+        "FLA_AUTOTUNE_MINIMAL=1: capping FLA triton autotune to 1 config/kernel "
+        "(faster ROCm startup, slightly suboptimal kernel perf)"
+    )
+# ----------------------------------------------------------------------------
+
 # Default chunk size used across FLA triton kernels (kda, chunk, chunk_o, etc.)
 FLA_CHUNK_SIZE = 64
 
