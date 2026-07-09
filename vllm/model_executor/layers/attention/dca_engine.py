@@ -64,6 +64,10 @@ class DCAEngine:
         self.local_size = int(dca_cfg["local_size"])
         self.orig_max = int(dca_cfg.get("original_max_position_embeddings", 0))
         self.chunk_len = self.chunk_size - self.local_size
+        # VLLM_DCA_SPARSE=1 routes the multi-chunk PREFILL through the vertical-slash
+        # sparse path (per-region select + sparse kernels + LSE merge); decode and the
+        # single-chunk/dense paths are unaffected.
+        self.sparse_prefill = os.environ.get("VLLM_DCA_SPARSE", "") not in ("", "0")
 
     def forward(self, layer, query, key, value, output_shape):
         from vllm.model_executor.layers.attention.attention import (
@@ -148,11 +152,21 @@ class DCAEngine:
             else:
                 n_chunks = (klen + self.chunk_len - 1) // self.chunk_len
                 _dbg(f"prefill seq{i} qlen={e - s} klen={klen} "
-                     f"chunk_len={self.chunk_len} n_chunks={n_chunks}")
-                o[s:e] = dca_prefill_forward(
-                    q5[s:e], k_cache, v_cache, klen, bt[i], scale,
-                    self.chunk_size, self.local_size, self.orig_max, block_size,
-                )
+                     f"chunk_len={self.chunk_len} n_chunks={n_chunks} "
+                     f"sparse={self.sparse_prefill}")
+                if self.sparse_prefill:
+                    from vllm.model_executor.layers.attention.dca_prefill_sparse import (  # noqa: E501
+                        dca_prefill_forward_sparse,
+                    )
+                    o[s:e] = dca_prefill_forward_sparse(
+                        q5[s:e], k_cache, v_cache, klen, bt[i], scale,
+                        self.chunk_size, self.local_size, self.orig_max, block_size,
+                    )
+                else:
+                    o[s:e] = dca_prefill_forward(
+                        q5[s:e], k_cache, v_cache, klen, bt[i], scale,
+                        self.chunk_size, self.local_size, self.orig_max, block_size,
+                    )
         return o
 
     def _kv_write(self, layer, key, value):
