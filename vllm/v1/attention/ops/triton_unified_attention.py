@@ -289,6 +289,9 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    lse_ptr=None,
+    lse_stride_head: tl.int64 = 0,
+    OUTPUT_LSE: tl.constexpr = False,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -642,6 +645,12 @@ def kernel_unified_attention(
         )
     else:
         acc = acc / L[:, None]
+        if OUTPUT_LSE:
+            tl.store(
+                lse_ptr + query_offset_1 * lse_stride_head + query_offset_0,
+                M + tl.log(L),
+                mask=query_mask_0 & query_mask_1,
+            )
         if USE_FP8_Q_DESCALE:
             acc *= value_scale
         if USE_FP8:
@@ -847,6 +856,7 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    output_lse=None,  # DCA: per-token LSE for chunk combination
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -1048,6 +1058,8 @@ def unified_attention(
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
+    if output_lse is not None:
+        use_3d = False
 
     # The kernel signature is the same for 2D and 3D — only the launch
     # grid + a handful of constexpr toggles differ.  Per-token-head scale
@@ -1164,6 +1176,9 @@ def unified_attention(
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
         **launch_kwargs,
+        lse_ptr=(output_lse if output_lse is not None else out),
+        lse_stride_head=(output_lse.stride(0) if output_lse is not None else 0),
+        OUTPUT_LSE=(output_lse is not None),
     )
 
     if use_3d:

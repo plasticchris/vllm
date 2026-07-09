@@ -337,6 +337,13 @@ class Attention(nn.Module, AttentionLayerBase):
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
         self.has_sink = extra_impl_args.get("sinks") is not None
+        # DCA: pop kwargs the stock impls reject; activate handler when config present.
+        self.dca = None
+        _dca_cfg = extra_impl_args.pop("dual_chunk_attention_config", None)
+        extra_impl_args.pop("layer_idx", None)
+        if _dca_cfg is not None:
+            from vllm.model_executor.layers.attention.dca_engine import DCAEngine
+            self.dca = DCAEngine(_dca_cfg)
 
         # NOTE: model_config may be None during certain tests
         model_config = vllm_config.model_config
@@ -502,6 +509,8 @@ class Attention(nn.Module, AttentionLayerBase):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
+        if self.dca is not None:
+            return self.dca.forward(self, query, key, value, output_shape)
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(
                 query, key, value, _encode_layer_name(self.layer_name)
