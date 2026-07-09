@@ -40,10 +40,19 @@ logger = logging.getLogger(__name__)
 _LOGGED = {"ok": False, "off": False, "rej": False, "check": False}
 
 
-def _num_kv_splits(max_seq_len: int) -> int:
-    # enough splits to fill ~96 CUs at low batch; capped to bound the reduce cost
-    s = (int(max_seq_len) + 1023) // 1024
-    return max(8, min(64, s))
+def _num_kv_splits(max_seq_len: int, num_kv_heads: int = 4) -> int:
+    # gfx1100 fp8 head-256 decode: fill the 96 CUs. stage-1 launches
+    # (splits * num_kv_heads) workgroups per sequence; ~192 (2x CUs) is the
+    # sweet spot, so splits ~= 192 / num_kv_heads -- 48 for 4 KV heads,
+    # 96 for 2 -- measured within a few % of optimal across batch 1-8 and
+    # context 2k-48k. The old seqlen/1024 gave 8-24 -> idle GPU -> the decode
+    # cliff. Env ROCM_FD_SPLITS forces a value.
+    import os
+    _o = os.environ.get('ROCM_FD_SPLITS')
+    if _o:
+        return int(_o)
+    base = max(8, min(96, 192 // max(1, int(num_kv_heads))))
+    return min(base, max(8, int(max_seq_len) // 16))
 
 
 @triton.jit
@@ -293,7 +302,7 @@ def try_native_flash_decode(
         num_heads = query.shape[1]
         head_size = query.shape[2]
         x = kc.shape[4]
-        NKV = _num_kv_splits(max_seq_len)
+        NKV = _num_kv_splits(max_seq_len, value_cache.shape[1])
         qv = query.view(num_seqs, Q, num_heads, head_size)
         ov = output.view(num_seqs, Q, num_heads, head_size)
         dst = ov if not check else torch.empty_like(ov)
