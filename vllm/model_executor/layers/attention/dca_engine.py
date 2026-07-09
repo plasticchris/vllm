@@ -64,10 +64,12 @@ class DCAEngine:
         self.local_size = int(dca_cfg["local_size"])
         self.orig_max = int(dca_cfg.get("original_max_position_embeddings", 0))
         self.chunk_len = self.chunk_size - self.local_size
-        # VLLM_DCA_SPARSE=1 routes the multi-chunk PREFILL through the vertical-slash
-        # sparse path (per-region select + sparse kernels + LSE merge); decode and the
-        # single-chunk/dense paths are unaffected.
-        self.sparse_prefill = os.environ.get("VLLM_DCA_SPARSE", "") not in ("", "0")
+        # Vertical-slash SPARSE prefill is the DEFAULT: multi-chunk PREFILL routes through
+        # per-region select + sparse kernels + LSE merge (holds needle retrieval at 256K,
+        # ~3x faster prefill). VLLM_DCA_SPARSE=0 forces dense-DCA prefill (equivalence /
+        # baseline tests). Decode and single-chunk/dense paths are unaffected.
+        _sp = os.environ.get("VLLM_DCA_SPARSE", "1").strip().lower()
+        self.sparse_prefill = _sp not in ("0", "off", "false", "no", "")
 
     def forward(self, layer, query, key, value, output_shape):
         from vllm.model_executor.layers.attention.attention import (
