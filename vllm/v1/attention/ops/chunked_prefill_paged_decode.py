@@ -300,6 +300,35 @@ def chunked_prefill_paged_decode(
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
 
+    # Native-layout split-KV flash-decoding for small uniform-Q decode/MTP steps
+    # (head_size 256 has no in-tree KV-splitting decode kernel; see
+    # rocm_native_flash_decode.py). Returns True only when it fully filled output.
+    from vllm.v1.attention.ops.rocm_native_flash_decode import (
+        try_native_flash_decode,
+    )
+
+    if try_native_flash_decode(
+        query=query,
+        output=output,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sm_scale=sm_scale,
+        kv_cache_dtype=kv_cache_dtype,
+        fp8_dtype=current_platform.fp8_dtype(),
+        alibi_slopes=alibi_slopes,
+        sliding_window=sliding_window,
+        sinks=sinks,
+        causal=causal,
+    ):
+        return
+
     if max_query_len > 1:
         context_attention_fwd(
             q=query,
