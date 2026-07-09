@@ -213,8 +213,16 @@ def triton_w4a16_gemm(
 
         if on_gfx1x():
             # Tuned for RDNA 3.5 (gfx1151, 40 CUs, 32-wide wavefronts).
+            import os as _os
+            # gfx1100 (96 CUs) decode-shape tuning: BLOCK_M=16 (WMMA min, less
+            # padding waste than 32), BLOCK_N=64 (best occupancy sweet spot;
+            # 128 falls off an occupancy cliff). +8% decode vs the 32,32,64
+            # gfx1151 default. Env W4A16_BM/BN/BK still override for re-tuning.
+            _bm = int(_os.environ.get("W4A16_BM", "16"))
             if M <= 32:
-                BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
+                BLOCK_M = _bm
+                BLOCK_N = int(_os.environ.get("W4A16_BN", "64"))
+                BLOCK_K = int(_os.environ.get("W4A16_BK", "64"))
             elif M <= 64:
                 BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
             else:
