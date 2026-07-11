@@ -53,7 +53,7 @@ logger = init_logger(__name__)
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+NUM_PAR_SOFTMAX_SEGMENTS = 64  # parallel split-KV softmax segments (gfx1100: fills 96 CUs at depth)
 
 
 @dataclass
