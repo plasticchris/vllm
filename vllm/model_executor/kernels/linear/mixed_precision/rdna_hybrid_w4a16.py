@@ -657,6 +657,12 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         c = self.config
         w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        # Symmetric (uint4b8): auto_gptq/AWQ still register a dummy packed qzeros
+        # and pass w_zp_param_name="qzeros", but zero_points=False. Drop it and use
+        # the constant-bias (ZP_BIAS=8) path; the raw packed qzeros (num_groups, N/8)
+        # would otherwise fail the kernel's (N, num_groups) zp shape check.
+        if not c.zero_points:
+            w_zp = None
 
         x_2d = x.reshape(-1, x.shape[-1])
         N = w_q.shape[0]
