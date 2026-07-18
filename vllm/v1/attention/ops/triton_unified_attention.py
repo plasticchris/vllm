@@ -9,6 +9,7 @@
 
 from typing import Any
 
+import os
 import torch
 
 import vllm.envs as envs
@@ -29,6 +30,14 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     store_segm_reduce_scalars,
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
+
+# Allow the split-KV (3D) decode path for small uniform-Q MTP/spec steps
+# (max_query_len<=N). Default 1 keeps stock behavior (3D only for pure Q=1
+# decode). Set VLLM_TRITON_3D_SPEC_Q=8 to route MTP verify through split-KV
+# instead of the serial 2D scan -> fixes the long-context MTP decode cliff on
+# gfx1100 (TRITON_ATTN backend, e.g. Gemma-4). Bounded by seq_threshold_3D so
+# total query rows still fit the preallocated segment buffers.
+_TRITON_3D_SPEC_Q = int(os.environ.get("VLLM_TRITON_3D_SPEC_Q", "1"))
 
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
@@ -1054,8 +1063,8 @@ def unified_attention(
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        or max_seqlen_q > _TRITON_3D_SPEC_Q
+        or q.shape[0] > seq_threshold_3D
         or is_batch_invariant
     )
     if output_lse is not None:
