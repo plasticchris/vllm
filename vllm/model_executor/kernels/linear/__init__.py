@@ -410,7 +410,6 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.ROCM: [
         RDNAHybridW4A16LinearKernel,
         RDNA3W4A16LinearKernel,
-        RDNAHybridW4A16LinearKernel,
         TritonW4A16LinearKernel,
         ConchLinearKernel,
         ExllamaLinearKernel,

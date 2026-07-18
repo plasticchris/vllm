@@ -59,9 +59,11 @@ def _on_gfx1151() -> bool:
 
 
 # Maximum batch size M for the HIP skinny kernel path (C++ supports N_in
-# up to 5).  When M is below this AND K*M fits in LDS, the skinny kernel is
-# used; otherwise the Triton prefill path handles the GEMM.
-MAX_SKINNY_BATCH_SIZE = 5
+# up to 8).  At M<=8 the scalar bit-trick skinny kernel matches upstreams
+# gptq_gemm_rdna3 low-M path (WMMA under-utilizes its 16-row tile there); the
+# medium variant streams the LDS-overflow activation rows from global, so we
+# allow up to 3x LDS (matches the C++ medium-limit guard) before Triton.
+MAX_SKINNY_BATCH_SIZE = 8
 # 64 KiB per-workgroup LDS limit expressed in fp16 elements.
 # (AMD RDNA has 128 KiB total LDS per CU, but 64 KiB per workgroup.)
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
@@ -501,7 +503,7 @@ def _rdna_hybrid_w4a16_apply_impl(
     K = x_2d.shape[1]
     N = w_q.shape[0]
 
-    if M <= MAX_SKINNY_BATCH_SIZE and K * M <= LDS_CAPACITY_ELEMENTS:
+    if M <= MAX_SKINNY_BATCH_SIZE and K * M <= 3 * LDS_CAPACITY_ELEMENTS:
         # record_function is not torch.compile-safe; use nullcontext when
         # compiling to keep the op traceable.
         ctx = (
@@ -655,6 +657,12 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         c = self.config
         w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        # Symmetric (uint4b8): auto_gptq/AWQ still register a dummy packed qzeros
+        # and pass w_zp_param_name="qzeros", but zero_points=False. Drop it and use
+        # the constant-bias (ZP_BIAS=8) path; the raw packed qzeros (num_groups, N/8)
+        # would otherwise fail the kernel's (N, num_groups) zp shape check.
+        if not c.zero_points:
+            w_zp = None
 
         x_2d = x.reshape(-1, x.shape[-1])
         N = w_q.shape[0]
