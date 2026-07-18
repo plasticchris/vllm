@@ -685,6 +685,10 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
       {N_in, M_in},
       torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
 
+  // gfx1100 tuning override: force (YTILE,UNRL) via env for sweeping.
+  static int _int4g_fY = []() { const char* e = getenv("VLLM_INT4G_YTILE"); return e ? atoi(e) : 0; }();
+  static int _int4g_fU = []() { const char* e = getenv("VLLM_INT4G_UNRL");  return e ? atoi(e) : 0; }();
+
   dim3 grid(CuCount);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
@@ -718,8 +722,22 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
   else                                               \
     WVSPLITK_INT4G(_YTILE, _UNRL, _N, 128, _HAS_ZP)
 
+#define WVSPLIT_INT4G_FORCE(__N, _HAS_ZP)                            \
+  {                                                                  \
+    if (_int4g_fY == 1 && _int4g_fU == 1) WVSPLIT_INT4G_GS(1, 1, __N, _HAS_ZP) \
+    else if (_int4g_fY == 1 && _int4g_fU == 2) WVSPLIT_INT4G_GS(1, 2, __N, _HAS_ZP) \
+    else if (_int4g_fY == 1 && _int4g_fU == 4) WVSPLIT_INT4G_GS(1, 4, __N, _HAS_ZP) \
+    else if (_int4g_fY == 2 && _int4g_fU == 1) WVSPLIT_INT4G_GS(2, 1, __N, _HAS_ZP) \
+    else if (_int4g_fY == 2 && _int4g_fU == 2) WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP) \
+    else if (_int4g_fY == 2 && _int4g_fU == 4) WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP) \
+    else if (_int4g_fY == 4 && _int4g_fU == 1) WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP) \
+    else if (_int4g_fY == 4 && _int4g_fU == 2) WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP) \
+    else WVSPLIT_INT4G_GS(4, 4, __N, _HAS_ZP)                        \
+  }
+
 #define WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                        \
   {                                                                   \
+    if (_int4g_fY > 0 && _int4g_fU > 0) { WVSPLIT_INT4G_FORCE(__N, _HAS_ZP) } else \
     if (K_in * N_in > max_lds_len) {                                  \
       if (_sYT < 30)                                                  \
         WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                          \
@@ -727,18 +745,10 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
         WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                          \
     } else if (__N >= 4 && _sYT >= 480)                               \
       WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                            \
-    else if (__N >= 3 && _sYT >= 40)                                  \
-      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                            \
-    else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096)) \
-      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                            \
-    else if (__N >= 3 && _sYT < 40)                                   \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                            \
-    else if (__N >= 2)                                                \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                            \
-    else if (_sYT >= 30)                                              \
-      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                            \
     else                                                              \
-      WVSPLIT_INT4G_GS(1, 4, __N, _HAS_ZP)                            \
+      /* gfx1100: 96 CUs -> YTILE=4,UNRL=2 beats the sYT heuristic    \
+         (sYT is computed from WGP count 48, miscalibrated here) */   \
+      WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                            \
   }
 
 // Inner dispatch: shared by both symmetric and asymmetric paths
@@ -789,6 +799,7 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
 #undef WVSPLITK_INT4G
 #undef WVSPLIT_INT4G_GS
 #undef WVSPLIT_INT4G_TILE
+#undef WVSPLIT_INT4G_FORCE
 #undef WVSPLIT_INT4G_DISPATCH
 
   return out_c;
