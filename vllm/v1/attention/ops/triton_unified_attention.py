@@ -961,17 +961,39 @@ def unified_attention(
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
     # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
     # more query rows per block + 8 warps is ~2x faster on B200.
+    _is_family100 = current_platform.is_device_capability_family(100)
+    _is_rocm = current_platform.is_rocm()
     tuned_large_head = (
-        head_size == 256
-        and max_seqlen_q > 1
+        max_seqlen_q > 1
         and num_queries_per_kv <= 16
-        and current_platform.is_device_capability_family(100)
+        and (
+            (_is_family100 and head_size == 256)
+            or (_is_rocm and head_size in (256, 512))
+        )
     )
+    _rocm_tile = 128
     if tuned_large_head:
-        BLOCK_M = 32
-        BLOCK_Q = BLOCK_M // num_queries_per_kv
-        launch_num_warps = 8
-        launch_num_stages = 2
+        if _is_rocm:
+            # gfx1100 (RDNA3): 64 KiB LDS/workgroup in CU mode. BLOCK_M is the
+            # dominant prefill lever: the 2D kernel re-reads all KV per query
+            # block, so KV HBM traffic ~ 1/BLOCK_M, and Gemma-4's head-512
+            # full-attention layers are HBM-bound at depth. BLOCK_M=64 (the
+            # ceiling before the [BLOCK_M, head] fp32 accumulator spills VGPRs)
+            # cuts their KV traffic 4x vs the decode default (BLOCK_M=16).
+            # num_stages=1 keeps the K/V double-buffer within 64 KiB. Swept on
+            # 7900 XTX (Gemma-4-31B prefill): total attention -64% at 24k vs the
+            # decode default; greedy output unchanged.
+            BLOCK_M = 64
+            launch_num_warps = 8
+            launch_num_stages = 1
+            # head 256 fits a 128-wide KV tile at num_stages=1 (64 KiB); head
+            # 512 is 2x the per-slot bytes, so cap its tile at 64 (also 64 KiB).
+            _rocm_tile = 128 if head_size == 256 else 64
+        else:
+            BLOCK_M = 32
+            launch_num_warps = 8
+            launch_num_stages = 2
+        BLOCK_Q = max(1, BLOCK_M // num_queries_per_kv)
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -1004,7 +1026,7 @@ def unified_attention(
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
-        TILE_SIZE_PREFILL = 128
+        TILE_SIZE_PREFILL = _rocm_tile if _is_rocm else 128
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
