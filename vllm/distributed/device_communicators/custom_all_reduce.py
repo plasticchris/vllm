@@ -71,6 +71,7 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self._rdna3 = False
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -119,6 +120,16 @@ class CustomAllreduce:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
+        # RDNA3 (gfx11) reaches every peer over PCIe P2P on this box
+        # (iommu=pt + ACS-redirect disabled on the GPU switch); with the
+        # RDNA3 __threadfence_system fix in custom_all_reduce.cuh the
+        # custom kernels are correct across >2 such GPUs even without
+        # XGMI. So gfx11 is (a) allowed past the >2-PCIe gate and
+        # should_custom_ar below, and (b) forced onto the copy path in
+        # custom_all_reduce() -- the registered graph-buffer path
+        # resolves wrong peer pointers under cudagraph replay on gfx11.
+        self._rdna3 = current_platform.is_rocm() and "gfx11" in getattr(
+            torch.cuda.get_device_properties(self.device), "gcnArchName", "")
         device_capability = current_platform.get_device_capability()
         if (
             current_platform.is_cuda()
@@ -147,7 +158,7 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
-        if world_size > 2 and not fully_connected:
+        if world_size > 2 and not fully_connected and not self._rdna3:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
                 " more than two PCIe-only GPUs. To silence this warning, "
@@ -189,14 +200,10 @@ class CustomAllreduce:
         self.world_size = world_size
         self.fully_connected = fully_connected
         self._ptr = ops.init_custom_ar(
-            self.meta_ptrs, self.rank_data, rank, self.fully_connected
+            self.meta_ptrs, self.rank_data, rank,
+            self.fully_connected or self._rdna3
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
-        # RDNA3 (gfx11) reaches peers over PCIe P2P. The registered graph-buffer
-        # path (get_graph_buffer_ipc_meta base-addr + offset) resolves wrong
-        # peer pointers under cudagraph replay there, so we use the copy path.
-        self._rdna3 = current_platform.is_rocm() and "gfx11" in getattr(
-            torch.cuda.get_device_properties(self.device), "gcnArchName", "")
 
     @contextmanager
     def capture(self):
@@ -242,8 +249,9 @@ class CustomAllreduce:
         if not is_weak_contiguous(inp):
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
-        if self.world_size == 2 or self.fully_connected:
+        # little performance improvement over NCCL -- except gfx11/PCIe
+        # here, where the tuned custom kernels beat RCCL over the P2P mesh.
+        if self.world_size == 2 or self.fully_connected or self._rdna3:
             return inp_size < self.max_size
         return False
 
