@@ -209,6 +209,14 @@ def _native_decode_one(q, key_cache, value_cache, o, block_table, blen,
     BLOCK_H = 16
     grid = (B, triton.cdiv(H, min(BLOCK_H, kv_group_num)), num_kv_splits)
     extra = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+    # WMMA forces BLOCK_H=16 (16x16 M-dim), but only kv_group_num (6 here) rows are
+    # valid, so the [16,256] q/acc tiles overflow 4 warps -> 256 VGPR + 41-reg spill.
+    # 8 warps spreads them over 256 lanes (239 VGPR, 0 spill) -> 2-3x stage1 (microbench,
+    # ctx 8k-128k) and +27% end-to-end decode tok/s at 65k ctx (live A/B). NUM_KV_SPLITS
+    # stays (=CU count; more only adds stage2 reduction). NOTE: vLLM's spawn workers get a
+    # sanitized env, so ROCM_FD_WARPS does NOT reach them -- the default here is what runs;
+    # to change, edit the default (not the env).
+    fd_warps = int(os.environ.get("ROCM_FD_WARPS", "8"))
 
     _native_grouped_stage1[grid](
         q, key_cache, value_cache, sm_scale, block_table, blen, logits,
@@ -224,7 +232,7 @@ def _native_decode_one(q, key_cache, value_cache, o, block_table, blen,
         BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DV=BLOCK_DV, BLOCK_N=BLOCK_N, BLOCK_H=BLOCK_H,
         NUM_KV_SPLITS=num_kv_splits, BLOCK_SIZE=block_size, X=x,
         logit_cap=0.0, Lk=head_size, Lv=head_size,
-        num_warps=4, num_stages=1, **extra,
+        num_warps=fd_warps, num_stages=1, **extra,
     )
     _fwd_kernel_stage2[(B, H)](
         logits, o, lse, blen,
