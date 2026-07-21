@@ -803,13 +803,25 @@ def context_attention_fwd(
     is_pow2 = real_block_size > 0 and (real_block_size & (real_block_size - 1) == 0)
     # For standard models involving powers of 2,
     # follow the original logic (Llama 128/64)
-    # For non-standard models (Qwen3-next block_size 544), set to 32.
     if is_pow2:
         BLOCK_M = 128
         BLOCK_N = 64
+        fwd_num_warps = 4
     else:
-        BLOCK_M = 32
-        BLOCK_N = 32
+        # Non-pow2 paged block (hybrid Mamba/attn block_size 816, Qwen3-next 544):
+        # only the *context* tile (TRITON_BLOCK_SIZE below, 32) needs the per-token
+        # paged addressing. BLOCK_M (query rows) and BLOCK_N (new-token keys) are
+        # independent of the cache block layout and flash-attention is invariant to
+        # this tiling, so the old 32/32 only wasted work: grid = cdiv(query_len,
+        # BLOCK_M), so BLOCK_M=32 re-read the whole cached context ~4x more than the
+        # pow2 path. Raise the query tile to the pow2 path's footprint
+        # (BLOCK_M*BLOCK_DMODEL_PADDED ~= 128*128 -> BLOCK_M 64 at head_size 256) and
+        # spread it over 8 warps (256 lanes) instead of 4 so per-thread VGPR pressure
+        # halves -- at head_size 256 the 4-warp version pegs the RDNA3 256-VGPR ceiling
+        # and spills to scratch; 8 warps cuts that spill.
+        BLOCK_M = min(128, max(32, 16384 // Lk_padded))
+        BLOCK_N = 64
+        fwd_num_warps = 8
 
     # TRITON_BLOCK_SIZE is kept at 32 to ensure
     # correct alignment logic when the kernel handles
@@ -869,7 +881,7 @@ def context_attention_fwd(
         BLOCK_N=BLOCK_N,
         num_unroll_cache=4,
         num_unroll_request=1,
-        num_warps=4,
+        num_warps=fwd_num_warps,
         num_stages=1,
         USE_SINKS=sinks is not None,
         CAUSAL=causal,
