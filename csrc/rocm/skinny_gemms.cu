@@ -328,14 +328,18 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
       V0 += (s.x + s.y);                                             \
     }
 #elif defined(__HIP__GFX1X__)
-  // gfx1x: v_dot2_f32_f16 (VOP3-P, dot10-insts, available on gfx11+gfx12)
+using bf16x2_dot_t = __attribute__((__vector_size__(2 * sizeof(__bf16)))) __bf16;
+  // gfx1x: v_dot2_f32_f16 (VOP3-P, dot10-insts, available on gfx11+gfx12).
+  // bf16 has its own dot here too; widening to fp32 instead costs 7 VALU slots
+  // against 2, enough to make this loop VALU-bound rather than memory-bound
+  // once YTILE > 1.
   #define DOT2C(V0, V2, V3)                                               \
     if constexpr (std::is_same_v<scalar_t, half>) {                       \
       asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3)); \
     } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {      \
-      float2 s = __bfloat1622float2(*((__hip_bfloat162*)(&(V2)))) *       \
-                 __bfloat1622float2(*((__hip_bfloat162*)(&(V3))));        \
-      V0 += (s.x + s.y);                                                  \
+      V0 = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_dot_t*)(&(V2))),     \
+                                           *((bf16x2_dot_t*)(&(V3))),     \
+                                           V0, false);                    \
     }
 #endif
 
