@@ -191,6 +191,206 @@ def _native_grouped_stage1(
         tl.store(Att_Out + offs_mid_o_1, e_max + tl.log(e_sum), mask=mask_h)
 
 
+_QBATCH_NEG = tl.constexpr(-1.0e30)
+# Largest (positions x heads) tile the WMMA M dimension will hold. 32 = two 16x16
+# tiles; 64 was not tried because 16 warps already lost badly to 8 on register
+# pressure at 32.
+_QBATCH_MAX_ROWS = 32
+# Flipping this needs a source edit, not an env var: vLLM's spawn workers get a
+# sanitized environment, so ROCM_FD_* does not reach them (same caveat as
+# ROCM_FD_WARPS below).
+_QBATCH_DEFAULT = True
+
+
+def _qbatch_tile(q_len: int, kv_group_num: int) -> int:
+    """Verify positions per tile, or 0 to keep the per-position loop."""
+    if not _QBATCH_DEFAULT or q_len < 1 or kv_group_num < 1:
+        return 0
+    if kv_group_num > _QBATCH_MAX_ROWS:
+        return 0
+    return max(1, min(q_len, _QBATCH_MAX_ROWS // kv_group_num))
+
+
+@triton.jit
+def _native_grouped_stage1_qbatch(
+    Q, K_Cache, V_Cache, sm_scale, Block_Table, B_Seqlen, Att_Out,
+    stride_bt_b,
+    stride_qb, stride_qq, stride_qh,
+    stride_k0, stride_k1, stride_k2, stride_k3, stride_k4,
+    stride_v0, stride_v1, stride_v2, stride_v3,
+    stride_mid_ob, stride_mid_oh, stride_mid_os,
+    k_scale, v_scale,
+    kv_group_num: tl.constexpr,
+    q_head_num: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    Q_TILE: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    X: tl.constexpr,
+    logit_cap: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    """One KV pass for Q_TILE query positions at once.
+
+    MTP verify hands us Q positions whose key sets differ only in the last Q-1
+    tokens, and BLOCK_H=16 is forced by WMMA while only kv_group_num rows carry
+    data. Packing (position, head) pairs into the rows already being paid for
+    turns Q full passes over the KV cache into cdiv(Q, Q_TILE).
+    """
+    cur_batch = tl.program_id(0)
+    yid = tl.program_id(1)
+    split_kv_id = tl.program_id(2)
+    cur_kv_head = yid // NUM_TILES
+    tile_id = yid % NUM_TILES
+
+    ROWS: tl.constexpr = Q_TILE * kv_group_num
+    r = tl.arange(0, BLOCK_H)
+    j_local = r // kv_group_num
+    h_local = r % kv_group_num
+    j_global = tile_id * Q_TILE + j_local
+    mask_h = (r < ROWS) & (j_global < Q_LEN)
+    cur_head = cur_kv_head * kv_group_num + h_local
+    mask_h = mask_h & (cur_head < q_head_num)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lk
+    mask_dv = offs_dv < Lv
+
+    # Partition by the longest position. Stage 2 recomputes this partition from
+    # its own B_Seqlen and skips splits it believes are empty, so it must be
+    # handed the same length for every position or the two disagree.
+    seq_max = tl.load(B_Seqlen + cur_batch)
+    row_len = seq_max - (Q_LEN - 1) + j_global
+
+    offs_q = (cur_batch * stride_qb + j_global[:, None] * stride_qq
+              + cur_head[:, None] * stride_qh + offs_d[None, :])
+    q = tl.load(Q + offs_q, mask=mask_h[:, None] & mask_d[None, :], other=0.0)
+
+    d_outer = offs_d // X
+    d_inner = offs_d % X
+    k_row = cur_kv_head * stride_k1 + d_outer[:, None] * stride_k2 + d_inner[:, None] * stride_k4
+    v_col = cur_kv_head * stride_v1 + offs_dv[None, :] * stride_v2
+
+    kv_len_per_split = tl.cdiv(seq_max, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, seq_max)
+
+    # Finite sentinel rather than -inf: with a per-row mask a row can be entirely
+    # masked inside a split, and -inf minus -inf is NaN in the rescale.
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) + _QBATCH_NEG
+    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
+
+    if split_kv_end > split_kv_start:
+        ks = tl.load(k_scale)
+        vs = tl.load(v_scale)
+        for start_n in tl.range(split_kv_start, split_kv_end, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < split_kv_end
+            logical_block = offs_n // BLOCK_SIZE
+            pos = offs_n % BLOCK_SIZE
+            phys_block = tl.load(
+                Block_Table + cur_batch * stride_bt_b + logical_block,
+                mask=mask_n, other=0,
+            )
+            k_col = phys_block[None, :] * stride_k0 + pos[None, :] * stride_k3
+            k = tl.load(K_Cache + k_col + k_row,
+                        mask=mask_n[None, :] & mask_d[:, None], other=0.0)
+            if k.dtype.is_fp8():
+                k = (k.to(tl.float32) * ks).to(q.dtype)
+            qk = tl.dot(q, k.to(q.dtype))
+            qk *= sm_scale
+            if logit_cap > 0:
+                qk = logit_cap * (2 * tl.sigmoid(2 * qk / logit_cap) - 1)
+            # mask_n bounds the split, row_len bounds the position. Both are
+            # needed: BLOCK_N can overshoot split_kv_end and those keys belong to
+            # the next split's workgroup, where they are counted already.
+            keep = (mask_h[:, None] & mask_n[None, :]
+                    & (offs_n[None, :] < row_len[:, None]))
+            qk = tl.where(keep, qk, _QBATCH_NEG)
+
+            v_row = phys_block[:, None] * stride_v0 + pos[:, None] * stride_v3
+            v = tl.load(V_Cache + v_row + v_col,
+                        mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
+            if v.dtype.is_fp8():
+                v = (v.to(tl.float32) * vs).to(q.dtype)
+
+            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.where(keep, tl.exp(qk - n_e_max[:, None]), 0.0)
+            acc *= re_scale[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+            e_sum = e_sum * re_scale + tl.sum(p, 1)
+            e_max = n_e_max
+
+        safe = e_sum > 0
+        denom = tl.where(safe, e_sum, 1.0)
+        row_ob = j_global * stride_mid_oh * q_head_num + cur_head * stride_mid_oh
+        offs_mid_o = (cur_batch * stride_mid_ob + row_ob[:, None]
+                      + split_kv_id * stride_mid_os + offs_dv[None, :])
+        tl.store(Att_Out + offs_mid_o, acc / denom[:, None],
+                 mask=mask_h[:, None] & mask_dv[None, :])
+        offs_mid_o_1 = (cur_batch * stride_mid_ob + row_ob
+                        + split_kv_id * stride_mid_os + Lv)
+        tl.store(Att_Out + offs_mid_o_1,
+                 tl.where(safe, e_max + tl.log(denom), _QBATCH_NEG), mask=mask_h)
+
+
+def _native_decode_qbatch(qv, key_cache, value_cache, out, block_table, seq_lens,
+                          num_kv_splits, sm_scale, k_scale, v_scale, head_size, x,
+                          q_tile):
+    """qv/out: [B, Q, H, D]. seq_lens is the longest position's length."""
+    B, QL, H, D = qv.shape
+    num_kv_heads = value_cache.shape[1]
+    block_size = value_cache.shape[3]
+    kv_group_num = H // num_kv_heads
+    BLOCK_H = max(16, triton.next_power_of_2(q_tile * kv_group_num))
+    BD = triton.next_power_of_2(head_size)
+    num_tiles = triton.cdiv(QL, q_tile)
+
+    # [B*Q, H, splits, Lv+1] so the shared stage 2 can be reused unchanged.
+    logits = torch.empty(B * QL, H, num_kv_splits, head_size + 1,
+                         device=qv.device, dtype=torch.float32)
+    o2 = out.view(B * QL, H, head_size)
+    lse = torch.empty(B * QL, H, device=qv.device, dtype=torch.float32)
+
+    _native_grouped_stage1_qbatch[(B, num_kv_heads * num_tiles, num_kv_splits)](
+        qv, key_cache, value_cache, sm_scale, block_table, seq_lens, logits,
+        block_table.stride(0),
+        qv.stride(0), qv.stride(1), qv.stride(2),
+        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+        key_cache.stride(3), key_cache.stride(4),
+        value_cache.stride(0), value_cache.stride(1),
+        value_cache.stride(2), value_cache.stride(3),
+        logits.stride(0) * QL, logits.stride(1), logits.stride(2),
+        k_scale, v_scale,
+        kv_group_num=kv_group_num, q_head_num=H,
+        Q_LEN=QL, Q_TILE=q_tile, NUM_TILES=num_tiles,
+        BLOCK_DMODEL=BD, BLOCK_DV=BD, BLOCK_N=16, BLOCK_H=BLOCK_H,
+        NUM_KV_SPLITS=num_kv_splits, BLOCK_SIZE=block_size, X=x,
+        logit_cap=0.0, Lk=head_size, Lv=head_size,
+        # 8 warps and splits=CU count measured best; 16 warps was 2-3x worse and
+        # 1.5x CUs of splits lost, both the reverse of the unbatched kernel since
+        # each workgroup now does Q_TILE times the work per byte it reads.
+        num_warps=8, num_stages=1,
+        waves_per_eu=1, matrix_instr_nonkdim=16, kpack=2,
+    )
+    _fwd_kernel_stage2[(B * QL, H)](
+        logits, o2, lse, seq_lens.repeat_interleave(QL),
+        logits.stride(0), logits.stride(1), logits.stride(2),
+        o2.stride(0), o2.stride(1), lse.stride(0),
+        NUM_KV_SPLITS=num_kv_splits, BLOCK_DV=BD, Lv=head_size,
+        num_warps=4, num_stages=2,
+    )
+
+
 def _native_decode_one(q, key_cache, value_cache, o, block_table, blen,
                        num_kv_splits, sm_scale, k_scale, v_scale, head_size, x):
     # q: [B, H, D]  o: [B, H, D]  (fp16)
@@ -315,19 +515,38 @@ def try_native_flash_decode(
         ov = output.view(num_seqs, Q, num_heads, head_size)
         dst = ov if not check else torch.empty_like(ov)
         max_rel = 0.0
-        for j in range(Q):
-            qj = qv[:, j, :, :].contiguous()
-            blen = (seq_lens - (Q - 1) + j).to(torch.int32)
-            oj = torch.empty(num_seqs, num_heads, head_size, device=query.device, dtype=query.dtype)
-            _native_decode_one(qj, kc, vc, oj, block_table, blen, NKV, sm_scale,
-                               k_scale, v_scale, head_size, x)
-            dst[:, j, :, :] = oj
+        q_tile = _qbatch_tile(Q, num_heads // value_cache.shape[1])
+        if q_tile:
+            # One KV pass per tile instead of one per position. Writes dst
+            # directly, so the per-position contiguous copy, the scratch
+            # allocation and the output slice assign all disappear too.
+            _native_decode_qbatch(qv, kc, vc, dst, block_table,
+                                  seq_lens.to(torch.int32), NKV, sm_scale,
+                                  k_scale, v_scale, head_size, x, q_tile)
             if check:
-                ref = _torch_oracle(qj, kc, vc, block_table, blen, sm_scale,
-                                    k_scale, v_scale, head_size, x)
-                denom = ref.abs().amax().clamp_min(1e-4)
-                rel = (oj.to(torch.float32) - ref.to(torch.float32)).abs().amax() / denom
-                max_rel = max(max_rel, float(rel))
+                for j in range(Q):
+                    blen = (seq_lens - (Q - 1) + j).to(torch.int32)
+                    ref = _torch_oracle(qv[:, j, :, :].contiguous(), kc, vc,
+                                        block_table, blen, sm_scale, k_scale,
+                                        v_scale, head_size, x)
+                    denom = ref.abs().amax().clamp_min(1e-4)
+                    rel = ((dst[:, j, :, :].to(torch.float32)
+                            - ref.to(torch.float32)).abs().amax() / denom)
+                    max_rel = max(max_rel, float(rel))
+        else:
+            for j in range(Q):
+                qj = qv[:, j, :, :].contiguous()
+                blen = (seq_lens - (Q - 1) + j).to(torch.int32)
+                oj = torch.empty(num_seqs, num_heads, head_size, device=query.device, dtype=query.dtype)
+                _native_decode_one(qj, kc, vc, oj, block_table, blen, NKV, sm_scale,
+                                   k_scale, v_scale, head_size, x)
+                dst[:, j, :, :] = oj
+                if check:
+                    ref = _torch_oracle(qj, kc, vc, block_table, blen, sm_scale,
+                                        k_scale, v_scale, head_size, x)
+                    denom = ref.abs().amax().clamp_min(1e-4)
+                    rel = (oj.to(torch.float32) - ref.to(torch.float32)).abs().amax() / denom
+                    max_rel = max(max_rel, float(rel))
         if check:
             ckey = f"worst_Q{Q}"
             prev = _LOGGED.get(ckey, 0.0)
