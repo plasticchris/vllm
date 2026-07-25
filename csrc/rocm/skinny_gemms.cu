@@ -1285,6 +1285,21 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     }                                                                       \
   }
 
+// For N>5 a single (YTILE, UNRL) is fixed per N rather than walking the sYT
+// ladder used below for N<=5. Register pressure scales with N through
+// sum[N][YTILE], sum4[N][YTILE] and bigA[N][UNRL], so the ladder's YTILE=3/4
+// rungs spill and give back the bandwidth advantage this kernel exists for;
+// pinning one config per N also keeps template instantiation bounded. A's LDS
+// residency is still handled by WVSPLITK_CFG, which drops to the _hf_/_big_
+// variants once Kbp*N no longer fits.
+#define WVSPLIT_TILE_BIGN(__N, _YTILE, _UNRL)      \
+  {                                                \
+    if (on_gfx1x())                                \
+      WVSPLITK_CFG(32, 16, _YTILE, _UNRL, __N)     \
+    else                                           \
+      WVSPLITK_CFG(64, 16, _YTILE, _UNRL, __N)     \
+  }
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK", [&] {
     using fptype = typename scalar<scalar_t>::type;
     fptype* af4 = reinterpret_cast<fptype*>(in_a.data_ptr());
@@ -1314,6 +1329,30 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
         break;
       case 5:
         WVSPLIT_TILE(sYT, 5)
+        break;
+      case 6:
+        WVSPLIT_TILE_BIGN(6, 2, 2)
+        break;
+      case 7:
+        WVSPLIT_TILE_BIGN(7, 2, 2)
+        break;
+      case 8:
+        WVSPLIT_TILE_BIGN(8, 2, 2)
+        break;
+      case 9:
+        WVSPLIT_TILE_BIGN(9, 2, 1)
+        break;
+      case 10:
+        WVSPLIT_TILE_BIGN(10, 2, 1)
+        break;
+      case 11:
+        WVSPLIT_TILE_BIGN(11, 2, 1)
+        break;
+      case 12:
+        WVSPLIT_TILE_BIGN(12, 2, 1)
+        break;
+      case 16:
+        WVSPLIT_TILE_BIGN(16, 2, 1)
         break;
       default:
         throw std::runtime_error(

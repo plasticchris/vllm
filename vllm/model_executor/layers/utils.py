@@ -119,6 +119,15 @@ def use_aiter_triton_gemm(n, m, k, dtype):
     )
 
 
+# Token counts where wvSplitK is measurably faster than rocBLAS; anything else
+# falls through to rocBLAS, which is slower on these shapes but always correct.
+# wvSplitK streams the weights once and stays bandwidth-bound, 1.3-2.6x ahead of
+# Tensile through n=12. It has no WMMA path, so its advantage decays as
+# arithmetic grows with n: at 16 it is break-even, so 16 stays instantiated in
+# skinny_gemms.cu but deliberately unselected here.
+_WVSPLITK_N = frozenset(range(1, 13))
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -178,7 +187,7 @@ def rocm_unquantized_gemm_impl(
 
     if use_skinny:
         x_view = x.reshape(-1, x.size(-1))
-        if m > 8 and 0 < n <= 5:
+        if m > 8 and n in _WVSPLITK_N:
             cu_count = num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -188,6 +189,47 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
+_DRAFT_HEAD_ENV = "VLLM_QWEN35_DRAFT_HEAD"
+
+
+def _draft_head_artifact() -> tuple[str, int] | None:
+    """Path and vocab size of a reduced draft head, or None if not configured.
+
+    Shrinking the draft head trades acceptance for bandwidth: the target still
+    verifies every proposal, so a token absent from the reduced vocabulary can
+    never be drafted but can still be emitted. Cost is acceptance, not
+    correctness.
+    """
+    path = os.environ.get(_DRAFT_HEAD_ENV)
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise ValueError(f"{_DRAFT_HEAD_ENV}={path!r} does not exist")
+
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        keys = set(f.keys())
+        missing = {"lm_head.weight", "d2t"} - keys
+        if missing:
+            raise ValueError(f"{path!r} is missing {sorted(missing)}")
+        rows = f.get_slice("lm_head.weight").get_shape()[0]
+        declared = (f.metadata() or {}).get("draft_vocab_size")
+    if declared is not None and int(declared) != rows:
+        raise ValueError(
+            f"{path!r} declares draft_vocab_size={declared} but holds {rows} rows"
+        )
+    return path, rows
+
+
+def _iter_draft_head_weights(path: str) -> Iterable[tuple[str, torch.Tensor]]:
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        yield "lm_head.weight", f.get_tensor("lm_head.weight")
+        yield "draft_id_to_target_id", f.get_tensor("d2t")
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -227,12 +269,28 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
+        artifact = _draft_head_artifact()
+        self.draft_head_path = None
+        draft_vocab_size = config.vocab_size
+        if artifact is not None:
+            self.draft_head_path, draft_vocab_size = artifact
+            if config.tie_word_embeddings:
+                raise ValueError(
+                    "a reduced draft head cannot be used with tied word "
+                    "embeddings: the head is the embedding table"
+                )
+            if draft_vocab_size > config.vocab_size:
+                raise ValueError(
+                    f"draft vocab {draft_vocab_size} exceeds target vocab "
+                    f"{config.vocab_size}"
+                )
+
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
-                    config.vocab_size,
+                    draft_vocab_size,
                     config.hidden_size,
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
@@ -240,7 +298,25 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(draft_vocab_size)
+
+        if draft_vocab_size != config.vocab_size:
+            # Indexed by global draft id, so every rank holds the whole table.
+            self.draft_id_to_target_id = nn.Parameter(
+                torch.zeros(draft_vocab_size, dtype=torch.long),
+                requires_grad=False,
+            )
+            # Without this the eagle loader shares the target's full-vocab head
+            # with the draft, discarding this one and leaving d2t indexed by
+            # target ids.
+            self.has_own_lm_head = True
+            logger.info(
+                "Qwen3_5MTP reduced draft head: vocab %d -> %d (%.0f%% of the "
+                "head's weight traffic), remapping via draft_id_to_target_id.",
+                config.vocab_size,
+                draft_vocab_size,
+                100.0 * draft_vocab_size / config.vocab_size,
+            )
 
     def embed_input_ids(
         self,
@@ -297,12 +373,19 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
                 elif any(key in name for key in ["embed_tokens", "lm_head"]):
                     if "embed_tokens" in name:
                         name = name.replace("language_model.", "")
+                    elif self.draft_head_path is not None:
+                        # The artifact supersedes the checkpoint's full head.
+                        continue
                 else:
                     continue
                 yield name, weight
 
+            if self.draft_head_path is not None:
+                yield from _iter_draft_head_weights(self.draft_head_path)
+
         loader = AutoWeightsLoader(self)
         return loader.load_weights(remap_weight_names(weights))
+
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):

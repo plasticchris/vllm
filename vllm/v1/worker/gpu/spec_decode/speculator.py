@@ -256,6 +256,22 @@ class DraftModelSpeculator(BaseSpeculator):
                 f"{self.model.__class__.__name__} does not implement "
                 "get_top_tokens()."
             )
+        d2t = getattr(self.model, "draft_id_to_target_id", None)
+        lm_head = getattr(self.model, "lm_head", None)
+        if d2t is not None and lm_head is not None:
+            # The draft argmax is remapped as target_id = k + d2t[k], so the
+            # table must cover exactly the head's vocabulary. A mismatch here
+            # means the head was shared from the target after the draft built
+            # its own (see load_eagle_model), and would index d2t out of bounds
+            # at the first draft step.
+            head_vocab = getattr(lm_head, "org_vocab_size", None)
+            if head_vocab is not None and head_vocab != d2t.numel():
+                raise ValueError(
+                    f"draft_id_to_target_id has {d2t.numel()} entries but the "
+                    f"draft lm_head covers {head_vocab} tokens; the draft head "
+                    "was most likely replaced by the target's (set "
+                    "has_own_lm_head on the draft to keep its own)."
+                )
         logger.info(
             "Using local argmax reduction for draft token generation "
             "(communication: O(2*tp_size) vs O(vocab_size))."
