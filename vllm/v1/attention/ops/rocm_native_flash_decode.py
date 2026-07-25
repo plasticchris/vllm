@@ -27,7 +27,7 @@
 # Env:
 #   ROCM_FLASH_DECODE=0        disable (fall back to stock path)
 #   ROCM_FLASH_DECODE_CHECK=1  also run a torch fp32 oracle, assert match, log max rel err
-#   ROCM_FLASH_DECODE_MAXQ=8   max query_len treated as decode/spec (else prefill)
+#   ROCM_FLASH_DECODE_MAXQ=12  max query_len treated as decode/spec (else prefill)
 import os
 import logging
 
@@ -491,7 +491,9 @@ def try_native_flash_decode(
     if sliding_window not in (0, None, -1, (-1, -1)):
         return False
     Q = int(max_query_len)
-    maxq = int(os.environ.get("ROCM_FLASH_DECODE_MAXQ", "8"))
+    # 12, not 8: Q-batching makes width 12 three KV passes rather than twelve,
+    # and wvSplitK is gated at n<=12. Beyond it the GEMMs hit rocBLAS.
+    maxq = int(os.environ.get("ROCM_FLASH_DECODE_MAXQ", "12"))
     num_seqs = seq_lens.shape[0]
     num_tokens = query.shape[0]
     if Q < 1 or Q > maxq or num_tokens != num_seqs * Q:
