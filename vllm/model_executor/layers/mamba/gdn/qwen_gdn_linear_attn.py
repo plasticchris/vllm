@@ -732,11 +732,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
 
-        The original code used ``rearrange(x, "l (h d) -> 1 l h d", d=...)``
-        followed by ``.contiguous()`` on each tensor.  This version flattens
-        all three splits into a single buffer via ``torch.cat`` so that
-        torch.compile emits one Triton copy kernel instead of three separate
-        contiguous() calls.
+        The q/k/v slices of a packed row are non-contiguous, so a copy is
+        unavoidable. This method runs inside the vllm::qwen_gdn_attention_core
+        custom op, which torch.compile treats as opaque, so an eager
+        split/reshape/cat here never gets fused and costs four launches per layer
+        per decode step. repack_mixed_qkv does the same movement in one.
         """
         if mixed_qkv is None:
             return None, None, None
@@ -746,11 +746,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         k_dim = self.key_dim // self.tp_size
         v_dim = self.value_dim // self.tp_size
 
-        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
-
-        fused = torch.cat(
-            [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0
-        )
+        fused = repack_mixed_qkv(mixed_qkv, q_dim, k_dim, v_dim)
 
         q_size = seq_len * q_dim
         k_size = seq_len * k_dim
@@ -1746,3 +1742,59 @@ def fused_gdn_gating(
         num_warps=1,
     )
     return g, beta_output
+
+
+@triton.jit
+def _repack_mixed_qkv_kernel(
+    src,
+    dst,
+    seq_len,
+    Q_DIM: tl.constexpr,
+    K_DIM: tl.constexpr,
+    V_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    total = Q_DIM + K_DIM + V_DIM
+    q_size = seq_len * Q_DIM
+    k_size = seq_len * K_DIM
+
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < seq_len * total
+
+    in_q = offs < q_size
+    in_k = (offs >= q_size) & (offs < q_size + k_size)
+
+    # Select the destination section branch-free so the whole repack is one launch.
+    base = tl.where(in_q, 0, tl.where(in_k, q_size, q_size + k_size))
+    width = tl.where(in_q, Q_DIM, tl.where(in_k, K_DIM, V_DIM))
+    row_off = tl.where(in_q, 0, tl.where(in_k, Q_DIM, Q_DIM + K_DIM))
+
+    local = offs - base
+    src_off = (local // width) * total + row_off + local % width
+    tl.store(dst + offs, tl.load(src + src_off, mask=mask, other=0), mask=mask)
+
+
+def repack_mixed_qkv(
+    mixed_qkv: torch.Tensor, q_dim: int, k_dim: int, v_dim: int
+) -> torch.Tensor:
+    """Scatter a packed [seq, Q+K+V] tensor into one [q | k | v] contiguous buffer.
+
+    Equivalent to ``torch.cat([q.reshape(-1), k.reshape(-1), v.reshape(-1)])``
+    over a last-dim ``torch.split``, but in a single launch instead of four
+    (three reshape materializations plus the cat). Bitwise identical.
+    """
+    assert mixed_qkv.shape[-1] == q_dim + k_dim + v_dim, (
+        f"packed width {mixed_qkv.shape[-1]} != {q_dim}+{k_dim}+{v_dim}"
+    )
+    # The index arithmetic assumes a row stride of exactly q_dim+k_dim+v_dim.
+    if not mixed_qkv.is_contiguous():
+        mixed_qkv = mixed_qkv.contiguous()
+
+    seq_len = mixed_qkv.shape[0]
+    n = seq_len * (q_dim + k_dim + v_dim)
+    out = torch.empty(n, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    BLOCK = 1024
+    _repack_mixed_qkv_kernel[(triton.cdiv(n, BLOCK),)](
+        mixed_qkv, out, seq_len, q_dim, k_dim, v_dim, BLOCK=BLOCK, num_warps=4
+    )
+    return out

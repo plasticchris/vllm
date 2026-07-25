@@ -797,6 +797,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    UPCAST_FP8: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -833,6 +834,13 @@ def _w8a8_triton_block_scaled_mm(
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
+        if UPCAST_FP8:
+            # RDNA (gfx10/11) has no native fp8 matrix op; Triton's fp8
+            # tl.dot hangs the AMDGPU backend. e4m3->bf16 is lossless
+            # (3 < 7 mantissa bits) and fp32 accumulation keeps the result
+            # bit-identical to a native fp8 dot.
+            a = a.to(tl.bfloat16)
+            b = b.to(tl.bfloat16)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -888,6 +896,21 @@ def get_w8a8_block_fp8_configs(
         config_file_path,
     )
     return None
+
+
+@functools.cache
+def _rocm_upcast_fp8_dot() -> bool:
+    """RDNA (gfx10/11) lacks a native fp8 matrix instruction, so Triton's
+    fp8 tl.dot drives the AMDGPU backend into a pathological (effectively
+    infinite) compile. Upcast operands to bf16 before the dot on those
+    devices; CDNA (gfx9/MI300) and CUDA keep the faster native fp8 path."""
+    if not current_platform.is_rocm():
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+    return arch.startswith(("gfx10", "gfx11"))
 
 
 def w8a8_triton_block_scaled_mm(
@@ -981,6 +1004,7 @@ def w8a8_triton_block_scaled_mm(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
+        UPCAST_FP8=_rocm_upcast_fp8_dot(),
         **config,
     )
 
