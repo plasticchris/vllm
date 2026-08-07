@@ -823,6 +823,14 @@ def context_attention_fwd(
         BLOCK_N = 64
         fwd_num_warps = 8
 
+    # Lower unrolling avoids scratch spills for non-power-of-two pages on gfx1100.
+    cache_unroll = 4
+    if current_platform.is_rocm() and not is_pow2:
+        from vllm.platforms.rocm import on_gfx1100
+
+        if on_gfx1100():
+            cache_unroll = 1
+
     # TRITON_BLOCK_SIZE is kept at 32 to ensure
     # correct alignment logic when the kernel handles
     # non-standard sizes (such as 544).
@@ -879,7 +887,7 @@ def context_attention_fwd(
         USE_FP8=fp8_out_scale is not None,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_unroll_cache=4,
+        num_unroll_cache=cache_unroll,
         num_unroll_request=1,
         num_warps=fwd_num_warps,
         num_stages=1,
