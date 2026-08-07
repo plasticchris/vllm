@@ -801,6 +801,13 @@ def context_attention_fwd(
 
     real_block_size = v_cache.shape[3]
     is_pow2 = real_block_size > 0 and (real_block_size & (real_block_size - 1) == 0)
+    is_gfx1100 = False
+    if current_platform.is_rocm() and not is_pow2:
+        from vllm.platforms.rocm import on_gfx1100
+
+        is_gfx1100 = on_gfx1100()
+    use_wide_gfx1100_tile = is_gfx1100 and Lk_padded == 256
+
     # For standard models involving powers of 2,
     # follow the original logic (Llama 128/64)
     if is_pow2:
@@ -816,20 +823,18 @@ def context_attention_fwd(
         # BLOCK_M), so BLOCK_M=32 re-read the whole cached context ~4x more than the
         # pow2 path. Raise the query tile to the pow2 path's footprint
         # (BLOCK_M*BLOCK_DMODEL_PADDED ~= 128*128 -> BLOCK_M 64 at head_size 256) and
-        # spread it over 8 warps (256 lanes) instead of 4 so per-thread VGPR pressure
-        # halves -- at head_size 256 the 4-warp version pegs the RDNA3 256-VGPR ceiling
-        # and spills to scratch; 8 warps cuts that spill.
-        BLOCK_M = min(128, max(32, 16384 // Lk_padded))
+        # At head size 256, gfx1100 can double cache reuse with 128 rows over
+        # 16 warps while preserving the prior per-thread footprint.
+        BLOCK_M = (
+            128
+            if use_wide_gfx1100_tile
+            else min(128, max(32, 16384 // Lk_padded))
+        )
         BLOCK_N = 64
-        fwd_num_warps = 8
+        fwd_num_warps = 16 if use_wide_gfx1100_tile else 8
 
-    # Lower unrolling avoids scratch spills for non-power-of-two pages on gfx1100.
-    cache_unroll = 4
-    if current_platform.is_rocm() and not is_pow2:
-        from vllm.platforms.rocm import on_gfx1100
-
-        if on_gfx1100():
-            cache_unroll = 1
+    # Larger workgroups and lower unrolling reduce gfx1100 scratch spills.
+    cache_unroll = 1 if is_gfx1100 and not is_pow2 else 4
 
     # TRITON_BLOCK_SIZE is kept at 32 to ensure
     # correct alignment logic when the kernel handles
