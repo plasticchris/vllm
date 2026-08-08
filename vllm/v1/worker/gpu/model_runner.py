@@ -34,6 +34,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -1383,6 +1384,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            num_speculative_steps=scheduler_output.num_spec_tokens_to_schedule,
         )
 
         if not self.is_last_pp_rank:
@@ -1405,6 +1407,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        runtime_speculative_steps = self.execute_model_state.num_speculative_steps
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1496,6 +1499,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            if getattr(self, "_last_runtime_speculative_steps", None) != runtime_speculative_steps:
+                if is_global_first_rank():
+                    logger.info(
+                        "MRV2 speculative depth: K=%d requests=%d",
+                        runtime_speculative_steps,
+                        input_batch.num_reqs,
+                    )
+                self._last_runtime_speculative_steps = runtime_speculative_steps
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
@@ -1517,15 +1528,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
+                num_speculative_steps=runtime_speculative_steps,
             )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            self.req_states.draft_tokens[input_batch.idx_mapping] = 0
+            self.req_states.draft_tokens[
+                input_batch.idx_mapping, :runtime_speculative_steps
+            ] = draft_tokens
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping, :runtime_speculative_steps
+                ],
             )
 
         # Post-step KV connector related operations.
@@ -1647,6 +1664,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    num_speculative_steps: int
 
 
 def sort_batch_req_ids(

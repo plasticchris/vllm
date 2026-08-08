@@ -854,6 +854,24 @@ class VllmConfig:
         )
         speculative_config.num_speculative_tokens_per_batch_size = None
 
+    def _validate_mrv2_dynamic_sd(self) -> None:
+        speculative_config = self.speculative_config
+        if (
+            speculative_config is None
+            or not self.use_v2_model_runner
+            or not speculative_config.uses_dynamic_speculative_decoding()
+        ):
+            return
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "MRV2 dynamic speculative decoding does not support pipeline parallelism"
+            )
+        if speculative_config.use_dflash() or speculative_config.use_dspark():
+            raise ValueError(
+                "MRV2 dynamic speculative decoding currently supports only "
+                "autoregressive draft methods"
+            )
+
     def _post_init_kv_transfer_config(self) -> None:
         """Update KVTransferConfig based on top-level configs in VllmConfig.
 
@@ -1271,6 +1289,7 @@ class VllmConfig:
             )
 
         self._maybe_disable_dynamic_sd_for_data_parallel()
+        self._validate_mrv2_dynamic_sd()
         self._maybe_override_dynamic_sd_cudagraph_mode()
 
         if (
