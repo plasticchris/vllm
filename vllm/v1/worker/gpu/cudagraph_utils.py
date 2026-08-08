@@ -200,6 +200,7 @@ class CudaGraphManager:
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
+            and self.decode_query_len > 1
         ):
             num_spec_per_batch_size = (
                 speculative_config.num_speculative_tokens_per_batch_size

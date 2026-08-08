@@ -326,3 +326,37 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
                 assert desc.num_tokens == num_tokens
                 assert desc.num_reqs is None
             assert desc.num_active_loras == 0
+
+
+def test_mtp_draft_decode_manager_ignores_target_dynamic_query_lengths(monkeypatch):
+    """The autoregressive MTP draft-decode graph always runs one token/request."""
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    config = _create_vllm_config_for_dsd(
+        max_num_seqs=2,
+        max_spec_tokens=8,
+        cudagraph_mode="FULL_AND_PIECEWISE",
+        num_spec_per_batch_size=[(1, 1, 8), (2, 2, 4)],
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=1,
+    )
+    manager._graphs_captured = True
+
+    for num_reqs in (1, 2):
+        desc = manager.dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_reqs,
+            uniform_token_count=1,
+            num_active_loras=0,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert desc.uniform_token_count == 1
+        assert desc.num_tokens == num_reqs
+        assert desc.num_reqs == num_reqs
