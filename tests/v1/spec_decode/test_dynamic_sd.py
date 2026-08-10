@@ -245,3 +245,39 @@ def test_scheduler_passes_max_num_seqs_as_dsd_runtime_batch_limit():
     assert len(scheduler.dynamic_sd_lookup) == 17
     assert len(output.num_scheduled_tokens) == 16
     assert output.num_spec_tokens_to_schedule == 3
+
+
+def test_dynamic_sd_caps_k_for_long_decode_context():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 1, 8)],
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+        runtime_num_speculative_tokens=8,
+    )
+    scheduler.long_context_threshold = 32
+    scheduler.long_context_num_spec_tokens = 4
+    (request,) = create_requests(num_requests=1, num_tokens=64)
+    request.num_computed_tokens = request.num_prompt_tokens
+    request.append_output_token_ids([42])
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_spec_tokens_to_schedule == 4
+
+
+def test_dynamic_sd_keeps_batch_k_for_short_decode_context():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 1, 8)],
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+        runtime_num_speculative_tokens=8,
+    )
+    scheduler.long_context_threshold = 128
+    scheduler.long_context_num_spec_tokens = 4
+    (request,) = create_requests(num_requests=1, num_tokens=64)
+    request.num_computed_tokens = request.num_prompt_tokens
+    request.append_output_token_ids([42])
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_spec_tokens_to_schedule == 8

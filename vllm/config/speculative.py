@@ -181,6 +181,10 @@ class SpeculativeConfig:
     Each entry is ``(range_start, range_end, num_speculative_tokens)`` with an
     inclusive batch-size range.
     """
+    long_context_threshold: int | None = Field(default=None, ge=1)
+    """Decode context length where dynamic SD caps K to the long-context value."""
+    long_context_num_speculative_tokens: int | None = Field(default=None, ge=0)
+    """Maximum K at or above ``long_context_threshold``."""
 
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -664,6 +668,22 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
+        if (self.long_context_threshold is None) != (
+            self.long_context_num_speculative_tokens is None
+        ):
+            raise ValueError(
+                "long_context_threshold and long_context_num_speculative_tokens "
+                "must be configured together"
+            )
+        if (
+            self.long_context_threshold is not None
+            and self.num_speculative_tokens_per_batch_size is None
+        ):
+            raise ValueError(
+                "long-context K requires num_speculative_tokens_per_batch_size "
+                "so every runtime K has a captured graph"
+            )
+
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight

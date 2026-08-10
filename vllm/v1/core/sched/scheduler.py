@@ -235,7 +235,13 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self.long_context_threshold: int | None = None
+        self.long_context_num_spec_tokens: int | None = None
         if speculative_config is not None:
+            self.long_context_threshold = speculative_config.long_context_threshold
+            self.long_context_num_spec_tokens = (
+                speculative_config.long_context_num_speculative_tokens
+            )
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -1129,6 +1135,21 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+            if self.long_context_threshold is not None and all(
+                self.requests[req_id].num_computed_tokens
+                >= self.requests[req_id].num_prompt_tokens
+                for req_id in num_scheduled_tokens
+            ):
+                max_context = max(
+                    self.requests[req_id].num_computed_tokens
+                    for req_id in num_scheduled_tokens
+                )
+                if max_context >= self.long_context_threshold:
+                    assert self.long_context_num_spec_tokens is not None
+                    num_spec_tokens_to_schedule = min(
+                        num_spec_tokens_to_schedule,
+                        self.long_context_num_spec_tokens,
+                    )
 
         scheduled_encoder_input_stats = None
         if (
