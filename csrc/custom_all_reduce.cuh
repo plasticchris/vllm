@@ -571,12 +571,29 @@ class CustomAllreduce {
     const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
     bool force_1stage = false;
     bool force_2stage = false;
+    if (const char* threshold = std::getenv("VLLM_CUSTOM_AR_2STAGE_MIN_BYTES");
+        threshold != nullptr && env_algo == nullptr) {
+      try {
+        std::string value(threshold);
+        size_t parsed = 0;
+        auto min_bytes = std::stoll(value, &parsed);
+        if (parsed != value.size() || min_bytes < 0)
+          throw std::invalid_argument("invalid threshold");
+        force_2stage = bytes >= static_cast<size_t>(min_bytes);
+        force_1stage = !force_2stage;
+      } catch (const std::exception&) {
+        throw std::runtime_error(
+            "VLLM_CUSTOM_AR_2STAGE_MIN_BYTES must be a non-negative integer");
+      }
+    }
     if (env_algo != nullptr) {
       if (std::strcmp(env_algo, "1stage") == 0 ||
           std::strcmp(env_algo, "oneshot") == 0) {
         force_1stage = true;
+        force_2stage = false;
       } else if (std::strcmp(env_algo, "2stage") == 0 ||
                  std::strcmp(env_algo, "twoshot") == 0) {
+        force_1stage = false;
         force_2stage = true;
       } else {
         throw std::runtime_error(
