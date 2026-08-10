@@ -237,11 +237,13 @@ class Scheduler(SchedulerInterface):
         self.dynamic_sd_lookup: list[int] | None = None
         self.long_context_threshold: int | None = None
         self.long_context_num_spec_tokens: int | None = None
+        self.greedy_num_spec_tokens: int | None = None
         if speculative_config is not None:
             self.long_context_threshold = speculative_config.long_context_threshold
             self.long_context_num_spec_tokens = (
                 speculative_config.long_context_num_speculative_tokens
             )
+            self.greedy_num_spec_tokens = speculative_config.greedy_num_speculative_tokens
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -1150,6 +1152,14 @@ class Scheduler(SchedulerInterface):
                         num_spec_tokens_to_schedule,
                         self.long_context_num_spec_tokens,
                     )
+            if self.greedy_num_spec_tokens is not None and all(
+                self.requests[req_id].sampling_params.temperature == 0
+                for req_id in num_scheduled_tokens
+            ):
+                num_spec_tokens_to_schedule = min(
+                    num_spec_tokens_to_schedule,
+                    self.greedy_num_spec_tokens,
+                )
 
         scheduled_encoder_input_stats = None
         if (

@@ -281,3 +281,21 @@ def test_dynamic_sd_keeps_batch_k_for_short_decode_context():
 
     output = scheduler.schedule()
     assert output.num_spec_tokens_to_schedule == 8
+
+
+def test_dynamic_sd_caps_k_for_greedy_sampling():
+    scheduler = _make_scheduler_with_dynamic_sd(
+        [(1, 1, 8)],
+        max_num_seqs=1,
+        max_num_batched_tokens=128,
+        runtime_num_speculative_tokens=8,
+    )
+    scheduler.greedy_num_spec_tokens = 4
+    (request,) = create_requests(num_requests=1, num_tokens=64)
+    request.sampling_params.temperature = 0
+    request.num_computed_tokens = request.num_prompt_tokens
+    request.append_output_token_ids([42])
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_spec_tokens_to_schedule == 4

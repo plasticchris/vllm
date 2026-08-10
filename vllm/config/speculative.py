@@ -185,6 +185,8 @@ class SpeculativeConfig:
     """Decode context length where dynamic SD caps K to the long-context value."""
     long_context_num_speculative_tokens: int | None = Field(default=None, ge=0)
     """Maximum K at or above ``long_context_threshold``."""
+    greedy_num_speculative_tokens: int | None = Field(default=None, ge=0)
+    """Maximum K for requests using greedy target sampling."""
 
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -682,6 +684,14 @@ class SpeculativeConfig:
             raise ValueError(
                 "long-context K requires num_speculative_tokens_per_batch_size "
                 "so every runtime K has a captured graph"
+            )
+        if (
+            self.greedy_num_speculative_tokens is not None
+            and self.num_speculative_tokens_per_batch_size is None
+        ):
+            raise ValueError(
+                "greedy K requires num_speculative_tokens_per_batch_size so "
+                "every runtime K has a captured graph"
             )
 
         # Note: "method" is a new parameter that helps to extend the
