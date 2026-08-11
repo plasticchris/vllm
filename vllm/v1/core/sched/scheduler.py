@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -65,6 +67,21 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# Per-step (drafted, accepted) trace for speculation research. Off unless
+# VLLM_SPEC_TRACE names a file. Written through so a run can be analyzed while
+# the server stays up; one buffered line per ~30 ms decode step is free.
+_SPEC_TRACE_PATH = os.environ.get("VLLM_SPEC_TRACE")
+_spec_trace_file = open(_SPEC_TRACE_PATH, "a") if _SPEC_TRACE_PATH else None
+
+
+def _spec_trace_write(step: int, req_id: str, drafted: int, accepted: int) -> None:
+    _spec_trace_file.write(f"{step}\t{req_id}\t{drafted}\t{accepted}\n")
+    _spec_trace_file.flush()
+
+
+if _spec_trace_file is not None:
+    atexit.register(_spec_trace_file.close)
 
 
 class Scheduler(SchedulerInterface):
@@ -1722,6 +1739,10 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
+                if _SPEC_TRACE_PATH:
+                    _spec_trace_write(
+                        self.current_step, req_id, num_draft_tokens, num_accepted
+                    )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
