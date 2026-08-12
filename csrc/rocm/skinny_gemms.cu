@@ -1213,17 +1213,23 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int max_lds_len = get_lds_size() / 2;
+  // 0 = auto, 2 = force wvSplitK_hf_, 3 = force wvSplitK_hf_big_
+  static int _wv_tier = []() {
+    const char* e = getenv("VLLM_WVSPLITK_TIER");
+    return e ? atoi(e) : 0;
+  }();
 
 #define WVSPLITK_CFG(_THRDS, _WVPRGRP, _YTILE, _UNRL, _N)                     \
   {                                                                           \
     dim3 block(_THRDS, _WVPRGRP);                                             \
     int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, _WVPRGRP);                 \
-    if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))               \
+    if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0) && !_wv_tier)  \
       wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>        \
           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
                                        By_in, af4, bf4, biasf4, c, __wvPrGrp, \
                                        CuCount);                              \
-    else if (Kbp_in * N_in <= max_lds_len * 1.2)                              \
+    else if ((Kbp_in * N_in <= max_lds_len * 1.2 || _wv_tier == 2) &&         \
+             _wv_tier != 3 && (_N < 6 || _wv_tier == 2))                      \
       wvSplitK_hf_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>            \
           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
                                        By_in, af4, bf4, biasf4, c, __wvPrGrp, \

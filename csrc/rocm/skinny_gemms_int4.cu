@@ -732,13 +732,20 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
     else if (_int4g_fY == 2 && _int4g_fU == 4) WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP) \
     else if (_int4g_fY == 4 && _int4g_fU == 1) WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP) \
     else if (_int4g_fY == 4 && _int4g_fU == 2) WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP) \
+    else if (_int4g_fY == 8 && _int4g_fU == 1) WVSPLIT_INT4G_GS(8, 1, __N, _HAS_ZP) \
+    else if (_int4g_fY == 8 && _int4g_fU == 2) WVSPLIT_INT4G_GS(8, 2, __N, _HAS_ZP) \
+    else if (_int4g_fY == 16 && _int4g_fU == 1) WVSPLIT_INT4G_GS(16, 1, __N, _HAS_ZP) \
     else WVSPLIT_INT4G_GS(4, 4, __N, _HAS_ZP)                        \
   }
 
 #define WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                        \
   {                                                                   \
     if (_int4g_fY > 0 && _int4g_fU > 0) { WVSPLIT_INT4G_FORCE(__N, _HAS_ZP) } else \
-    if (K_in * N_in > max_lds_len) {                                  \
+    if (__N >= 7 && M_in % 8 == 0) {                                  \
+      /* speculative-decode batch: the wider tile amortizes the weight \
+         read across more output rows (see sweep in the header) */    \
+      WVSPLIT_INT4G_GS(8, 1, __N, _HAS_ZP)                            \
+    } else if (K_in * N_in > max_lds_len) {                           \
       if (_sYT < 30)                                                  \
         WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                          \
       else                                                            \
