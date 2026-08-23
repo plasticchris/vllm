@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -51,12 +52,20 @@ from vllm.distributed.utils import is_weak_contiguous  # noqa: E402
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
 
-    # max_size: max supported allreduce size
+    # max_size: max supported allreduce size (eager-mode copy buffer). Env override
+    # VLLM_CUSTOM_AR_MAX_BYTES raises the dispatch boundary so bigger ARs use the
+    # custom P2P kernels instead of NCCL. Measured A/B 2026-08-23 on gfx1100 (qwen3.8
+    # 27B, TP=4, C=1024): 256 MB boundary LOSES at prefill sizes — warm prefill
+    # 1452 -> 588 tok/s, mixed prefill 906 -> 529 tok/s, clean decode 29.4 -> 23.8
+    # tok/s (2-stage custom AR is ~2.5x slower than RCCL's 16-channel ring on big
+    # P2P-payload ARs). Keep the default 8 MB (decode-sized ARs only, the only
+    # regime where custom beats NCCL); the knob exists for future kernels, not
+    # for current prefill workloads.
     def __init__(
         self,
         group: ProcessGroup,
         device: int | str | torch.device,
-        max_size=8192 * 1024,
+        max_size: int | None = None,
         symm_mem_enabled=False,
     ) -> None:
         """
@@ -72,6 +81,13 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self.disabled = True
         self._rdna3 = False
+
+        if max_size is None:
+            max_size = int(
+                os.environ.get("VLLM_CUSTOM_AR_MAX_BYTES", 8192 * 1024)
+            )
+            if max_size <= 0 or max_size % 16:
+                max_size = 8192 * 1024
 
         if not custom_ar:
             # disable because of missing custom allreduce library
