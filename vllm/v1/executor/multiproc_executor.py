@@ -842,6 +842,15 @@ class WorkerProc:
         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
 
+        # asgard: spawn scrubs the parent env (see /proc/*/environ: workers start
+        # with ~15 import-time vars), so ROCr flags must be set here, before the
+        # first GPU op (ROCr parses env once at first hsa_init). With our patched
+        # libhsa-runtime64 (spin-then-sleep fallback, /mnt/scratch/hsafix/README.md),
+        # a nonzero budget frees this thread's core while a step is in flight
+        # (measured 0.997 -> 0.173 core at 100us on the per-step D2H sync). The lib
+        # default is 0 (upstream pure-spin), so only this fork path is affected.
+        os.environ.setdefault("HSA_SIGNAL_WAIT_SPIN_BUDGET_US", "100")
+
         worker = None
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
