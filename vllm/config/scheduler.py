@@ -155,6 +155,9 @@ class SchedulerConfig:
     steps. This protects inter-token latency on a single engine and aligns
     prefill work across ranks in data-parallel deployments."""
 
+    decode_active_prefill_token_budget: int | None = Field(default=None, ge=1)
+    """Maximum prefill tokens per step while decode requests are active."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.

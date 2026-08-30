@@ -68,20 +68,42 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-# Per-step (drafted, accepted) trace for speculation research. Off unless
-# VLLM_SPEC_TRACE names a file. Written through so a run can be analyzed while
-# the server stays up; one buffered line per ~30 ms decode step is free.
-_SPEC_TRACE_PATH = os.environ.get("VLLM_SPEC_TRACE")
-_spec_trace_file = open(_SPEC_TRACE_PATH, "a") if _SPEC_TRACE_PATH else None
+
+class _TsvTrace:
+    def __init__(self, path: str | None, columns: str, flush_interval: float = 1):
+        self.path = path
+        self.columns = columns
+        self.file = None
+        self.flush_interval = flush_interval
+        self.last_flush = time.monotonic()
+
+    def write(self, *values: object) -> None:
+        if self.path is None:
+            return
+        if self.file is None:
+            self.file = open(self.path, "a")
+            self.file.write(f"# start={time.time():.6f}\t{self.columns}\n")
+        self.file.write(f"{time.time():.6f}\t" + "\t".join(map(str, values)) + "\n")
+        now = time.monotonic()
+        if now - self.last_flush >= self.flush_interval:
+            self.file.flush()
+            self.last_flush = now
+
+    def close(self) -> None:
+        if self.file is not None:
+            self.file.close()
 
 
-def _spec_trace_write(step: int, req_id: str, drafted: int, accepted: int) -> None:
-    _spec_trace_file.write(f"{step}\t{req_id}\t{drafted}\t{accepted}\n")
-    _spec_trace_file.flush()
-
-
-if _spec_trace_file is not None:
-    atexit.register(_spec_trace_file.close)
+_spec_trace = _TsvTrace(
+    os.environ.get("VLLM_SPEC_TRACE"),
+    "timestamp\tstep\tbatch_size\trequest_id\tdrafted\taccepted",
+)
+_prefix_trace = _TsvTrace(
+    os.environ.get("VLLM_PREFIX_TRACE"),
+    "timestamp\tstep\trequest_id\tqueried\thits\tpreempted",
+)
+atexit.register(_spec_trace.close)
+atexit.register(_prefix_trace.close)
 
 
 class Scheduler(SchedulerInterface):
@@ -479,12 +501,16 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # On a throttled (non-cadence-aligned) step, defer all prefill compute
-        # while decode work is active, unless prefill admission exhausted the
-        # token budget on the previous release step.
+        # Protect active decodes with both cadence and an aggregate prefill cap.
+        active_decode = any(not r.is_prefill_chunk for r in self.running)
         defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+            throttle_prefills and not self.prefill_capacity_bound and active_decode
+        )
+        prefill_token_budget = (
+            self.scheduler_config.decode_active_prefill_token_budget
+            if active_decode
+            else None
+        )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -524,6 +550,8 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if request.is_prefill_chunk and prefill_token_budget is not None:
+                num_new_tokens = min(num_new_tokens, prefill_token_budget)
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -602,7 +630,15 @@ class Scheduler(SchedulerInterface):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            restored_tokens = num_scheduled_tokens.pop(
+                                preempted_req_id
+                            )
+                            token_budget += restored_tokens
+                            if (
+                                prefill_token_budget is not None
+                                and preempted_req.is_prefill_chunk
+                            ):
+                                prefill_token_budget += restored_tokens
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -637,6 +673,8 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            if request.is_prefill_chunk and prefill_token_budget is not None:
+                prefill_token_budget -= num_new_tokens
             req_index += 1
 
             # Speculative decode related.
@@ -844,12 +882,13 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                is_waiting_prefill = num_computed_tokens < request.num_tokens - 1
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
-                elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
+                elif defer_prefills and is_waiting_prefill:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
                     break
@@ -881,6 +920,10 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    if is_waiting_prefill and prefill_token_budget is not None:
+                        num_new_tokens = min(num_new_tokens, prefill_token_budget)
+                        if num_new_tokens == 0:
+                            break
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -996,6 +1039,13 @@ class Scheduler(SchedulerInterface):
                         )
 
                 request = request_queue.pop_request()
+                _prefix_trace.write(
+                    self.current_step,
+                    request_id,
+                    request.num_tokens,
+                    num_new_local_computed_tokens,
+                    int(request.num_preemptions > 0),
+                )
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1047,6 +1097,8 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                if is_waiting_prefill and prefill_token_budget is not None:
+                    prefill_token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
@@ -1741,10 +1793,13 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
-                if _SPEC_TRACE_PATH:
-                    _spec_trace_write(
-                        self.current_step, req_id, num_draft_tokens, num_accepted
-                    )
+                _spec_trace.write(
+                    self.current_step,
+                    len(scheduler_output.num_scheduled_tokens),
+                    req_id,
+                    num_draft_tokens,
+                    num_accepted,
+                )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,

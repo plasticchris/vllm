@@ -27,7 +27,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler, _TsvTrace
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import (
@@ -42,6 +42,17 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_tsv_trace(tmp_path):
+    path = tmp_path / "trace.tsv"
+    trace = _TsvTrace(str(path), "timestamp\tvalue")
+    trace.write("value")
+    trace.close()
+
+    lines = path.read_text().splitlines()
+    assert lines[0].startswith("# start=")
+    assert lines[1].split("\t")[1:] == ["value"]
 
 
 def test_engine_core_prefill_cadence():
@@ -60,6 +71,73 @@ def test_engine_core_prefill_cadence():
         True,
         False,
     ]
+
+
+def test_decode_active_prefill_token_budget():
+    scheduler = create_scheduler(
+        max_num_seqs=4,
+        max_num_batched_tokens=8192,
+        long_prefill_token_threshold=1024,
+        decode_active_prefill_token_budget=2048,
+    )
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["dec"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec"],
+            req_id_to_index={"dec": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    prefills = create_requests(
+        num_requests=3, num_tokens=4000, req_ids=["p0", "p1", "p2"]
+    )
+    for request in prefills:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["dec"] == 1
+    assert sum(
+        count
+        for request_id, count in output.num_scheduled_tokens.items()
+        if request_id.startswith("p")
+    ) == 2048
+    assert "p2" not in output.num_scheduled_tokens
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec", "p0", "p1"],
+            req_id_to_index={"dec": 0, "p0": 1, "p1": 2},
+            sampled_token_ids=[[0], [], []],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    output = scheduler.schedule()
+    assert sum(
+        count
+        for request_id, count in output.num_scheduled_tokens.items()
+        if request_id.startswith("p")
+    ) == 2048
+
+    prefill_only = create_scheduler(
+        max_num_seqs=3,
+        max_num_batched_tokens=8192,
+        long_prefill_token_threshold=1024,
+        decode_active_prefill_token_budget=2048,
+    )
+    for request in create_requests(
+        num_requests=3, num_tokens=4000, req_ids=["a", "b", "c"]
+    ):
+        prefill_only.add_request(request)
+    output = prefill_only.schedule()
+    assert sum(output.num_scheduled_tokens.values()) == 3072
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
