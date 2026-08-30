@@ -73,6 +73,53 @@ def test_engine_core_prefill_cadence():
     ]
 
 
+def test_engine_core_high_load_prefill_policy():
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = Mock()
+    core.scheduler.get_request_counts.return_value = (3, 2)
+    core.scheduler.get_max_decode_tokens.return_value = 8
+    core.scheduler.get_decode_prefill_arrival_gap.return_value = 2.0
+    core.prefill_schedule_interval = 4
+    core.prefill_schedule_high_load_interval = 6
+    core.prefill_schedule_high_load_threshold = 5
+    core.prefill_schedule_high_load_decode_tokens = 8
+    core.prefill_schedule_high_load_decode_lead_seconds = 1.0
+    core.decode_active_prefill_token_budget = 3072
+    core.decode_active_prefill_high_load_token_budget = 1632
+    core._prefill_schedule_step = 0
+
+    core.scheduler.get_max_decode_tokens.return_value = 7
+    assert core._current_prefill_token_budget() == 3072
+    core.scheduler.get_max_decode_tokens.return_value = 8
+    core.scheduler.get_decode_prefill_arrival_gap.return_value = 0.5
+    assert core._current_prefill_token_budget() == 3072
+    core.scheduler.get_decode_prefill_arrival_gap.return_value = 2.0
+    assert [core._should_throttle_prefills() for _ in range(7)] == [
+        False, True, True, True, True, True, False
+    ]
+    assert core._current_prefill_token_budget() == 1632
+
+    core.scheduler.get_request_counts.return_value = (2, 2)
+    core._prefill_schedule_step = 0
+    assert [core._should_throttle_prefills() for _ in range(5)] == [
+        False, True, True, True, False
+    ]
+    assert core._current_prefill_token_budget() == 3072
+
+
+def test_decode_prefill_arrival_gap():
+    scheduler = Scheduler.__new__(Scheduler)
+    decode = Mock(is_prefill_chunk=False, arrival_time=10.0)
+    prefill = Mock(is_prefill_chunk=True, arrival_time=12.5)
+    scheduler.running = [decode, prefill]
+    scheduler.waiting = []
+    scheduler.skipped_waiting = []
+
+    assert scheduler.get_decode_prefill_arrival_gap() == 2.5
+    prefill.arrival_time = 9.0
+    assert scheduler.get_decode_prefill_arrival_gap() == 0.0
+
+
 def test_prefill_budget_rotates_when_all_candidates_do_not_fit():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._prefill_rr_cursor = 0

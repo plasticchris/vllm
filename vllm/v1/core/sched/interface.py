@@ -50,7 +50,11 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
+    def schedule(
+        self,
+        throttle_prefills: bool = False,
+        decode_active_prefill_token_budget: int | None = None,
+    ) -> "SchedulerOutput":
         """Schedule the requests to process in this scheduling step.
 
         The scheduling decision is made at the iteration level. Each scheduling
@@ -227,6 +231,16 @@ class SchedulerInterface(ABC):
         This should be called when model weights are updated to ensure
         stale vision embeddings are not reused.
         """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_max_decode_tokens(self) -> int:
+        """Maximum generated-token count among active decode requests."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_decode_prefill_arrival_gap(self) -> float:
+        """Arrival-time lead of the oldest decode over the oldest prefill."""
         raise NotImplementedError
 
     @abstractmethod

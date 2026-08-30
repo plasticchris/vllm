@@ -158,6 +158,29 @@ class SchedulerConfig:
     decode_active_prefill_token_budget: int | None = Field(default=None, ge=1)
     """Maximum prefill tokens per step while decode requests are active."""
 
+    prefill_schedule_high_load_interval: int | None = Field(default=None, ge=1)
+    """Optional prefill cadence used when the number of running plus waiting
+    requests reaches ``prefill_schedule_high_load_threshold``."""
+
+    prefill_schedule_high_load_threshold: int = Field(default=5, ge=1)
+    """Request count that activates the high-load prefill policy."""
+
+    prefill_schedule_high_load_decode_tokens: int = Field(default=0, ge=0)
+    """Minimum generated tokens on a running decode before high-load prefill
+    protection activates."""
+
+    prefill_schedule_high_load_decode_lead_seconds: float = Field(
+        default=0.0, ge=0.0
+    )
+    """Minimum arrival-time lead an active decode must have over active
+    prefills before high-load protection activates. This avoids penalizing
+    equal-length fanouts that transition from prefill to decode unevenly."""
+
+    decode_active_prefill_high_load_token_budget: int | None = Field(
+        default=None, ge=1
+    )
+    """Optional decode-active prefill budget used under high load."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.

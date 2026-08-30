@@ -617,6 +617,21 @@ class EngineArgs:
     decode_active_prefill_token_budget: int | None = (
         SchedulerConfig.decode_active_prefill_token_budget
     )
+    prefill_schedule_high_load_interval: int | None = (
+        SchedulerConfig.prefill_schedule_high_load_interval
+    )
+    prefill_schedule_high_load_threshold: int = (
+        SchedulerConfig.prefill_schedule_high_load_threshold
+    )
+    prefill_schedule_high_load_decode_tokens: int = (
+        SchedulerConfig.prefill_schedule_high_load_decode_tokens
+    )
+    prefill_schedule_high_load_decode_lead_seconds: float = (
+        SchedulerConfig.prefill_schedule_high_load_decode_lead_seconds
+    )
+    decode_active_prefill_high_load_token_budget: int | None = (
+        SchedulerConfig.decode_active_prefill_high_load_token_budget
+    )
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1486,6 +1501,26 @@ class EngineArgs:
             **scheduler_kwargs["decode_active_prefill_token_budget"],
         )
         scheduler_group.add_argument(
+            "--prefill-schedule-high-load-interval",
+            **scheduler_kwargs["prefill_schedule_high_load_interval"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-high-load-threshold",
+            **scheduler_kwargs["prefill_schedule_high_load_threshold"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-high-load-decode-tokens",
+            **scheduler_kwargs["prefill_schedule_high_load_decode_tokens"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-high-load-decode-lead-seconds",
+            **scheduler_kwargs["prefill_schedule_high_load_decode_lead_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--decode-active-prefill-high-load-token-budget",
+            **scheduler_kwargs["decode_active_prefill_high_load_token_budget"],
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -2205,6 +2240,21 @@ class EngineArgs:
             prefill_schedule_interval=self.prefill_schedule_interval,
             decode_active_prefill_token_budget=(
                 self.decode_active_prefill_token_budget
+            ),
+            prefill_schedule_high_load_interval=(
+                self.prefill_schedule_high_load_interval
+            ),
+            prefill_schedule_high_load_threshold=(
+                self.prefill_schedule_high_load_threshold
+            ),
+            prefill_schedule_high_load_decode_tokens=(
+                self.prefill_schedule_high_load_decode_tokens
+            ),
+            prefill_schedule_high_load_decode_lead_seconds=(
+                self.prefill_schedule_high_load_decode_lead_seconds
+            ),
+            decode_active_prefill_high_load_token_budget=(
+                self.decode_active_prefill_high_load_token_budget
             ),
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,

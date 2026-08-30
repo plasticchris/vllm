@@ -112,8 +112,25 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
-        self.prefill_schedule_interval = (
-            vllm_config.scheduler_config.prefill_schedule_interval
+        scheduler_config = vllm_config.scheduler_config
+        self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
+        self.prefill_schedule_high_load_interval = (
+            scheduler_config.prefill_schedule_high_load_interval
+        )
+        self.prefill_schedule_high_load_threshold = (
+            scheduler_config.prefill_schedule_high_load_threshold
+        )
+        self.prefill_schedule_high_load_decode_tokens = (
+            scheduler_config.prefill_schedule_high_load_decode_tokens
+        )
+        self.prefill_schedule_high_load_decode_lead_seconds = (
+            scheduler_config.prefill_schedule_high_load_decode_lead_seconds
+        )
+        self.decode_active_prefill_token_budget = (
+            scheduler_config.decode_active_prefill_token_budget
+        )
+        self.decode_active_prefill_high_load_token_budget = (
+            scheduler_config.decode_active_prefill_high_load_token_budget
         )
         self._prefill_schedule_step = 0
         if not vllm_config.parallel_config.data_parallel_rank_local:
@@ -572,14 +589,59 @@ class EngineCore:
         else:
             eco.scheduler_stats.iteration_details = iteration_details
 
-    def _should_throttle_prefills(self) -> bool:
+    def _prefill_load_is_high(self) -> bool:
+        high_load_interval = getattr(
+            self, "prefill_schedule_high_load_interval", None
+        )
+        high_load_budget = getattr(
+            self, "decode_active_prefill_high_load_token_budget", None
+        )
+        if high_load_interval is None and high_load_budget is None:
+            return False
+        threshold = getattr(self, "prefill_schedule_high_load_threshold", None)
+        if threshold is None:
+            return False
+        running, waiting = self.scheduler.get_request_counts()
+        if running + waiting < threshold:
+            return False
+        minimum_decode_tokens = getattr(
+            self, "prefill_schedule_high_load_decode_tokens", 0
+        )
+        if self.scheduler.get_max_decode_tokens() < minimum_decode_tokens:
+            return False
+        minimum_lead = getattr(
+            self, "prefill_schedule_high_load_decode_lead_seconds", 0.0
+        )
+        return self.scheduler.get_decode_prefill_arrival_gap() >= minimum_lead
+
+    def _current_prefill_token_budget(
+        self, high_load: bool | None = None
+    ) -> int | None:
+        if high_load is None:
+            high_load = self._prefill_load_is_high()
+        if high_load:
+            high_load_budget = getattr(
+                self, "decode_active_prefill_high_load_token_budget", None
+            )
+            if high_load_budget is not None:
+                return high_load_budget
+        return getattr(self, "decode_active_prefill_token_budget", None)
+
+    def _should_throttle_prefills(
+        self, high_load: bool | None = None
+    ) -> bool:
         """Whether this step should protect active decodes from prefill work."""
+        if high_load is None:
+            high_load = self._prefill_load_is_high()
+        interval = self.prefill_schedule_interval
+        if high_load:
+            interval = (
+                getattr(self, "prefill_schedule_high_load_interval", None)
+                or interval
+            )
         step = self._prefill_schedule_step
         self._prefill_schedule_step += 1
-        return (
-            self.prefill_schedule_interval > 1
-            and step % self.prefill_schedule_interval != 0
-        )
+        return interval > 1 and step % interval != 0
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
@@ -592,7 +654,11 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        high_prefill_load = self._prefill_load_is_high()
+        scheduler_output = self.scheduler.schedule(
+            self._should_throttle_prefills(high_prefill_load),
+            self._current_prefill_token_budget(high_prefill_load),
+        )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -650,7 +716,11 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            high_prefill_load = self._prefill_load_is_high()
+            scheduler_output = self.scheduler.schedule(
+                self._should_throttle_prefills(high_prefill_load),
+                self._current_prefill_token_budget(high_prefill_load),
+            )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -1869,6 +1939,24 @@ class DPEngineCoreProc(EngineCoreProc):
 
         scheduler_config = vllm_config.scheduler_config
         self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
+        self.prefill_schedule_high_load_interval = (
+            scheduler_config.prefill_schedule_high_load_interval
+        )
+        self.prefill_schedule_high_load_threshold = (
+            scheduler_config.prefill_schedule_high_load_threshold
+        )
+        self.prefill_schedule_high_load_decode_tokens = (
+            scheduler_config.prefill_schedule_high_load_decode_tokens
+        )
+        self.prefill_schedule_high_load_decode_lead_seconds = (
+            scheduler_config.prefill_schedule_high_load_decode_lead_seconds
+        )
+        self.decode_active_prefill_token_budget = (
+            scheduler_config.decode_active_prefill_token_budget
+        )
+        self.decode_active_prefill_high_load_token_budget = (
+            scheduler_config.decode_active_prefill_high_load_token_budget
+        )
 
         # Counts forward-passes of the model so that we can synchronize
         # finished with DP peers every N steps.
@@ -2020,8 +2108,14 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
-    def _should_throttle_prefills(self) -> bool:
-        # Throttle new prefills to cadence-aligned steps for DP balancing.
+    def _prefill_load_is_high(self) -> bool:
+        # A local request count can differ across DP ranks. Keep the globally
+        # aligned base cadence until high-load state is reduced across ranks.
+        return False
+
+    def _should_throttle_prefills(
+        self, high_load: bool | None = None
+    ) -> bool:
         # step_counter is identical across DP ranks. On a fresh wave the
         # counter is 0, so prefills are admitted immediately after idle.
         return (

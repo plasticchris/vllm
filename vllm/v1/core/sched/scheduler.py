@@ -351,16 +351,21 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        prefill_budget = self.scheduler_config.decode_active_prefill_token_budget
-        if (
-            self.need_mamba_block_aligned_split
-            and prefill_budget is not None
-            and prefill_budget < self.block_size
-        ):
-            raise ValueError(
-                "decode_active_prefill_token_budget must be at least one "
-                f"Mamba-aligned cache block ({self.block_size})"
-            )
+        prefill_budgets = {
+            "decode_active_prefill_token_budget": (
+                self.scheduler_config.decode_active_prefill_token_budget
+            ),
+            "decode_active_prefill_high_load_token_budget": (
+                self.scheduler_config.decode_active_prefill_high_load_token_budget
+            ),
+        }
+        if self.need_mamba_block_aligned_split:
+            for name, budget in prefill_budgets.items():
+                if budget is not None and budget < self.block_size:
+                    raise ValueError(
+                        f"{name} must be at least one Mamba-aligned cache "
+                        f"block ({self.block_size})"
+                    )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
@@ -487,7 +492,11 @@ class Scheduler(SchedulerInterface):
         self._prefill_rr_cursor = (start + count) % len(candidate_ids)
         return selected, max(1, budget // count)
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def schedule(
+        self,
+        throttle_prefills: bool = False,
+        decode_active_prefill_token_budget: int | None = None,
+    ) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -530,11 +539,12 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound and active_decode
         )
-        prefill_token_budget = (
+        configured_prefill_budget = (
             self.scheduler_config.decode_active_prefill_token_budget
-            if active_decode
-            else None
+            if decode_active_prefill_token_budget is None
+            else decode_active_prefill_token_budget
         )
+        prefill_token_budget = configured_prefill_budget if active_decode else None
         selected_prefills: set[str] | None = None
         prefill_request_budget: int | None = None
         if prefill_token_budget is not None and not defer_prefills:
@@ -2283,6 +2293,36 @@ class Scheduler(SchedulerInterface):
             sched_spec_tokens[req_id] = spec_token_ids
 
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
+
+    def get_max_decode_tokens(self) -> int:
+        return max(
+            (
+                request.num_output_tokens
+                for request in self.running
+                if not request.is_prefill_chunk
+            ),
+            default=0,
+        )
+
+    def get_decode_prefill_arrival_gap(self) -> float:
+        decode_arrivals = [
+            request.arrival_time
+            for request in self.running
+            if not request.is_prefill_chunk
+        ]
+        prefill_arrivals = [
+            request.arrival_time
+            for request in self.running
+            if request.is_prefill_chunk
+        ]
+        prefill_arrivals.extend(
+            request.arrival_time
+            for request in (*self.waiting, *self.skipped_waiting)
+            if request.num_output_tokens == 0
+        )
+        if not decode_arrivals or not prefill_arrivals:
+            return 0.0
+        return max(min(prefill_arrivals) - min(decode_arrivals), 0.0)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
