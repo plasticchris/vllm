@@ -338,6 +338,7 @@ class Scheduler(SchedulerInterface):
         # the token budget before draining the waiting queue. Prefill throttling
         # backs off in this case so sustained admission can keep up.
         self.prefill_capacity_bound = False
+        self._prefill_rr_cursor = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -350,6 +351,16 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        prefill_budget = self.scheduler_config.decode_active_prefill_token_budget
+        if (
+            self.need_mamba_block_aligned_split
+            and prefill_budget is not None
+            and prefill_budget < self.block_size
+        ):
+            raise ValueError(
+                "decode_active_prefill_token_budget must be at least one "
+                f"Mamba-aligned cache block ({self.block_size})"
+            )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
@@ -463,6 +474,19 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    def _fair_prefill_selection(
+        self, candidate_ids: list[str], budget: int, minimum_chunk: int
+    ) -> tuple[set[str], int]:
+        max_selected = max(1, budget // minimum_chunk)
+        count = min(len(candidate_ids), max_selected)
+        start = self._prefill_rr_cursor % len(candidate_ids)
+        selected = {
+            candidate_ids[(start + offset) % len(candidate_ids)]
+            for offset in range(count)
+        }
+        self._prefill_rr_cursor = (start + count) % len(candidate_ids)
+        return selected, max(1, budget // count)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -511,6 +535,39 @@ class Scheduler(SchedulerInterface):
             if active_decode
             else None
         )
+        selected_prefills: set[str] | None = None
+        prefill_request_budget: int | None = None
+        if prefill_token_budget is not None and not defer_prefills:
+            candidate_ids = [
+                request.request_id
+                for request in self.running
+                if request.is_prefill_chunk
+            ]
+            available_slots = max(
+                self.max_num_running_reqs
+                - len(self.running)
+                - self.num_waiting_for_streaming_input,
+                0,
+            )
+            waiting = list(self.skipped_waiting) + list(self.waiting)
+            if self.policy == SchedulingPolicy.PRIORITY:
+                waiting.sort()
+            candidate_ids.extend(
+                request.request_id
+                for request in waiting[:available_slots]
+                if request.num_computed_tokens < request.num_tokens - 1
+            )
+            if candidate_ids:
+                minimum_chunk = (
+                    self.cache_config.block_size
+                    if self.need_mamba_block_aligned_split
+                    else 1
+                )
+                selected_prefills, prefill_request_budget = (
+                    self._fair_prefill_selection(
+                        candidate_ids, prefill_token_budget, minimum_chunk
+                    )
+                )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -539,9 +596,13 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            if defer_prefills and request.is_prefill_chunk:
-                # DP prefill balancing: defer this in-progress prefill chunk to a
-                # cadence-aligned step; decodes still run to fill this step.
+            if request.is_prefill_chunk and (
+                defer_prefills
+                or (
+                    selected_prefills is not None
+                    and request.request_id not in selected_prefills
+                )
+            ):
                 req_index += 1
                 continue
 
@@ -551,7 +612,11 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
             )
             if request.is_prefill_chunk and prefill_token_budget is not None:
-                num_new_tokens = min(num_new_tokens, prefill_token_budget)
+                num_new_tokens = min(
+                    num_new_tokens,
+                    prefill_token_budget,
+                    prefill_request_budget or prefill_token_budget,
+                )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
@@ -888,9 +953,13 @@ class Scheduler(SchedulerInterface):
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
-                elif defer_prefills and is_waiting_prefill:
-                    # DP prefill balancing: defer this step's local prefill
-                    # compute to a cadence-aligned step.
+                elif is_waiting_prefill and (
+                    defer_prefills
+                    or (
+                        selected_prefills is not None
+                        and request_id not in selected_prefills
+                    )
+                ):
                     break
                 else:
                     # Number of tokens to be scheduled.
@@ -921,7 +990,11 @@ class Scheduler(SchedulerInterface):
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
                     if is_waiting_prefill and prefill_token_budget is not None:
-                        num_new_tokens = min(num_new_tokens, prefill_token_budget)
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            prefill_token_budget,
+                            prefill_request_budget or prefill_token_budget,
+                        )
                         if num_new_tokens == 0:
                             break
 

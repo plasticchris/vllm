@@ -73,6 +73,29 @@ def test_engine_core_prefill_cadence():
     ]
 
 
+def test_prefill_budget_rotates_when_all_candidates_do_not_fit():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._prefill_rr_cursor = 0
+    candidates = ["p0", "p1", "p2", "p3", "p4"]
+
+    selected, request_budget = scheduler._fair_prefill_selection(
+        candidates, budget=3072, minimum_chunk=816
+    )
+    assert selected == {"p0", "p1", "p2"}
+    assert request_budget == 1024
+
+    selected, request_budget = scheduler._fair_prefill_selection(
+        candidates, budget=3072, minimum_chunk=816
+    )
+    assert selected == {"p0", "p3", "p4"}
+    assert request_budget == 1024
+
+    selected, _ = scheduler._fair_prefill_selection(
+        candidates, budget=3072, minimum_chunk=816
+    )
+    assert selected == {"p1", "p2", "p3"}
+
+
 def test_decode_active_prefill_token_budget():
     scheduler = create_scheduler(
         max_num_seqs=4,
@@ -102,29 +125,33 @@ def test_decode_active_prefill_token_budget():
         scheduler.add_request(request)
     output = scheduler.schedule()
     assert output.num_scheduled_tokens["dec"] == 1
-    assert sum(
-        count
+    prefill_counts = {
+        request_id: count
         for request_id, count in output.num_scheduled_tokens.items()
         if request_id.startswith("p")
-    ) == 2048
-    assert "p2" not in output.num_scheduled_tokens
+    }
+    assert set(prefill_counts) == {"p0", "p1", "p2"}
+    assert sum(prefill_counts.values()) <= 2048
+    assert max(prefill_counts.values()) - min(prefill_counts.values()) <= 1
     scheduler.update_from_output(
         output,
         ModelRunnerOutput(
-            req_ids=["dec", "p0", "p1"],
-            req_id_to_index={"dec": 0, "p0": 1, "p1": 2},
-            sampled_token_ids=[[0], [], []],
+            req_ids=["dec", "p0", "p1", "p2"],
+            req_id_to_index={"dec": 0, "p0": 1, "p1": 2, "p2": 3},
+            sampled_token_ids=[[0], [], [], []],
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=[],
         ),
     )
     output = scheduler.schedule()
-    assert sum(
+    prefill_counts = [
         count
         for request_id, count in output.num_scheduled_tokens.items()
         if request_id.startswith("p")
-    ) == 2048
+    ]
+    assert sum(prefill_counts) <= 2048
+    assert max(prefill_counts) - min(prefill_counts) <= 1
 
     prefill_only = create_scheduler(
         max_num_seqs=3,
