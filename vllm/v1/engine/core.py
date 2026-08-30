@@ -112,6 +112,10 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        self.prefill_schedule_interval = (
+            vllm_config.scheduler_config.prefill_schedule_interval
+        )
+        self._prefill_schedule_step = 0
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -569,9 +573,13 @@ class EngineCore:
             eco.scheduler_stats.iteration_details = iteration_details
 
     def _should_throttle_prefills(self) -> bool:
-        """Whether to defer new prefills this step (DP prefill balancing).
-        Overridden by the DP engine core; never throttles otherwise."""
-        return False
+        """Whether this step should protect active decodes from prefill work."""
+        step = self._prefill_schedule_step
+        self._prefill_schedule_step += 1
+        return (
+            self.prefill_schedule_interval > 1
+            and step % self.prefill_schedule_interval != 0
+        )
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.

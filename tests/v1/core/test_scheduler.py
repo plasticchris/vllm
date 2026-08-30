@@ -29,6 +29,7 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
+from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -41,6 +42,24 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_engine_core_prefill_cadence():
+    core = EngineCore.__new__(EngineCore)
+    core.prefill_schedule_interval = 4
+    core._prefill_schedule_step = 0
+
+    assert [core._should_throttle_prefills() for _ in range(9)] == [
+        False,
+        True,
+        True,
+        True,
+        False,
+        True,
+        True,
+        True,
+        False,
+    ]
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -529,6 +548,61 @@ def test_throttle_capacity_bound_guard_admits():
     # off and `b` is admitted rather than stalling the backlog.
     output = scheduler.schedule(throttle_prefills=True)
     assert "b" in output.num_scheduled_tokens
+
+
+def test_sequence_bound_queue_does_not_disable_prefill_throttle():
+    """A queue caused by max_num_seqs is not token-capacity saturation."""
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        max_num_batched_tokens=200,
+        long_prefill_token_threshold=50,
+    )
+
+    (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["dec0"])
+    scheduler.add_request(decode_req)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    prefill_req, waiting_req = create_requests(
+        num_requests=2, num_tokens=400, req_ids=["prefill", "waiting"]
+    )
+    scheduler.add_request(prefill_req)
+    scheduler.add_request(waiting_req)
+
+    # The release has spare token budget, but the second prefill cannot enter
+    # because the decode and first prefill occupy both sequence slots.
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["prefill"] == 50
+    assert "waiting" not in output.num_scheduled_tokens
+    assert not scheduler.prefill_capacity_bound
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec0", "prefill"],
+            req_id_to_index={"dec0": 0, "prefill": 1},
+            sampled_token_ids=[[0], []],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # The next throttled step protects decode instead of advancing the partial
+    # prefill merely because another request is waiting for a sequence slot.
+    output = scheduler.schedule(throttle_prefills=True)
+    assert "dec0" in output.num_scheduled_tokens
+    assert "prefill" not in output.num_scheduled_tokens
+    assert "waiting" not in output.num_scheduled_tokens
 
 
 def test_no_mm_input_chunking():

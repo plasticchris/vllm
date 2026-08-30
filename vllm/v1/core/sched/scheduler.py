@@ -312,9 +312,9 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
-        # DP prefill balancing: Flag to track whether the last cadence-aligned
-        # prefill batch fully drained the waiting queue. Prefill throttling
-        # is disabled in this case.
+        # Flag to track whether the last cadence-aligned prefill batch exhausted
+        # the token budget before draining the waiting queue. Prefill throttling
+        # backs off in this case so sustained admission can keep up.
         self.prefill_capacity_bound = False
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
@@ -479,8 +479,9 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # On a throttled (non-cadence-aligned) step, defer all prefill compute
+        # while decode work is active, unless prefill admission exhausted the
+        # token budget on the previous release step.
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
@@ -1075,10 +1076,11 @@ class Scheduler(SchedulerInterface):
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
 
-            # DP prefill balancing: on a step that admitted prefills (release),
-            # record whether it was capacity-bound.
+            # A waiting queue alone may only mean that max_num_seqs is full.
+            # Treat the release as capacity-bound only when its token budget was
+            # exhausted; otherwise the throttle remains useful for active decodes.
             if not defer_prefills:
-                self.prefill_capacity_bound = bool(self.waiting)
+                self.prefill_capacity_bound = bool(self.waiting) and token_budget == 0
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
