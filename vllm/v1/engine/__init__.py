@@ -242,6 +242,7 @@ class EngineCoreOutputs(
     kv_cache_evictable_tokens: int | None = None
     kv_cache_pinned_tokens: int | None = None
     kv_cache_total_tokens: int | None = None
+    request_kv_tokens: dict[str, int] | None = None
     prefill_control_interval: int | None = None
     prefill_control_token_budget: int | None = None
     prefill_control_p99_ms: float | None = None

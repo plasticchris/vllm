@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import atexit
 import itertools
+import json
 import os
 import time
 from collections import defaultdict, deque
@@ -289,6 +290,10 @@ class Scheduler(SchedulerInterface):
         self._last_spec_profitability_batch_size: int | None = None
         self._last_spec_profitability_selected_k: int | None = None
         self._last_spec_profitability_exploration = False
+        self.profitability_state_path: str | None = None
+        self.profitability_state_save_interval = 16
+        self._spec_profitability_unsaved = 0
+        self._spec_profitability_loaded_samples = 0
         if speculative_config is not None:
             self.long_context_threshold = speculative_config.long_context_threshold
             self.long_context_num_spec_tokens = (
@@ -308,6 +313,13 @@ class Scheduler(SchedulerInterface):
                 speculative_config.profitability_hysteresis
             )
             self._spec_profitability_window = speculative_config.profitability_window
+            self.profitability_state_path = speculative_config.profitability_state_path
+            self.profitability_state_save_interval = (
+                speculative_config.profitability_state_save_interval
+            )
+            self._load_spec_profitability_state()
+            if self.profitability_state_path:
+                atexit.register(self._save_spec_profitability_state)
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -555,6 +567,89 @@ class Scheduler(SchedulerInterface):
         advance = extra_blocks if extra_blocks else len(selected)
         self._idle_prefill_rr_cursor = (start + max(advance, 1)) % len(candidate_ids)
         return budgets
+
+    def _load_spec_profitability_state(self) -> None:
+        path = self.profitability_state_path
+        if not path:
+            return
+        try:
+            with open(path) as state_file:
+                state = json.load(state_file)
+            if state.get("version") != 1:
+                raise ValueError("unsupported state version")
+            loaded_history: dict[tuple[int, int], deque[float]] = {}
+            loaded_steps: dict[int, int] = {}
+            loaded_samples = 0
+            for key, values in state.get("history", {}).items():
+                batch_size, k = (int(part) for part in key.split(":"))
+                valid = [
+                    float(value)
+                    for value in values
+                    if isinstance(value, (int, float)) and value > 0
+                ]
+                if valid:
+                    history = deque(valid, maxlen=self._spec_profitability_window)
+                    loaded_history[(batch_size, k)] = history
+                    loaded_samples += len(history)
+            for key, value in state.get("steps", {}).items():
+                if isinstance(value, int) and value >= 0:
+                    loaded_steps[int(key)] = value
+            self._spec_profitability_history.update(loaded_history)
+            self._spec_profitability_steps.update(loaded_steps)
+            self._spec_profitability_loaded_samples = loaded_samples
+            logger.info(
+                "Loaded %d speculative profitability samples from %s",
+                loaded_samples,
+                path,
+            )
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.warning(
+                "Ignoring invalid speculative profitability state at %s",
+                path,
+                exc_info=True,
+            )
+
+    def _save_spec_profitability_state(self) -> None:
+        path = self.profitability_state_path
+        if not path or not self._spec_profitability_history:
+            return
+        state = {
+            "version": 1,
+            "history": {
+                f"{batch_size}:{k}": list(history)
+                for (batch_size, k), history in sorted(
+                    self._spec_profitability_history.items()
+                )
+            },
+            "steps": {
+                str(batch_size): steps
+                for batch_size, steps in sorted(
+                    self._spec_profitability_steps.items()
+                )
+            },
+        }
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temporary = f"{path}.tmp.{os.getpid()}"
+        try:
+            with open(temporary, "w") as state_file:
+                json.dump(state, state_file, sort_keys=True)
+                state_file.write("\n")
+            os.replace(temporary, path)
+            self._spec_profitability_unsaved = 0
+        except Exception:
+            logger.warning(
+                "Could not persist speculative profitability state to %s",
+                path,
+                exc_info=True,
+            )
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
     def _profitability_adjusted_spec_tokens(
         self, batch_size: int, base_tokens: int
@@ -2307,6 +2402,12 @@ class Scheduler(SchedulerInterface):
             history.append(
                 spec_step_committed_tokens / scheduler_output.model_step_elapsed_ms
             )
+            self._spec_profitability_unsaved += 1
+            if (
+                self._spec_profitability_unsaved
+                >= self.profitability_state_save_interval
+            ):
+                self._save_spec_profitability_state()
 
         engine_core_outputs = {
             client_index: EngineCoreOutputs(outputs=outs)
@@ -2546,6 +2647,14 @@ class Scheduler(SchedulerInterface):
             total * self.block_size,
         )
 
+    def get_request_kv_token_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for request_id in self.requests:
+            block_ids = self.kv_cache_manager.get_block_ids(request_id)
+            allocated_blocks = max((len(group) for group in block_ids), default=0)
+            counts[request_id] = allocated_blocks * self.block_size
+        return counts
+
     def get_oldest_prefill_wait_seconds(self) -> float:
         arrivals = [
             request.arrival_time
@@ -2576,6 +2685,8 @@ class Scheduler(SchedulerInterface):
             "last_batch_size": self._last_spec_profitability_batch_size,
             "last_selected_k": self._last_spec_profitability_selected_k,
             "last_exploration": self._last_spec_profitability_exploration,
+            "loaded_samples": self._spec_profitability_loaded_samples,
+            "state_path": self.profitability_state_path,
             "batches": batches,
         }
 

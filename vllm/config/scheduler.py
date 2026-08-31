@@ -213,6 +213,11 @@ class SchedulerConfig:
     )
     """Maximum time an adaptive high-load policy may defer all prefills."""
 
+    prefill_schedule_adaptive_reset_seconds: float | None = Field(
+        default=30.0, gt=0.0
+    )
+    """Quiet time after which adaptive prefill history and controls reset."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.

@@ -148,6 +148,9 @@ class EngineCore:
         self.prefill_schedule_adaptive_max_wait_seconds = (
             scheduler_config.prefill_schedule_adaptive_max_wait_seconds
         )
+        self.prefill_schedule_adaptive_reset_seconds = (
+            scheduler_config.prefill_schedule_adaptive_reset_seconds
+        )
         self._adaptive_prefill_interval = (
             self.prefill_schedule_high_load_interval
             or self.prefill_schedule_interval
@@ -176,6 +179,7 @@ class EngineCore:
         self._adaptive_aging_interval: int | None = None
         self._adaptive_aging_token_budget: int | None = None
         self._adaptive_high_load = False
+        self._adaptive_quiet_since: float | None = None
         self._last_prefill_service_time = time.monotonic()
         self._prefill_schedule_step = 0
         if not vllm_config.parallel_config.data_parallel_rank_local:
@@ -649,6 +653,7 @@ class EngineCore:
             pinned_tokens,
             total_tokens,
         ) = self.scheduler.get_kv_cache_token_counts()
+        request_kv_tokens = self.scheduler.get_request_kv_token_counts()
         spec_profitability = self.scheduler.get_spec_profitability_stats()
         if not outputs:
             outputs[0] = EngineCoreOutputs()
@@ -665,6 +670,7 @@ class EngineCore:
             output.kv_cache_evictable_tokens = evictable_tokens
             output.kv_cache_pinned_tokens = pinned_tokens
             output.kv_cache_total_tokens = total_tokens
+            output.request_kv_tokens = request_kv_tokens
             output.prefill_control_interval = getattr(
                 self, "_adaptive_prefill_interval", None
             )
@@ -827,6 +833,23 @@ class EngineCore:
         else:
             self._adaptive_prefill_healthy_windows = 0
 
+    def _reset_adaptive_prefill_control(self) -> None:
+        self._adaptive_prefill_interval = (
+            self.prefill_schedule_high_load_interval
+            or self.prefill_schedule_interval
+        )
+        self._adaptive_prefill_budget = self._adaptive_prefill_max_budget
+        self._adaptive_prefill_latencies.clear()
+        self._adaptive_decode_latencies.clear()
+        self._adaptive_high_load_latencies.clear()
+        self._adaptive_prefill_observations = 0
+        self._adaptive_prefill_healthy_windows = 0
+        self._adaptive_prefill_p99_ms = None
+        self._adaptive_decode_p99_ms = None
+        self._adaptive_prefill_penalty_p99_ms = None
+        self._adaptive_control_p99_ms = None
+        self._adaptive_quiet_since = None
+
     def _should_throttle_prefills(
         self, high_load: bool | None = None
     ) -> bool:
@@ -840,6 +863,17 @@ class EngineCore:
         if high_load:
             if getattr(self, "prefill_schedule_adaptive_target_ms", None) is not None:
                 now = time.monotonic()
+                reset_seconds = getattr(
+                    self, "prefill_schedule_adaptive_reset_seconds", None
+                )
+                quiet_since = getattr(self, "_adaptive_quiet_since", None)
+                if (
+                    quiet_since is not None
+                    and reset_seconds is not None
+                    and now - quiet_since >= reset_seconds
+                ):
+                    self._reset_adaptive_prefill_control()
+                self._adaptive_quiet_since = None
                 if not self._adaptive_high_load:
                     self._adaptive_high_load = True
                     self._last_prefill_service_time = now
@@ -869,8 +903,21 @@ class EngineCore:
                     or interval
                 )
         else:
+            now = time.monotonic()
+            if getattr(self, "_adaptive_high_load", False):
+                self._adaptive_quiet_since = now
             self._adaptive_high_load = False
             self._adaptive_oldest_prefill_wait_seconds = 0.0
+            reset_seconds = getattr(
+                self, "prefill_schedule_adaptive_reset_seconds", None
+            )
+            quiet_since = getattr(self, "_adaptive_quiet_since", None)
+            if (
+                quiet_since is not None
+                and reset_seconds is not None
+                and now - quiet_since >= reset_seconds
+            ):
+                self._reset_adaptive_prefill_control()
         step = self._prefill_schedule_step
         self._prefill_schedule_step += 1
         return not force_prefill_service and interval > 1 and step % interval != 0

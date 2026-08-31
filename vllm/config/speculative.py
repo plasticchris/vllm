@@ -204,6 +204,12 @@ class SpeculativeConfig:
     profitability_hysteresis: float = Field(default=0.03, ge=0.0, le=0.5)
     """Required committed-token throughput advantage before switching to K=2."""
 
+    profitability_state_path: str | None = None
+    """Optional JSON file used to warm-start online profitability history."""
+
+    profitability_state_save_interval: int = Field(default=16, ge=1)
+    """New profitability observations between atomic state checkpoints."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""

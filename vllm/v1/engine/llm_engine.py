@@ -124,6 +124,7 @@ class LLMEngine:
             int | None,
             int | None,
         ] = (None, None, None, None, None, None, None, None, None)
+        self.last_request_kv_tokens: dict[str, int] = {}
         self.last_spec_profitability: dict[str, Any] | None = None
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
@@ -340,6 +341,7 @@ class LLMEngine:
                 outputs.kv_cache_pinned_tokens,
                 outputs.kv_cache_total_tokens,
             )
+        self.last_request_kv_tokens = outputs.request_kv_tokens or {}
         self.last_prefill_control = (
             outputs.prefill_control_interval,
             outputs.prefill_control_token_budget,

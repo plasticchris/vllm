@@ -259,6 +259,10 @@ class SchedulerInterface(ABC):
             total * block_size,
         )
 
+    def get_request_kv_token_counts(self) -> dict[str, int]:
+        """Return scheduler-resident KV tokens keyed by request ID."""
+        return {}
+
     def get_oldest_prefill_wait_seconds(self) -> float:
         """Return the age of the oldest active prefill request."""
         return 0.0

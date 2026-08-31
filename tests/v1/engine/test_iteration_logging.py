@@ -163,11 +163,38 @@ def test_adaptive_prefill_control_forces_aged_service():
     assert engine._adaptive_oldest_prefill_wait_seconds == 20.0
 
 
+def test_adaptive_prefill_control_resets_after_quiet_period():
+    engine = SimpleNamespace(
+        prefill_schedule_high_load_interval=128,
+        prefill_schedule_interval=4,
+        _adaptive_prefill_max_budget=2448,
+        _adaptive_prefill_interval=512,
+        _adaptive_prefill_budget=816,
+        _adaptive_prefill_latencies=deque([600.0], maxlen=128),
+        _adaptive_decode_latencies=deque([30.0], maxlen=128),
+        _adaptive_high_load_latencies=deque([30.0, 600.0], maxlen=128),
+        _adaptive_prefill_observations=8,
+        _adaptive_prefill_healthy_windows=2,
+        _adaptive_prefill_p99_ms=600.0,
+        _adaptive_decode_p99_ms=30.0,
+        _adaptive_prefill_penalty_p99_ms=570.0,
+        _adaptive_control_p99_ms=600.0,
+        _adaptive_quiet_since=1.0,
+    )
+    EngineCore._reset_adaptive_prefill_control(engine)
+    assert engine._adaptive_prefill_interval == 128
+    assert engine._adaptive_prefill_budget == 2448
+    assert not engine._adaptive_high_load_latencies
+    assert engine._adaptive_control_p99_ms is None
+    assert engine._adaptive_quiet_since is None
+
+
 def test_attach_kv_cache_stats_without_request_output():
     engine = SimpleNamespace(
         scheduler=SimpleNamespace(
             get_kv_cache_block_counts=lambda: (20, 5, 75, 100),
             get_kv_cache_token_counts=lambda: (320, 80, 1200, 1600),
+            get_request_kv_token_counts=lambda: {"request-1": 160},
             get_spec_profitability_stats=lambda: {
                 "last_selected_k": 2,
                 "batches": {},
@@ -194,6 +221,7 @@ def test_attach_kv_cache_stats_without_request_output():
     assert outputs[0].kv_cache_evictable_tokens == 80
     assert outputs[0].kv_cache_pinned_tokens == 1200
     assert outputs[0].kv_cache_total_tokens == 1600
+    assert outputs[0].request_kv_tokens == {"request-1": 160}
     assert outputs[0].prefill_control_interval == 48
     assert outputs[0].prefill_control_slo_p99_ms == 42.0
     assert outputs[0].prefill_control_oldest_wait_seconds == 12.0

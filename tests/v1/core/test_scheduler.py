@@ -227,6 +227,42 @@ def test_profitability_controller_explores_both_depths():
     assert stats["last_selected_k"] == 3
 
 
+def test_request_kv_token_counts_use_scheduler_allocations():
+    scheduler = Mock()
+    scheduler.requests = {"a": Mock(), "b": Mock()}
+    scheduler.block_size = 16
+    scheduler.kv_cache_manager.get_block_ids.side_effect = (
+        lambda request_id: ([1, 2, 3], [4, 5])
+        if request_id == "a"
+        else ([6], [7])
+    )
+    assert Scheduler.get_request_kv_token_counts(scheduler) == {
+        "a": 48,
+        "b": 16,
+    }
+
+
+def test_profitability_state_round_trip(tmp_path):
+    state_path = tmp_path / "profitability.json"
+    first = create_scheduler()
+    first.profitability_state_path = str(state_path)
+    first._spec_profitability_history = {
+        (5, 2): deque([1.1, 1.2], maxlen=8),
+        (5, 3): deque([1.3], maxlen=8),
+    }
+    first._spec_profitability_steps[5] = 9
+    first._save_spec_profitability_state()
+
+    second = create_scheduler()
+    second.profitability_state_path = str(state_path)
+    second._spec_profitability_window = 8
+    second._load_spec_profitability_state()
+    assert list(second._spec_profitability_history[(5, 2)]) == [1.1, 1.2]
+    assert list(second._spec_profitability_history[(5, 3)]) == [1.3]
+    assert second._spec_profitability_steps[5] == 9
+    assert second._spec_profitability_loaded_samples == 3
+
+
 def test_decode_active_prefill_token_budget():
     scheduler = create_scheduler(
         max_num_seqs=4,
