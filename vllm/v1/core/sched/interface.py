@@ -244,8 +244,8 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_kv_cache_block_counts(self) -> tuple[int, int]:
-        """Return allocatable and total GPU KV-cache blocks."""
+    def get_kv_cache_block_counts(self) -> tuple[int, int, int, int]:
+        """Return immediate, evictable, pinned, and total GPU KV blocks."""
         raise NotImplementedError
 
     @abstractmethod

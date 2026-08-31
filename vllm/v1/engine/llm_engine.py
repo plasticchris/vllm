@@ -110,10 +110,10 @@ class LLMEngine:
             log_stats=self.log_stats,
         )
 
-        self.last_kv_cache_stats: tuple[float, int, int] | None = None
-        self.last_prefill_control: tuple[int | None, int | None, float | None] = (
-            None, None, None
-        )
+        self.last_kv_cache_stats: tuple[float, int, int, int, int] | None = None
+        self.last_prefill_control: tuple[
+            int | None, int | None, float | None, float | None, float | None
+        ] = (None, None, None, None, None)
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
             self.logger_manager = StatLoggerManager(
@@ -311,15 +311,22 @@ class LLMEngine:
             and outputs.kv_cache_free_blocks is not None
             and outputs.kv_cache_total_blocks is not None
         ):
+            assert outputs.kv_cache_immediate_free_blocks is not None
+            assert outputs.kv_cache_evictable_blocks is not None
+            assert outputs.kv_cache_pinned_blocks is not None
             self.last_kv_cache_stats = (
                 outputs.kv_cache_usage,
-                outputs.kv_cache_free_blocks,
+                outputs.kv_cache_immediate_free_blocks,
+                outputs.kv_cache_evictable_blocks,
+                outputs.kv_cache_pinned_blocks,
                 outputs.kv_cache_total_blocks,
             )
         self.last_prefill_control = (
             outputs.prefill_control_interval,
             outputs.prefill_control_token_budget,
             outputs.prefill_control_p99_ms,
+            outputs.prefill_control_decode_p99_ms,
+            outputs.prefill_control_penalty_p99_ms,
         )
 
         # 2) Process EngineCoreOutputs.

@@ -257,7 +257,9 @@ class SchedulerOutput:
 
     # Engine-core-only timing metadata for adaptive prefill control.
     scheduled_timestamp: float = 0.0
+    model_step_elapsed_ms: float = 0.0
     high_prefill_load: bool = False
+    scheduled_prefill_tokens: int = 0
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.

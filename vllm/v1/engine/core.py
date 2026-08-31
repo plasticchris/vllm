@@ -145,6 +145,9 @@ class EngineCore:
         self.prefill_schedule_adaptive_min_token_budget = (
             scheduler_config.prefill_schedule_adaptive_min_token_budget
         )
+        self.prefill_schedule_adaptive_max_wait_seconds = (
+            scheduler_config.prefill_schedule_adaptive_max_wait_seconds
+        )
         self._adaptive_prefill_interval = (
             self.prefill_schedule_high_load_interval
             or self.prefill_schedule_interval
@@ -157,9 +160,16 @@ class EngineCore:
         self._adaptive_prefill_latencies = deque(
             maxlen=scheduler_config.prefill_schedule_adaptive_window
         )
-        self._adaptive_prefill_steps = 0
+        self._adaptive_decode_latencies = deque(
+            maxlen=scheduler_config.prefill_schedule_adaptive_window
+        )
+        self._adaptive_prefill_observations = 0
         self._adaptive_prefill_healthy_windows = 0
         self._adaptive_prefill_p99_ms: float | None = None
+        self._adaptive_decode_p99_ms: float | None = None
+        self._adaptive_prefill_penalty_p99_ms: float | None = None
+        self._adaptive_high_load = False
+        self._last_prefill_service_time = time.monotonic()
         self._prefill_schedule_step = 0
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
@@ -620,13 +630,22 @@ class EngineCore:
     def _attach_kv_cache_stats(
         self, outputs: dict[int, EngineCoreOutputs]
     ) -> None:
-        free_blocks, total_blocks = self.scheduler.get_kv_cache_block_counts()
+        (
+            immediate_blocks,
+            evictable_blocks,
+            pinned_blocks,
+            total_blocks,
+        ) = self.scheduler.get_kv_cache_block_counts()
         if not outputs:
             outputs[0] = EngineCoreOutputs()
-        usage = 1.0 - (free_blocks / total_blocks) if total_blocks else 0.0
+        free_blocks = immediate_blocks + evictable_blocks
+        usage = pinned_blocks / total_blocks if total_blocks else 0.0
         for output in outputs.values():
             output.kv_cache_usage = usage
             output.kv_cache_free_blocks = free_blocks
+            output.kv_cache_immediate_free_blocks = immediate_blocks
+            output.kv_cache_evictable_blocks = evictable_blocks
+            output.kv_cache_pinned_blocks = pinned_blocks
             output.kv_cache_total_blocks = total_blocks
             output.prefill_control_interval = getattr(
                 self, "_adaptive_prefill_interval", None
@@ -636,6 +655,12 @@ class EngineCore:
             )
             output.prefill_control_p99_ms = getattr(
                 self, "_adaptive_prefill_p99_ms", None
+            )
+            output.prefill_control_decode_p99_ms = getattr(
+                self, "_adaptive_decode_p99_ms", None
+            )
+            output.prefill_control_penalty_p99_ms = getattr(
+                self, "_adaptive_prefill_penalty_p99_ms", None
             )
 
     def _prefill_load_is_high(self) -> bool:
@@ -681,6 +706,8 @@ class EngineCore:
         return getattr(self, "decode_active_prefill_token_budget", None)
 
     def _observe_prefill_control(self, scheduler_output: SchedulerOutput) -> None:
+        elapsed_ms = (time.monotonic() - scheduler_output.scheduled_timestamp) * 1000
+        scheduler_output.model_step_elapsed_ms = elapsed_ms
         target = getattr(self, "prefill_schedule_adaptive_target_ms", None)
         if (
             target is None
@@ -688,19 +715,31 @@ class EngineCore:
             or scheduler_output.scheduled_timestamp <= 0
         ):
             return
-        latency_ms = (time.monotonic() - scheduler_output.scheduled_timestamp) * 1000
-        self._adaptive_prefill_latencies.append(latency_ms)
-        self._adaptive_prefill_steps += 1
+        if scheduler_output.scheduled_prefill_tokens <= 0:
+            self._adaptive_decode_latencies.append(elapsed_ms)
+            if len(self._adaptive_decode_latencies) >= 4:
+                values = sorted(self._adaptive_decode_latencies)
+                self._adaptive_decode_p99_ms = values[
+                    math.ceil(len(values) * 0.99) - 1
+                ]
+            return
+
+        self._last_prefill_service_time = time.monotonic()
+        self._adaptive_prefill_latencies.append(elapsed_ms)
+        self._adaptive_prefill_observations += 1
+        values = sorted(self._adaptive_prefill_latencies)
+        p99 = values[math.ceil(len(values) * 0.99) - 1]
+        self._adaptive_prefill_p99_ms = p99
+        baseline = self._adaptive_decode_p99_ms
+        self._adaptive_prefill_penalty_p99_ms = (
+            max(p99 - baseline, 0.0) if baseline is not None else None
+        )
         if (
-            len(self._adaptive_prefill_latencies) < 16
-            or self._adaptive_prefill_steps
+            self._adaptive_prefill_observations
             % self.prefill_schedule_adaptive_update_interval
             != 0
         ):
             return
-        values = sorted(self._adaptive_prefill_latencies)
-        p99 = values[math.ceil(len(values) * 0.99) - 1]
-        self._adaptive_prefill_p99_ms = p99
         if p99 > target:
             self._adaptive_prefill_healthy_windows = 0
             self._adaptive_prefill_interval = min(
@@ -743,17 +782,31 @@ class EngineCore:
         if high_load is None:
             high_load = self._prefill_load_is_high()
         interval = self.prefill_schedule_interval
+        force_prefill_service = False
         if high_load:
             if getattr(self, "prefill_schedule_adaptive_target_ms", None) is not None:
+                now = time.monotonic()
+                if not self._adaptive_high_load:
+                    self._adaptive_high_load = True
+                    self._last_prefill_service_time = now
+                max_wait = self.prefill_schedule_adaptive_max_wait_seconds
+                if (
+                    max_wait is not None
+                    and now - self._last_prefill_service_time >= max_wait
+                ):
+                    force_prefill_service = True
+                    self._last_prefill_service_time = now
                 interval = self._adaptive_prefill_interval
             else:
                 interval = (
                     getattr(self, "prefill_schedule_high_load_interval", None)
                     or interval
                 )
+        else:
+            self._adaptive_high_load = False
         step = self._prefill_schedule_step
         self._prefill_schedule_step += 1
-        return interval > 1 and step % interval != 0
+        return not force_prefill_service and interval > 1 and step % interval != 0
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.

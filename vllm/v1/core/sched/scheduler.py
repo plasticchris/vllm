@@ -277,33 +277,34 @@ class Scheduler(SchedulerInterface):
         self.long_context_threshold: int | None = None
         self.long_context_num_spec_tokens: int | None = None
         self.greedy_num_spec_tokens: int | None = None
-        self.acceptance_aware_min_batch_size: int | None = None
-        self.acceptance_aware_threshold = 0.0
-        self.acceptance_aware_min_samples = 0
-        self._spec_acceptance_history: dict[int, deque[float]] = {}
+        self.profitability_aware_min_batch_size: int | None = None
+        self.profitability_min_samples = 0
+        self.profitability_exploration_interval = 32
+        self.profitability_hysteresis = 0.0
+        self._spec_profitability_window = 16
+        self._spec_profitability_history: dict[
+            tuple[int, int], deque[float]
+        ] = {}
+        self._spec_profitability_steps: defaultdict[int, int] = defaultdict(int)
         if speculative_config is not None:
             self.long_context_threshold = speculative_config.long_context_threshold
             self.long_context_num_spec_tokens = (
                 speculative_config.long_context_num_speculative_tokens
             )
             self.greedy_num_spec_tokens = speculative_config.greedy_num_speculative_tokens
-            self.acceptance_aware_min_batch_size = (
-                speculative_config.acceptance_aware_min_batch_size
+            self.profitability_aware_min_batch_size = (
+                speculative_config.profitability_aware_min_batch_size
             )
-            self.acceptance_aware_threshold = (
-                speculative_config.acceptance_aware_threshold
+            self.profitability_min_samples = (
+                speculative_config.profitability_min_samples
             )
-            self.acceptance_aware_min_samples = (
-                speculative_config.acceptance_aware_min_samples
+            self.profitability_exploration_interval = (
+                speculative_config.profitability_exploration_interval
             )
-            if self.acceptance_aware_min_batch_size is not None:
-                self._spec_acceptance_history = {
-                    batch_size: deque(maxlen=speculative_config.acceptance_aware_window)
-                    for batch_size in range(
-                        self.acceptance_aware_min_batch_size,
-                        self.scheduler_config.max_num_seqs + 1,
-                    )
-                }
+            self.profitability_hysteresis = (
+                speculative_config.profitability_hysteresis
+            )
+            self._spec_profitability_window = speculative_config.profitability_window
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -360,6 +361,7 @@ class Scheduler(SchedulerInterface):
         # backs off in this case so sustained admission can keep up.
         self.prefill_capacity_bound = False
         self._prefill_rr_cursor = 0
+        self._idle_prefill_rr_cursor = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -513,18 +515,74 @@ class Scheduler(SchedulerInterface):
         self._prefill_rr_cursor = (start + count) % len(candidate_ids)
         return selected, max(1, budget // count)
 
-    def _acceptance_adjusted_spec_tokens(
+    def _idle_prefill_block_budgets(
+        self,
+        candidate_ids: list[str],
+        token_budget: int,
+        block_size: int,
+        max_chunk: int,
+    ) -> dict[str, int]:
+        """Distribute whole idle-prefill blocks without wasting the remainder."""
+        if not candidate_ids or token_budget < block_size:
+            return {}
+        total_blocks = token_budget // block_size
+        max_blocks = max(1, max_chunk // block_size)
+        start = self._idle_prefill_rr_cursor % len(candidate_ids)
+        ordered = [
+            candidate_ids[(start + offset) % len(candidate_ids)]
+            for offset in range(len(candidate_ids))
+        ]
+        selected = ordered[: min(len(ordered), total_blocks)]
+        budgets = {request_id: block_size for request_id in selected}
+        remaining = total_blocks - len(selected)
+        extra_blocks = 0
+        while remaining > 0:
+            made_progress = False
+            for request_id in selected:
+                if budgets[request_id] // block_size >= max_blocks:
+                    continue
+                budgets[request_id] += block_size
+                remaining -= 1
+                extra_blocks += 1
+                made_progress = True
+                if remaining == 0:
+                    break
+            if not made_progress:
+                break
+        advance = extra_blocks if extra_blocks else len(selected)
+        self._idle_prefill_rr_cursor = (start + max(advance, 1)) % len(candidate_ids)
+        return budgets
+
+    def _profitability_adjusted_spec_tokens(
         self, batch_size: int, base_tokens: int
     ) -> int:
-        minimum_batch = self.acceptance_aware_min_batch_size
-        if minimum_batch is None or batch_size < minimum_batch or base_tokens <= 2:
+        minimum_batch = self.profitability_aware_min_batch_size
+        if minimum_batch is None or batch_size < minimum_batch or base_tokens != 3:
             return base_tokens
-        history = self._spec_acceptance_history.get(batch_size)
-        if history is None or len(history) < self.acceptance_aware_min_samples:
+        lower_tokens = 2
+        self._spec_profitability_steps[batch_size] += 1
+        base_history = self._spec_profitability_history.get((batch_size, base_tokens))
+        lower_history = self._spec_profitability_history.get(
+            (batch_size, lower_tokens)
+        )
+        if lower_history is None or len(lower_history) < self.profitability_min_samples:
+            return lower_tokens
+        if base_history is None or len(base_history) < self.profitability_min_samples:
             return base_tokens
-        if sum(history) / len(history) < self.acceptance_aware_threshold:
-            return base_tokens - 1
-        return base_tokens
+        base_rate = sum(base_history) / len(base_history)
+        lower_rate = sum(lower_history) / len(lower_history)
+        selected = (
+            lower_tokens
+            if lower_rate > base_rate * (1.0 + self.profitability_hysteresis)
+            else base_tokens
+        )
+        if (
+            self._spec_profitability_steps[batch_size]
+            % self.profitability_exploration_interval
+            == 0
+        ):
+            return base_tokens if selected == lower_tokens else lower_tokens
+        return selected
 
     def schedule(
         self,
@@ -562,6 +620,7 @@ class Scheduler(SchedulerInterface):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
+        scheduled_prefill_tokens = 0
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -614,6 +673,7 @@ class Scheduler(SchedulerInterface):
                 )
 
         long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+        idle_prefill_budgets: dict[str, int] | None = None
         if (
             active_decode
             and self.scheduler_config.decode_active_long_prefill_token_threshold
@@ -627,7 +687,6 @@ class Scheduler(SchedulerInterface):
             and long_prefill_threshold > 0
             and self.need_mamba_block_aligned_split
         ):
-            num_prefills = sum(r.is_prefill_chunk for r in self.running)
             available_slots = max(
                 self.max_num_running_reqs
                 - len(self.running)
@@ -635,18 +694,22 @@ class Scheduler(SchedulerInterface):
                 0,
             )
             waiting = list(self.skipped_waiting) + list(self.waiting)
-            num_prefills += sum(
-                request.num_computed_tokens < request.num_tokens - 1
+            candidate_ids = [
+                request.request_id
+                for request in self.running
+                if request.is_prefill_chunk
+            ]
+            candidate_ids.extend(
+                request.request_id
                 for request in waiting[:available_slots]
+                if request.num_computed_tokens < request.num_tokens - 1
             )
-            if num_prefills > 1:
-                minimum_chunk = (
-                    self.block_size if self.need_mamba_block_aligned_split else 1
-                )
-                fair_share = max(token_budget // num_prefills, minimum_chunk)
-                long_prefill_threshold = min(
-                    long_prefill_threshold, fair_share
-                )
+            idle_prefill_budgets = self._idle_prefill_block_budgets(
+                candidate_ids,
+                token_budget,
+                self.block_size,
+                long_prefill_threshold,
+            )
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -681,6 +744,10 @@ class Scheduler(SchedulerInterface):
                     selected_prefills is not None
                     and request.request_id not in selected_prefills
                 )
+                or (
+                    idle_prefill_budgets is not None
+                    and request.request_id not in idle_prefill_budgets
+                )
             ):
                 req_index += 1
                 continue
@@ -698,6 +765,10 @@ class Scheduler(SchedulerInterface):
                 )
             if 0 < long_prefill_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_threshold
+            if request.is_prefill_chunk and idle_prefill_budgets is not None:
+                num_new_tokens = min(
+                    num_new_tokens, idle_prefill_budgets[request.request_id]
+                )
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -813,6 +884,8 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            if request.is_prefill_chunk:
+                scheduled_prefill_tokens += num_new_tokens
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -1038,6 +1111,10 @@ class Scheduler(SchedulerInterface):
                         selected_prefills is not None
                         and request_id not in selected_prefills
                     )
+                    or (
+                        idle_prefill_budgets is not None
+                        and request_id not in idle_prefill_budgets
+                    )
                 ):
                     break
                 else:
@@ -1067,6 +1144,10 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_threshold
+                    if is_waiting_prefill and idle_prefill_budgets is not None:
+                        num_new_tokens = min(
+                            num_new_tokens, idle_prefill_budgets[request_id]
+                        )
                     if is_waiting_prefill and prefill_token_budget is not None:
                         num_new_tokens = min(
                             num_new_tokens,
@@ -1248,6 +1329,8 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                if is_waiting_prefill:
+                    scheduled_prefill_tokens += num_new_tokens
                 if is_waiting_prefill and prefill_token_budget is not None:
                     prefill_token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -1382,7 +1465,7 @@ class Scheduler(SchedulerInterface):
                     num_spec_tokens_to_schedule,
                     self.greedy_num_spec_tokens,
                 )
-            num_spec_tokens_to_schedule = self._acceptance_adjusted_spec_tokens(
+            num_spec_tokens_to_schedule = self._profitability_adjusted_spec_tokens(
                 len(num_scheduled_tokens), num_spec_tokens_to_schedule
             )
 
@@ -1413,6 +1496,7 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            scheduled_prefill_tokens=scheduled_prefill_tokens,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
 
@@ -1899,6 +1983,9 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        spec_step_committed_tokens = 0
+        spec_step_num_tokens: int | None = None
+        spec_step_requests = 0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1936,10 +2023,9 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
-                batch_size = len(scheduler_output.num_scheduled_tokens)
-                history = self._spec_acceptance_history.get(batch_size)
-                if history is not None and num_draft_tokens > 0:
-                    history.append(num_accepted / num_draft_tokens)
+                spec_step_committed_tokens += len(generated_token_ids)
+                spec_step_num_tokens = num_draft_tokens
+                spec_step_requests += 1
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -2178,6 +2264,24 @@ class Scheduler(SchedulerInterface):
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
+        if (
+            getattr(self, "profitability_aware_min_batch_size", None) is not None
+            and scheduler_output.scheduled_prefill_tokens == 0
+            and scheduler_output.model_step_elapsed_ms > 0
+            and spec_step_num_tokens in (2, 3)
+            and spec_step_requests > 0
+            and spec_step_committed_tokens > 0
+        ):
+            batch_size = len(scheduler_output.num_scheduled_tokens)
+            key = (batch_size, spec_step_num_tokens)
+            history = self._spec_profitability_history.get(key)
+            if history is None:
+                history = deque(maxlen=self._spec_profitability_window)
+                self._spec_profitability_history[key] = history
+            history.append(
+                spec_step_committed_tokens / scheduler_output.model_step_elapsed_ms
+            )
+
         engine_core_outputs = {
             client_index: EngineCoreOutputs(outputs=outs)
             for client_index, outs in outputs.items()
@@ -2399,10 +2503,13 @@ class Scheduler(SchedulerInterface):
             return 0.0
         return max(min(prefill_arrivals) - min(decode_arrivals), 0.0)
 
-    def get_kv_cache_block_counts(self) -> tuple[int, int]:
+    def get_kv_cache_block_counts(self) -> tuple[int, int, int, int]:
         block_pool = self.kv_cache_manager.block_pool
+        immediate, evictable = block_pool.get_free_block_counts()
         # The permanently allocated null block is not usable capacity.
-        return block_pool.get_num_free_blocks(), max(block_pool.num_gpu_blocks - 1, 0)
+        total = max(block_pool.num_gpu_blocks - 1, 0)
+        pinned = max(total - immediate - evictable, 0)
+        return immediate, evictable, pinned, total
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

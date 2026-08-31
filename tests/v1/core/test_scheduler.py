@@ -155,24 +155,67 @@ def test_mamba_prefill_chunks_share_the_batch_budget():
     for request in create_requests(num_requests=3, num_tokens=800):
         scheduler.add_request(request)
     output = scheduler.schedule()
-    assert list(output.num_scheduled_tokens.values()) == [336, 336, 336]
+    assert list(output.num_scheduled_tokens.values()) == [352, 336, 336]
+    assert output.scheduled_prefill_tokens == 1024
 
 
-def test_acceptance_aware_dynamic_speculation_reduces_k():
+def test_idle_prefill_block_remainder_rotates():
     scheduler = create_scheduler()
-    scheduler.acceptance_aware_min_batch_size = 4
-    scheduler.acceptance_aware_threshold = 0.4
-    scheduler.acceptance_aware_min_samples = 4
-    scheduler._spec_acceptance_history = {
-        5: deque([0.2, 0.4, 0.5, 0.3], maxlen=8)
-    }
-    assert scheduler._acceptance_adjusted_spec_tokens(5, 3) == 2
-    scheduler._spec_acceptance_history[5] = deque(
-        [0.7, 0.8, 0.6, 0.9], maxlen=8
+    request_ids = [f"p{i}" for i in range(5)]
+    first = scheduler._idle_prefill_block_budgets(
+        request_ids, token_budget=6144, block_size=816, max_chunk=3264
     )
-    assert scheduler._acceptance_adjusted_spec_tokens(5, 3) == 3
-    assert scheduler._acceptance_adjusted_spec_tokens(3, 3) == 3
-    assert scheduler._acceptance_adjusted_spec_tokens(6, 2) == 2
+    second = scheduler._idle_prefill_block_budgets(
+        request_ids, token_budget=6144, block_size=816, max_chunk=3264
+    )
+    assert [first[request_id] for request_id in request_ids] == [
+        1632,
+        1632,
+        816,
+        816,
+        816,
+    ]
+    assert [second[request_id] for request_id in request_ids] == [
+        816,
+        816,
+        1632,
+        1632,
+        816,
+    ]
+
+
+def test_profitability_aware_dynamic_speculation_selects_faster_k():
+    scheduler = create_scheduler()
+    scheduler.profitability_aware_min_batch_size = 4
+    scheduler.profitability_min_samples = 4
+    scheduler.profitability_exploration_interval = 100
+    scheduler.profitability_hysteresis = 0.03
+    scheduler._spec_profitability_history = {
+        (5, 2): deque([1.2, 1.1, 1.3, 1.2], maxlen=8),
+        (5, 3): deque([1.0, 1.0, 1.1, 1.0], maxlen=8),
+    }
+    assert scheduler._profitability_adjusted_spec_tokens(5, 3) == 2
+    scheduler._spec_profitability_history = {
+        (5, 2): deque([1.0, 1.0, 1.1, 1.0], maxlen=8),
+        (5, 3): deque([1.2, 1.1, 1.3, 1.2], maxlen=8),
+    }
+    assert scheduler._profitability_adjusted_spec_tokens(5, 3) == 3
+    assert scheduler._profitability_adjusted_spec_tokens(3, 3) == 3
+    assert scheduler._profitability_adjusted_spec_tokens(6, 2) == 2
+
+
+def test_profitability_controller_explores_both_depths():
+    scheduler = create_scheduler()
+    scheduler.profitability_aware_min_batch_size = 4
+    scheduler.profitability_min_samples = 2
+    scheduler.profitability_exploration_interval = 4
+    scheduler.profitability_hysteresis = 0.03
+    scheduler._spec_profitability_history = {
+        (5, 2): deque([1.2, 1.2], maxlen=8),
+        (5, 3): deque([1.0, 1.0], maxlen=8),
+    }
+    scheduler._spec_profitability_steps[5] = 3
+    assert scheduler._profitability_adjusted_spec_tokens(5, 3) == 3
 
 
 def test_decode_active_prefill_token_budget():

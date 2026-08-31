@@ -794,6 +794,14 @@ class BlockPool:
 
         return True
 
+    def get_free_block_counts(self) -> tuple[int, int]:
+        """Return immediately free and cached-evictable block counts."""
+        evictable = sum(
+            block.block_hash is not None
+            for block in self.free_block_queue.iter_blocks_after(None)
+        )
+        return self.get_num_free_blocks() - evictable, evictable
+
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.
 

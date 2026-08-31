@@ -650,6 +650,9 @@ class EngineArgs:
     prefill_schedule_adaptive_min_token_budget: int | None = (
         SchedulerConfig.prefill_schedule_adaptive_min_token_budget
     )
+    prefill_schedule_adaptive_max_wait_seconds: float | None = (
+        SchedulerConfig.prefill_schedule_adaptive_max_wait_seconds
+    )
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1563,6 +1566,10 @@ class EngineArgs:
             **scheduler_kwargs["prefill_schedule_adaptive_min_token_budget"],
         )
         scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-max-wait-seconds",
+            **scheduler_kwargs["prefill_schedule_adaptive_max_wait_seconds"],
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -2313,6 +2320,9 @@ class EngineArgs:
             ),
             prefill_schedule_adaptive_min_token_budget=(
                 self.prefill_schedule_adaptive_min_token_budget
+            ),
+            prefill_schedule_adaptive_max_wait_seconds=(
+                self.prefill_schedule_adaptive_max_wait_seconds
             ),
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,

@@ -188,18 +188,21 @@ class SpeculativeConfig:
     greedy_num_speculative_tokens: int | None = Field(default=None, ge=0)
     """Maximum K for requests using greedy target sampling."""
 
-    acceptance_aware_min_batch_size: int | None = Field(default=None, ge=1)
-    """Minimum dynamic-schedule batch size eligible for acceptance-aware K
-    reduction. ``None`` disables the controller."""
+    profitability_aware_min_batch_size: int | None = Field(default=None, ge=1)
+    """Minimum dynamic-schedule batch size eligible for online K=2/K=3
+    profitability selection. ``None`` disables the controller."""
 
-    acceptance_aware_threshold: float = Field(default=0.40, ge=0.0, le=1.0)
-    """Mean recent draft acceptance below which K is reduced by one."""
+    profitability_window: int = Field(default=16, ge=4)
+    """Recent decode-only throughput observations retained per batch size and K."""
 
-    acceptance_aware_window: int = Field(default=32, ge=4)
-    """Number of per-request speculative outcomes retained per batch size."""
+    profitability_min_samples: int = Field(default=4, ge=1)
+    """Observations required for both K values before exploitation."""
 
-    acceptance_aware_min_samples: int = Field(default=16, ge=1)
-    """Outcomes required before acceptance-aware K reduction begins."""
+    profitability_exploration_interval: int = Field(default=32, ge=2)
+    """Selections between probes of the currently slower K value."""
+
+    profitability_hysteresis: float = Field(default=0.03, ge=0.0, le=0.5)
+    """Required committed-token throughput advantage before switching to K=2."""
 
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1282,12 +1285,11 @@ class SpeculativeConfig:
             )
 
         if (
-            self.acceptance_aware_min_batch_size is not None
-            and self.acceptance_aware_min_samples > self.acceptance_aware_window
+            self.profitability_aware_min_batch_size is not None
+            and self.profitability_min_samples > self.profitability_window
         ):
             raise ValueError(
-                "acceptance_aware_min_samples cannot exceed "
-                "acceptance_aware_window"
+                "profitability_min_samples cannot exceed profitability_window"
             )
 
         if self.rejection_sample_method == "synthetic":

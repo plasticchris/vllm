@@ -208,6 +208,11 @@ class SchedulerConfig:
     )
     """Minimum decode-active prefill budget selected by the controller."""
 
+    prefill_schedule_adaptive_max_wait_seconds: float | None = Field(
+        default=None, gt=0.0
+    )
+    """Maximum time an adaptive high-load policy may defer all prefills."""
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
