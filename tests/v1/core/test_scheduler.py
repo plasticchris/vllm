@@ -5847,3 +5847,14 @@ def test_profitability_state_decays_loaded_samples(tmp_path):
     reader.profitability_state_half_life_seconds = 100.0
     reader._load_spec_profitability_state()
     assert list(reader._spec_profitability_history[(5, 2)]) == [5, 6, 7, 8]
+
+
+def test_decode_gap_p99_uses_recent_per_request_samples():
+    scheduler = object.__new__(Scheduler)
+    now = time.monotonic()
+    scheduler._decode_gap_window_seconds = 30.0
+    scheduler._decode_gap_samples = deque(
+        [(now - 31.0, 999.0), (now, 20.0), (now, 250.0)], maxlen=4096
+    )
+    assert Scheduler.get_decode_gap_p99_ms(scheduler) == 250.0
+    assert list(scheduler._decode_gap_samples) == [(now, 20.0), (now, 250.0)]

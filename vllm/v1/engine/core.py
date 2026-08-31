@@ -175,6 +175,7 @@ class EngineCore:
         self._adaptive_prefill_healthy_windows = 0
         self._adaptive_prefill_p99_ms: float | None = None
         self._adaptive_decode_p99_ms: float | None = None
+        self._adaptive_decode_gap_p99_ms: float | None = None
         self._adaptive_prefill_penalty_p99_ms: float | None = None
         self._adaptive_control_p99_ms: float | None = None
         self._adaptive_oldest_prefill_wait_seconds = 0.0
@@ -735,6 +736,9 @@ class EngineCore:
             output.prefill_control_prefill_ms_per_token = (
                 statistics.median(prefill_costs) if prefill_costs else None
             )
+            output.prefill_control_decode_gap_p99_ms = getattr(
+                self, "_adaptive_decode_gap_p99_ms", None
+            )
             output.spec_profitability = spec_profitability
 
     def _prefill_load_is_high(self) -> bool:
@@ -811,9 +815,14 @@ class EngineCore:
             return
 
         self._adaptive_high_load_latencies.append(elapsed_ms)
-        self._adaptive_control_p99_ms = EngineCore._latency_p99(
+        model_step_p99 = EngineCore._latency_p99(
             self._adaptive_high_load_latencies
         )
+        scheduler = getattr(self, "scheduler", None)
+        get_decode_gap = getattr(scheduler, "get_decode_gap_p99_ms", None)
+        decode_gap_p99 = get_decode_gap() if get_decode_gap is not None else None
+        self._adaptive_decode_gap_p99_ms = decode_gap_p99
+        self._adaptive_control_p99_ms = decode_gap_p99 or model_step_p99
         if scheduler_output.scheduled_prefill_tokens <= 0:
             self._adaptive_decode_latencies.append(elapsed_ms)
             if len(self._adaptive_decode_latencies) >= 4:
@@ -893,10 +902,18 @@ class EngineCore:
             self._adaptive_prefill_healthy_windows = 0
 
     def _activate_adaptive_prefill_tier(self, tier: str) -> None:
-        if getattr(self, "_adaptive_control_tier", None) == tier:
+        previous_tier = getattr(self, "_adaptive_control_tier", None)
+        if previous_tier == tier:
             return
         self._adaptive_control_tier = tier
         self._last_prefill_service_time = time.monotonic()
+        if previous_tier is not None:
+            if tier == "high" and self.prefill_schedule_high_load_interval:
+                self._adaptive_prefill_interval = max(
+                    self._adaptive_prefill_interval,
+                    self.prefill_schedule_high_load_interval,
+                )
+            return
         self._adaptive_prefill_interval = (
             self.prefill_schedule_high_load_interval
             if tier == "high" and self.prefill_schedule_high_load_interval
@@ -910,6 +927,7 @@ class EngineCore:
         self._adaptive_prefill_healthy_windows = 0
         self._adaptive_prefill_p99_ms = None
         self._adaptive_decode_p99_ms = None
+        self._adaptive_decode_gap_p99_ms = None
         self._adaptive_prefill_penalty_p99_ms = None
         self._adaptive_control_p99_ms = None
         self._adaptive_cold_start = True
@@ -946,6 +964,7 @@ class EngineCore:
         self._adaptive_prefill_healthy_windows = 0
         self._adaptive_prefill_p99_ms = None
         self._adaptive_decode_p99_ms = None
+        self._adaptive_decode_gap_p99_ms = None
         self._adaptive_prefill_penalty_p99_ms = None
         self._adaptive_control_p99_ms = None
         self._adaptive_control_tier = None

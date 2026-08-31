@@ -227,6 +227,12 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self._decode_completion_times: dict[str, float] = {}
+        self._decode_gap_samples: deque[tuple[float, float]] = deque(maxlen=4096)
+        self._decode_gap_window_seconds = max(
+            self.scheduler_config.prefill_schedule_adaptive_reset_seconds or 30.0,
+            30.0,
+        )
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -2364,6 +2370,13 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        completion_timestamp = time.monotonic()
+        decode_completion_times = getattr(self, "_decode_completion_times", None)
+        if decode_completion_times is None:
+            decode_completion_times = self._decode_completion_times = {}
+        decode_gap_samples = getattr(self, "_decode_gap_samples", None)
+        if decode_gap_samples is None:
+            decode_gap_samples = self._decode_gap_samples = deque(maxlen=4096)
         spec_step_committed_tokens = 0
         spec_step_num_tokens: int | None = None
         spec_step_requests = 0
@@ -2452,6 +2465,16 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                if new_token_ids:
+                    previous = decode_completion_times.get(req_id)
+                    if previous is not None and num_output_tokens_before > 0:
+                        decode_gap_samples.append(
+                            (
+                                completion_timestamp,
+                                (completion_timestamp - previous) * 1000.0,
+                            )
+                        )
+                    decode_completion_times[req_id] = completion_timestamp
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -2917,6 +2940,15 @@ class Scheduler(SchedulerInterface):
             counts[request_id] = allocated_blocks * self.block_size
         return counts
 
+    def get_decode_gap_p99_ms(self) -> float | None:
+        cutoff = time.monotonic() - self._decode_gap_window_seconds
+        while self._decode_gap_samples and self._decode_gap_samples[0][0] < cutoff:
+            self._decode_gap_samples.popleft()
+        if not self._decode_gap_samples:
+            return None
+        values = sorted(gap_ms for _, gap_ms in self._decode_gap_samples)
+        return values[math.ceil(len(values) * 0.99) - 1]
+
     def has_decode_prefill_overlap(self) -> bool:
         has_decode = any(not request.is_prefill_chunk for request in self.running)
         if not has_decode:
@@ -3061,6 +3093,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self._decode_completion_times.pop(request.request_id, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing

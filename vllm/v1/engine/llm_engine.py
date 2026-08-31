@@ -131,9 +131,10 @@ class LLMEngine:
             str | None,
             int | None,
             float | None,
+            float | None,
         ] = (
             None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         )
         self.last_request_kv_tokens: dict[str, int] = {}
         self.last_spec_profitability: dict[str, Any] | None = None
@@ -371,6 +372,7 @@ class LLMEngine:
             outputs.prefill_control_tier,
             outputs.mamba_prefill_subblock_tokens,
             outputs.prefill_control_prefill_ms_per_token,
+            outputs.prefill_control_decode_gap_p99_ms,
         )
         self.last_spec_profitability = outputs.spec_profitability
 

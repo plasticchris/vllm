@@ -304,3 +304,56 @@ def test_overlap_controller_applies_adaptive_prefill_budget():
     assert EngineCore._current_prefill_token_budget(
         engine, high_load=False, overlap=False
     ) == 2448
+
+
+def test_adaptive_prefill_controller_prefers_decode_gap_signal():
+    engine = SimpleNamespace(
+        scheduler=SimpleNamespace(get_decode_gap_p99_ms=lambda: 300.0),
+        prefill_schedule_adaptive_target_ms=250.0,
+        prefill_schedule_adaptive_update_interval=1,
+        prefill_schedule_adaptive_max_interval=128,
+        prefill_schedule_adaptive_min_token_budget=816,
+        prefill_schedule_high_load_interval=24,
+        prefill_schedule_interval=4,
+        _adaptive_control_tier="overlap",
+        _adaptive_prefill_interval=4,
+        _adaptive_prefill_max_budget=2448,
+        _adaptive_prefill_budget=2448,
+        _adaptive_prefill_latencies=deque(maxlen=128),
+        _adaptive_decode_latencies=deque(maxlen=128),
+        _adaptive_high_load_latencies=deque(maxlen=128),
+        _prefill_ms_per_token_samples=deque(maxlen=128),
+        _adaptive_prefill_observations=0,
+        _adaptive_prefill_healthy_windows=0,
+        _adaptive_cold_start=True,
+        _adaptive_prefill_p99_ms=None,
+        _adaptive_decode_p99_ms=None,
+        _adaptive_decode_gap_p99_ms=None,
+        _adaptive_prefill_penalty_p99_ms=None,
+        _adaptive_control_p99_ms=None,
+        _last_prefill_service_time=0.0,
+    )
+    output = SimpleNamespace(
+        high_prefill_load=False,
+        prefill_decode_overlap=True,
+        scheduled_timestamp=time.monotonic() - 0.1,
+        scheduled_prefill_tokens=204,
+        model_step_elapsed_ms=0.0,
+    )
+    EngineCore._observe_prefill_control(engine, output)
+    assert engine._adaptive_decode_gap_p99_ms == 300.0
+    assert engine._adaptive_control_p99_ms == 300.0
+    assert engine._adaptive_prefill_interval == 6
+
+
+def test_adaptive_prefill_tier_transition_preserves_feedback():
+    engine = SimpleNamespace(
+        _adaptive_control_tier="overlap",
+        _adaptive_prefill_interval=32,
+        prefill_schedule_high_load_interval=24,
+        _last_prefill_service_time=0.0,
+    )
+    EngineCore._activate_adaptive_prefill_tier(engine, "high")
+    assert engine._adaptive_prefill_interval == 32
+    EngineCore._activate_adaptive_prefill_tier(engine, "overlap")
+    assert engine._adaptive_prefill_interval == 32

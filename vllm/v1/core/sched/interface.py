@@ -271,6 +271,10 @@ class SchedulerInterface(ABC):
         """Return whether active decode and pending prefill work coexist."""
         return False
 
+    def get_decode_gap_p99_ms(self) -> float | None:
+        """Return recent P99 time between outputs for individual decodes."""
+        return None
+
     def get_spec_profitability_stats(self) -> dict[str, object] | None:
         """Return online speculative-decoding controller telemetry."""
         return None

@@ -260,6 +260,7 @@ class EngineCoreOutputs(
     prefill_control_tier: str | None = None
     mamba_prefill_subblock_tokens: int | None = None
     prefill_control_prefill_ms_per_token: float | None = None
+    prefill_control_decode_gap_p99_ms: float | None = None
     spec_profitability: dict[str, Any] | None = None
     timestamp: float = 0.0
 
