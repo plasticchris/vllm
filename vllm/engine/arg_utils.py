@@ -530,6 +530,9 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+    decode_active_long_prefill_token_threshold: int | None = (
+        SchedulerConfig.decode_active_long_prefill_token_threshold
+    )
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -631,6 +634,21 @@ class EngineArgs:
     )
     decode_active_prefill_high_load_token_budget: int | None = (
         SchedulerConfig.decode_active_prefill_high_load_token_budget
+    )
+    prefill_schedule_adaptive_target_ms: float | None = (
+        SchedulerConfig.prefill_schedule_adaptive_target_ms
+    )
+    prefill_schedule_adaptive_window: int = (
+        SchedulerConfig.prefill_schedule_adaptive_window
+    )
+    prefill_schedule_adaptive_update_interval: int = (
+        SchedulerConfig.prefill_schedule_adaptive_update_interval
+    )
+    prefill_schedule_adaptive_max_interval: int = (
+        SchedulerConfig.prefill_schedule_adaptive_max_interval
+    )
+    prefill_schedule_adaptive_min_token_budget: int | None = (
+        SchedulerConfig.prefill_schedule_adaptive_min_token_budget
     )
 
     watermark: float = SchedulerConfig.watermark
@@ -1469,6 +1487,10 @@ class EngineArgs:
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"],
         )
+        scheduler_group.add_argument(
+            "--decode-active-long-prefill-token-threshold",
+            **scheduler_kwargs["decode_active_long_prefill_token_threshold"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
@@ -1519,6 +1541,26 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--decode-active-prefill-high-load-token-budget",
             **scheduler_kwargs["decode_active_prefill_high_load_token_budget"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-target-ms",
+            **scheduler_kwargs["prefill_schedule_adaptive_target_ms"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-window",
+            **scheduler_kwargs["prefill_schedule_adaptive_window"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-update-interval",
+            **scheduler_kwargs["prefill_schedule_adaptive_update_interval"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-max-interval",
+            **scheduler_kwargs["prefill_schedule_adaptive_max_interval"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-min-token-budget",
+            **scheduler_kwargs["prefill_schedule_adaptive_min_token_budget"],
         )
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
@@ -2235,6 +2277,9 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
+            decode_active_long_prefill_token_threshold=(
+                self.decode_active_long_prefill_token_threshold
+            ),
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
@@ -2255,6 +2300,19 @@ class EngineArgs:
             ),
             decode_active_prefill_high_load_token_budget=(
                 self.decode_active_prefill_high_load_token_budget
+            ),
+            prefill_schedule_adaptive_target_ms=(
+                self.prefill_schedule_adaptive_target_ms
+            ),
+            prefill_schedule_adaptive_window=self.prefill_schedule_adaptive_window,
+            prefill_schedule_adaptive_update_interval=(
+                self.prefill_schedule_adaptive_update_interval
+            ),
+            prefill_schedule_adaptive_max_interval=(
+                self.prefill_schedule_adaptive_max_interval
+            ),
+            prefill_schedule_adaptive_min_token_budget=(
+                self.prefill_schedule_adaptive_min_token_budget
             ),
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,

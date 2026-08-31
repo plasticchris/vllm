@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import math
 import os
 import queue
 import signal
@@ -132,6 +133,33 @@ class EngineCore:
         self.decode_active_prefill_high_load_token_budget = (
             scheduler_config.decode_active_prefill_high_load_token_budget
         )
+        self.prefill_schedule_adaptive_target_ms = (
+            scheduler_config.prefill_schedule_adaptive_target_ms
+        )
+        self.prefill_schedule_adaptive_update_interval = (
+            scheduler_config.prefill_schedule_adaptive_update_interval
+        )
+        self.prefill_schedule_adaptive_max_interval = (
+            scheduler_config.prefill_schedule_adaptive_max_interval
+        )
+        self.prefill_schedule_adaptive_min_token_budget = (
+            scheduler_config.prefill_schedule_adaptive_min_token_budget
+        )
+        self._adaptive_prefill_interval = (
+            self.prefill_schedule_high_load_interval
+            or self.prefill_schedule_interval
+        )
+        self._adaptive_prefill_max_budget = (
+            self.decode_active_prefill_high_load_token_budget
+            or self.decode_active_prefill_token_budget
+        )
+        self._adaptive_prefill_budget = self._adaptive_prefill_max_budget
+        self._adaptive_prefill_latencies = deque(
+            maxlen=scheduler_config.prefill_schedule_adaptive_window
+        )
+        self._adaptive_prefill_steps = 0
+        self._adaptive_prefill_healthy_windows = 0
+        self._adaptive_prefill_p99_ms: float | None = None
         self._prefill_schedule_step = 0
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
@@ -589,6 +617,27 @@ class EngineCore:
         else:
             eco.scheduler_stats.iteration_details = iteration_details
 
+    def _attach_kv_cache_stats(
+        self, outputs: dict[int, EngineCoreOutputs]
+    ) -> None:
+        free_blocks, total_blocks = self.scheduler.get_kv_cache_block_counts()
+        if not outputs:
+            outputs[0] = EngineCoreOutputs()
+        usage = 1.0 - (free_blocks / total_blocks) if total_blocks else 0.0
+        for output in outputs.values():
+            output.kv_cache_usage = usage
+            output.kv_cache_free_blocks = free_blocks
+            output.kv_cache_total_blocks = total_blocks
+            output.prefill_control_interval = getattr(
+                self, "_adaptive_prefill_interval", None
+            )
+            output.prefill_control_token_budget = getattr(
+                self, "_adaptive_prefill_budget", None
+            )
+            output.prefill_control_p99_ms = getattr(
+                self, "_adaptive_prefill_p99_ms", None
+            )
+
     def _prefill_load_is_high(self) -> bool:
         high_load_interval = getattr(
             self, "prefill_schedule_high_load_interval", None
@@ -620,12 +669,72 @@ class EngineCore:
         if high_load is None:
             high_load = self._prefill_load_is_high()
         if high_load:
+            if getattr(self, "prefill_schedule_adaptive_target_ms", None) is not None:
+                adaptive_budget = getattr(self, "_adaptive_prefill_budget", None)
+                if adaptive_budget is not None:
+                    return adaptive_budget
             high_load_budget = getattr(
                 self, "decode_active_prefill_high_load_token_budget", None
             )
             if high_load_budget is not None:
                 return high_load_budget
         return getattr(self, "decode_active_prefill_token_budget", None)
+
+    def _observe_prefill_control(self, scheduler_output: SchedulerOutput) -> None:
+        target = getattr(self, "prefill_schedule_adaptive_target_ms", None)
+        if (
+            target is None
+            or not scheduler_output.high_prefill_load
+            or scheduler_output.scheduled_timestamp <= 0
+        ):
+            return
+        latency_ms = (time.monotonic() - scheduler_output.scheduled_timestamp) * 1000
+        self._adaptive_prefill_latencies.append(latency_ms)
+        self._adaptive_prefill_steps += 1
+        if (
+            len(self._adaptive_prefill_latencies) < 16
+            or self._adaptive_prefill_steps
+            % self.prefill_schedule_adaptive_update_interval
+            != 0
+        ):
+            return
+        values = sorted(self._adaptive_prefill_latencies)
+        p99 = values[math.ceil(len(values) * 0.99) - 1]
+        self._adaptive_prefill_p99_ms = p99
+        if p99 > target:
+            self._adaptive_prefill_healthy_windows = 0
+            self._adaptive_prefill_interval = min(
+                self.prefill_schedule_adaptive_max_interval,
+                max(
+                    self._adaptive_prefill_interval + 1,
+                    math.ceil(self._adaptive_prefill_interval * 1.5),
+                ),
+            )
+            minimum_budget = self.prefill_schedule_adaptive_min_token_budget
+            if minimum_budget is not None and self._adaptive_prefill_budget is not None:
+                halved = self._adaptive_prefill_budget // 2
+                aligned = (halved // minimum_budget) * minimum_budget
+                self._adaptive_prefill_budget = max(minimum_budget, aligned)
+        elif p99 < target * 0.7:
+            self._adaptive_prefill_healthy_windows += 1
+            if self._adaptive_prefill_healthy_windows >= 3:
+                base_interval = self.prefill_schedule_high_load_interval or 1
+                self._adaptive_prefill_interval = max(
+                    base_interval, math.floor(self._adaptive_prefill_interval * 0.8)
+                )
+                if (
+                    self.prefill_schedule_adaptive_min_token_budget is not None
+                    and self._adaptive_prefill_budget is not None
+                    and self._adaptive_prefill_max_budget is not None
+                ):
+                    self._adaptive_prefill_budget = min(
+                        self._adaptive_prefill_max_budget,
+                        self._adaptive_prefill_budget
+                        + self.prefill_schedule_adaptive_min_token_budget,
+                    )
+                self._adaptive_prefill_healthy_windows = 0
+        else:
+            self._adaptive_prefill_healthy_windows = 0
 
     def _should_throttle_prefills(
         self, high_load: bool | None = None
@@ -635,10 +744,13 @@ class EngineCore:
             high_load = self._prefill_load_is_high()
         interval = self.prefill_schedule_interval
         if high_load:
-            interval = (
-                getattr(self, "prefill_schedule_high_load_interval", None)
-                or interval
-            )
+            if getattr(self, "prefill_schedule_adaptive_target_ms", None) is not None:
+                interval = self._adaptive_prefill_interval
+            else:
+                interval = (
+                    getattr(self, "prefill_schedule_high_load_interval", None)
+                    or interval
+                )
         step = self._prefill_schedule_step
         self._prefill_schedule_step += 1
         return interval > 1 and step % interval != 0
@@ -655,10 +767,13 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         high_prefill_load = self._prefill_load_is_high()
+        schedule_started = time.monotonic()
         scheduler_output = self.scheduler.schedule(
             self._should_throttle_prefills(high_prefill_load),
             self._current_prefill_token_budget(high_prefill_load),
         )
+        scheduler_output.scheduled_timestamp = schedule_started
+        scheduler_output.high_prefill_load = high_prefill_load
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -669,6 +784,8 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        self._observe_prefill_control(scheduler_output)
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
@@ -676,6 +793,7 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+        self._attach_kv_cache_stats(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -717,10 +835,13 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             high_prefill_load = self._prefill_load_is_high()
+            schedule_started = time.monotonic()
             scheduler_output = self.scheduler.schedule(
                 self._should_throttle_prefills(high_prefill_load),
                 self._current_prefill_token_budget(high_prefill_load),
             )
+            scheduler_output.scheduled_timestamp = schedule_started
+            scheduler_output.high_prefill_load = high_prefill_load
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -775,6 +896,8 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
+        self._observe_prefill_control(scheduler_output)
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
@@ -782,6 +905,7 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+        self._attach_kv_cache_stats(engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is

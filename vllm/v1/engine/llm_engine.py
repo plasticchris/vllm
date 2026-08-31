@@ -110,6 +110,10 @@ class LLMEngine:
             log_stats=self.log_stats,
         )
 
+        self.last_kv_cache_stats: tuple[float, int, int] | None = None
+        self.last_prefill_control: tuple[int | None, int | None, float | None] = (
+            None, None, None
+        )
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
             self.logger_manager = StatLoggerManager(
@@ -302,6 +306,21 @@ class LLMEngine:
         # 1) Get EngineCoreOutput from the EngineCore.
         with record_function_or_nullcontext("llm_engine step: get_output"):
             outputs = self.engine_core.get_output()
+        if (
+            outputs.kv_cache_usage is not None
+            and outputs.kv_cache_free_blocks is not None
+            and outputs.kv_cache_total_blocks is not None
+        ):
+            self.last_kv_cache_stats = (
+                outputs.kv_cache_usage,
+                outputs.kv_cache_free_blocks,
+                outputs.kv_cache_total_blocks,
+            )
+        self.last_prefill_control = (
+            outputs.prefill_control_interval,
+            outputs.prefill_control_token_budget,
+            outputs.prefill_control_p99_ms,
+        )
 
         # 2) Process EngineCoreOutputs.
         with record_function_or_nullcontext("llm_engine step: process_outputs"):

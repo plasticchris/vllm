@@ -67,6 +67,13 @@ class SchedulerConfig:
     In real usage, this should be set in `EngineArgs.create_engine_config`.
     """
 
+    decode_active_long_prefill_token_threshold: int | None = Field(
+        default=None, ge=1
+    )
+    """Optional per-request prefill chunk limit while decode work is active.
+    This allows larger, throughput-oriented chunks when the engine has no
+    decodes without increasing decode interruption latency."""
+
     max_num_partial_prefills: int = Field(default=1, ge=1)
     """For chunked prefill, the maximum number of sequences that can be
     partially prefilled concurrently."""
@@ -180,6 +187,26 @@ class SchedulerConfig:
         default=None, ge=1
     )
     """Optional decode-active prefill budget used under high load."""
+
+    prefill_schedule_adaptive_target_ms: float | None = Field(
+        default=None, gt=0.0
+    )
+    """Enable closed-loop high-load prefill control with this scheduler-step
+    p99 latency target in milliseconds."""
+
+    prefill_schedule_adaptive_window: int = Field(default=128, ge=16)
+    """Number of high-load scheduler-step latencies in the control window."""
+
+    prefill_schedule_adaptive_update_interval: int = Field(default=16, ge=1)
+    """High-load steps between control updates."""
+
+    prefill_schedule_adaptive_max_interval: int = Field(default=128, ge=1)
+    """Maximum prefill cadence interval selected by the controller."""
+
+    prefill_schedule_adaptive_min_token_budget: int | None = Field(
+        default=None, ge=1
+    )
+    """Minimum decode-active prefill budget selected by the controller."""
 
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to

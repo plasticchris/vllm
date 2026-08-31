@@ -255,6 +255,10 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # Engine-core-only timing metadata for adaptive prefill control.
+    scheduled_timestamp: float = 0.0
+    high_prefill_load: bool = False
+
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0

@@ -188,6 +188,19 @@ class SpeculativeConfig:
     greedy_num_speculative_tokens: int | None = Field(default=None, ge=0)
     """Maximum K for requests using greedy target sampling."""
 
+    acceptance_aware_min_batch_size: int | None = Field(default=None, ge=1)
+    """Minimum dynamic-schedule batch size eligible for acceptance-aware K
+    reduction. ``None`` disables the controller."""
+
+    acceptance_aware_threshold: float = Field(default=0.40, ge=0.0, le=1.0)
+    """Mean recent draft acceptance below which K is reduced by one."""
+
+    acceptance_aware_window: int = Field(default=32, ge=4)
+    """Number of per-request speculative outcomes retained per batch size."""
+
+    acceptance_aware_min_samples: int = Field(default=16, ge=1)
+    """Outcomes required before acceptance-aware K reduction begins."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
@@ -1266,6 +1279,15 @@ class SpeculativeConfig:
             raise ValueError(
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
+            )
+
+        if (
+            self.acceptance_aware_min_batch_size is not None
+            and self.acceptance_aware_min_samples > self.acceptance_aware_window
+        ):
+            raise ValueError(
+                "acceptance_aware_min_samples cannot exceed "
+                "acceptance_aware_window"
             )
 
         if self.rejection_sample_method == "synthetic":

@@ -2290,6 +2290,11 @@ class VllmConfig:
             )
             if self.scheduler_config.long_prefill_token_threshold > 0:
                 assert self.scheduler_config.long_prefill_token_threshold >= block_size
+            decode_prefill_threshold = (
+                self.scheduler_config.decode_active_long_prefill_token_threshold
+            )
+            if decode_prefill_threshold is not None:
+                assert decode_prefill_threshold >= block_size
             assert not self.scheduler_config.disable_chunked_mm_input, (
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "

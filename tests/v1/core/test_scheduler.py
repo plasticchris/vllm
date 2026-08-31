@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from collections import deque
 from unittest.mock import Mock
 
 import pytest
@@ -143,11 +144,43 @@ def test_prefill_budget_rotates_when_all_candidates_do_not_fit():
     assert selected == {"p1", "p2", "p3"}
 
 
+def test_mamba_prefill_chunks_share_the_batch_budget():
+    scheduler = create_scheduler(
+        max_num_seqs=3,
+        max_num_batched_tokens=1024,
+        long_prefill_token_threshold=400,
+        block_size=16,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    for request in create_requests(num_requests=3, num_tokens=800):
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert list(output.num_scheduled_tokens.values()) == [336, 336, 336]
+
+
+def test_acceptance_aware_dynamic_speculation_reduces_k():
+    scheduler = create_scheduler()
+    scheduler.acceptance_aware_min_batch_size = 4
+    scheduler.acceptance_aware_threshold = 0.4
+    scheduler.acceptance_aware_min_samples = 4
+    scheduler._spec_acceptance_history = {
+        5: deque([0.2, 0.4, 0.5, 0.3], maxlen=8)
+    }
+    assert scheduler._acceptance_adjusted_spec_tokens(5, 3) == 2
+    scheduler._spec_acceptance_history[5] = deque(
+        [0.7, 0.8, 0.6, 0.9], maxlen=8
+    )
+    assert scheduler._acceptance_adjusted_spec_tokens(5, 3) == 3
+    assert scheduler._acceptance_adjusted_spec_tokens(3, 3) == 3
+    assert scheduler._acceptance_adjusted_spec_tokens(6, 2) == 2
+
+
 def test_decode_active_prefill_token_budget():
     scheduler = create_scheduler(
         max_num_seqs=4,
         max_num_batched_tokens=8192,
         long_prefill_token_threshold=1024,
+        decode_active_long_prefill_token_threshold=512,
         decode_active_prefill_token_budget=2048,
     )
     (decode_req,) = create_requests(num_requests=1, num_tokens=4, req_ids=["dec"])
@@ -178,7 +211,8 @@ def test_decode_active_prefill_token_budget():
         if request_id.startswith("p")
     }
     assert set(prefill_counts) == {"p0", "p1", "p2"}
-    assert sum(prefill_counts.values()) <= 2048
+    assert sum(prefill_counts.values()) <= 1536
+    assert max(prefill_counts.values()) <= 512
     assert max(prefill_counts.values()) - min(prefill_counts.values()) <= 1
     scheduler.update_from_output(
         output,
@@ -197,7 +231,8 @@ def test_decode_active_prefill_token_budget():
         for request_id, count in output.num_scheduled_tokens.items()
         if request_id.startswith("p")
     ]
-    assert sum(prefill_counts) <= 2048
+    assert sum(prefill_counts) <= 1536
+    assert max(prefill_counts) <= 512
     assert max(prefill_counts) - min(prefill_counts) <= 1
 
     prefill_only = create_scheduler(

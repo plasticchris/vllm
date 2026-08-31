@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
+from collections import deque
 from types import SimpleNamespace
 
 from vllm.v1.engine import EngineCoreOutputs
@@ -86,3 +87,48 @@ def test_attach_iteration_details_falls_back_to_client_zero_without_outputs():
     assert set(outputs) == {0}
     assert outputs[0].scheduler_stats is not None
     assert outputs[0].scheduler_stats.iteration_details == iteration_details
+
+
+def test_adaptive_prefill_control_reacts_to_high_p99():
+    engine = SimpleNamespace(
+        prefill_schedule_adaptive_target_ms=250.0,
+        prefill_schedule_adaptive_update_interval=16,
+        prefill_schedule_adaptive_max_interval=128,
+        prefill_schedule_adaptive_min_token_budget=816,
+        prefill_schedule_high_load_interval=24,
+        _adaptive_prefill_interval=24,
+        _adaptive_prefill_max_budget=2448,
+        _adaptive_prefill_budget=2448,
+        _adaptive_prefill_latencies=deque(maxlen=128),
+        _adaptive_prefill_steps=0,
+        _adaptive_prefill_healthy_windows=0,
+        _adaptive_prefill_p99_ms=None,
+    )
+    for _ in range(16):
+        output = SimpleNamespace(
+            high_prefill_load=True,
+            scheduled_timestamp=time.monotonic() - 0.6,
+        )
+        EngineCore._observe_prefill_control(engine, output)
+
+    assert engine._adaptive_prefill_p99_ms >= 500
+    assert engine._adaptive_prefill_interval == 36
+    assert engine._adaptive_prefill_budget == 816
+
+
+def test_attach_kv_cache_stats_without_request_output():
+    engine = SimpleNamespace(
+        scheduler=SimpleNamespace(
+            get_kv_cache_block_counts=lambda: (25, 100)
+        ),
+        _adaptive_prefill_interval=48,
+        _adaptive_prefill_budget=816,
+        _adaptive_prefill_p99_ms=410.0,
+    )
+    outputs = {}
+    EngineCore._attach_kv_cache_stats(engine, outputs)
+
+    assert outputs[0].kv_cache_usage == 0.75
+    assert outputs[0].kv_cache_free_blocks == 25
+    assert outputs[0].kv_cache_total_blocks == 100
+    assert outputs[0].prefill_control_interval == 48

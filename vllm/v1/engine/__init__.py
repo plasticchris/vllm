@@ -232,6 +232,12 @@ class EngineCoreOutputs(
     # [num_reqs]
     outputs: list[EngineCoreOutput] = []
     scheduler_stats: SchedulerStats | None = None
+    kv_cache_usage: float | None = None
+    kv_cache_free_blocks: int | None = None
+    kv_cache_total_blocks: int | None = None
+    prefill_control_interval: int | None = None
+    prefill_control_token_budget: int | None = None
+    prefill_control_p99_ms: float | None = None
     timestamp: float = 0.0
 
     utility_output: UtilityOutput | None = None
