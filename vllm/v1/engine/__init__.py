@@ -252,6 +252,11 @@ class EngineCoreOutputs(
     prefill_control_oldest_wait_seconds: float | None = None
     prefill_control_aging_interval: int | None = None
     prefill_control_aging_token_budget: int | None = None
+    prefill_control_high_load: bool | None = None
+    prefill_control_cold_start: bool | None = None
+    prefill_control_observations: int | None = None
+    prefill_control_reset_count: int | None = None
+    prefill_control_quiet_seconds: float | None = None
     spec_profitability: dict[str, Any] | None = None
     timestamp: float = 0.0
 

@@ -533,6 +533,18 @@ class EngineArgs:
     decode_active_long_prefill_token_threshold: int | None = (
         SchedulerConfig.decode_active_long_prefill_token_threshold
     )
+    short_prefill_priority_token_threshold: int | None = (
+        SchedulerConfig.short_prefill_priority_token_threshold
+    )
+    short_prefill_priority_max_burst: int = (
+        SchedulerConfig.short_prefill_priority_max_burst
+    )
+    short_prefill_priority_aging_seconds: float = (
+        SchedulerConfig.short_prefill_priority_aging_seconds
+    )
+    mamba_prefill_subblock_tokens: int | None = (
+        SchedulerConfig.mamba_prefill_subblock_tokens
+    )
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -1497,6 +1509,22 @@ class EngineArgs:
             "--decode-active-long-prefill-token-threshold",
             **scheduler_kwargs["decode_active_long_prefill_token_threshold"],
         )
+        scheduler_group.add_argument(
+            "--short-prefill-priority-token-threshold",
+            **scheduler_kwargs["short_prefill_priority_token_threshold"],
+        )
+        scheduler_group.add_argument(
+            "--short-prefill-priority-max-burst",
+            **scheduler_kwargs["short_prefill_priority_max_burst"],
+        )
+        scheduler_group.add_argument(
+            "--short-prefill-priority-aging-seconds",
+            **scheduler_kwargs["short_prefill_priority_aging_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--mamba-prefill-subblock-tokens",
+            **scheduler_kwargs["mamba_prefill_subblock_tokens"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
@@ -2294,6 +2322,16 @@ class EngineArgs:
             decode_active_long_prefill_token_threshold=(
                 self.decode_active_long_prefill_token_threshold
             ),
+            short_prefill_priority_token_threshold=(
+                self.short_prefill_priority_token_threshold
+            ),
+            short_prefill_priority_max_burst=(
+                self.short_prefill_priority_max_burst
+            ),
+            short_prefill_priority_aging_seconds=(
+                self.short_prefill_priority_aging_seconds
+            ),
+            mamba_prefill_subblock_tokens=self.mamba_prefill_subblock_tokens,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,

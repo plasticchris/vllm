@@ -75,6 +75,24 @@ def test_mamba_align_split_partial_tail_schedule():
     assert split(self=mock, request=req2, num_new_tokens=1000) == 512
 
 
+def test_mamba_decode_active_subblock_retains_partial_state():
+    block_size = 816
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        use_eagle=False,
+        hash_block_size=block_size,
+        mamba_partial_cache_hit=False,
+    )
+    split = Scheduler._mamba_block_aligned_split
+    req = make_request("subblock", [0] * 4000, block_size, sha256)
+
+    assert split(mock, req, 816, subblock_tokens=408) == 408
+    req.num_computed_tokens = 408
+    assert split(mock, req, 816, subblock_tokens=408) == 408
+    req.num_computed_tokens = 816
+    assert split(mock, req, 816, subblock_tokens=408) == 408
+
+
 def test_hybrid_mamba_align_partial_hash_hit():
     hash_block_size = 2
     mamba_block_size = 2 * hash_block_size

@@ -74,6 +74,18 @@ class SchedulerConfig:
     This allows larger, throughput-oriented chunks when the engine has no
     decodes without increasing decode interruption latency."""
 
+    short_prefill_priority_token_threshold: int | None = Field(default=None, ge=1)
+    """Prioritize waiting prefills no larger than this many prompt tokens."""
+
+    short_prefill_priority_max_burst: int = Field(default=4, ge=1)
+    """Maximum consecutive short-prefill promotions while long prefills wait."""
+
+    short_prefill_priority_aging_seconds: float = Field(default=10.0, gt=0.0)
+    """Long-prefill age that reduces the short-prefill promotion burst to one."""
+
+    mamba_prefill_subblock_tokens: int | None = Field(default=None, ge=1)
+    """Experimental decode-active Mamba prefill slice below one cache block."""
+
     max_num_partial_prefills: int = Field(default=1, ge=1)
     """For chunked prefill, the maximum number of sequences that can be
     partially prefilled concurrently."""

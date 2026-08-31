@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
+import time
 from collections import deque
 from unittest.mock import Mock
 
@@ -144,6 +146,26 @@ def test_prefill_budget_rotates_when_all_candidates_do_not_fit():
     assert selected == {"p1", "p2", "p3"}
 
 
+def test_prefill_priority_overrides_round_robin_cursor():
+    scheduler = create_scheduler()
+    candidates = ["short", "long-a", "long-b"]
+    scheduler._prefill_rr_cursor = 2
+    selected, _ = scheduler._fair_prefill_selection(
+        candidates, budget=816, minimum_chunk=816, priority_id="short"
+    )
+    assert selected == {"short"}
+
+    scheduler._idle_prefill_rr_cursor = 2
+    budgets = scheduler._idle_prefill_block_budgets(
+        candidates,
+        token_budget=816,
+        block_size=816,
+        max_chunk=816,
+        priority_id="short",
+    )
+    assert budgets == {"short": 816}
+
+
 def test_mamba_prefill_chunks_share_the_batch_budget():
     scheduler = create_scheduler(
         max_num_seqs=3,
@@ -182,6 +204,61 @@ def test_idle_prefill_block_remainder_rotates():
         1632,
         816,
     ]
+
+
+def test_short_prefill_priority_has_burst_and_aging_limits():
+    scheduler = create_scheduler()
+    scheduler.scheduler_config.short_prefill_priority_token_threshold = 1024
+    scheduler.scheduler_config.short_prefill_priority_max_burst = 4
+    scheduler.scheduler_config.short_prefill_priority_aging_seconds = 10.0
+    long_request = create_requests(
+        num_requests=1, num_tokens=8000, req_ids=["long"]
+    )[0]
+    short_request = create_requests(
+        num_requests=1, num_tokens=512, req_ids=["short"]
+    )[0]
+    scheduler.add_request(long_request)
+    scheduler.add_request(short_request)
+
+    assert scheduler._select_short_waiting_prefill() == "short"
+    assert scheduler.waiting.peek_request().request_id == "short"
+    assert scheduler._select_short_waiting_prefill() == "short"
+    assert scheduler._select_short_waiting_prefill() == "short"
+    assert scheduler._select_short_waiting_prefill() == "short"
+    assert scheduler._select_short_waiting_prefill() is None
+
+    scheduler._short_prefill_priority_streak = 0
+    long_request.arrival_time -= 11.0
+    assert scheduler._select_short_waiting_prefill() == "short"
+    assert scheduler._select_short_waiting_prefill() is None
+
+
+def test_short_prefill_preempts_running_long_prefill_chunk():
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        max_num_batched_tokens=1024,
+        long_prefill_token_threshold=512,
+        block_size=16,
+    )
+    scheduler.scheduler_config.short_prefill_priority_token_threshold = 600
+    scheduler.scheduler_config.short_prefill_priority_max_burst = 4
+    scheduler.scheduler_config.short_prefill_priority_aging_seconds = 10.0
+    long_request = create_requests(
+        num_requests=1, num_tokens=8000, req_ids=["long-running"]
+    )[0]
+    scheduler.add_request(long_request)
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"long-running": 512}
+
+    short_request = create_requests(
+        num_requests=1, num_tokens=512, req_ids=["short-waiting"]
+    )[0]
+    scheduler.add_request(short_request)
+    scheduler._prefill_rr_cursor = 1
+    scheduler._idle_prefill_rr_cursor = 1
+    second = scheduler.schedule()
+    assert "short-waiting" in second.num_scheduled_tokens
+    assert "long-running" not in second.num_scheduled_tokens
 
 
 def test_profitability_aware_dynamic_speculation_selects_faster_k():
@@ -261,6 +338,33 @@ def test_profitability_state_round_trip(tmp_path):
     assert list(second._spec_profitability_history[(5, 3)]) == [1.3]
     assert second._spec_profitability_steps[5] == 9
     assert second._spec_profitability_loaded_samples == 3
+
+
+def test_profitability_state_rejects_mismatch_and_expiry(tmp_path):
+    state_path = tmp_path / "profitability.json"
+    writer = create_scheduler()
+    writer.profitability_state_path = str(state_path)
+    writer._profitability_state_fingerprint = "runtime-a"
+    writer._spec_profitability_history = {
+        (5, 2): deque([1.1, 1.2], maxlen=8),
+    }
+    writer._save_spec_profitability_state()
+
+    mismatch = create_scheduler()
+    mismatch.profitability_state_path = str(state_path)
+    mismatch._profitability_state_fingerprint = "runtime-b"
+    mismatch._load_spec_profitability_state()
+    assert not mismatch._spec_profitability_history
+
+    state = json.loads(state_path.read_text())
+    state["saved_at"] = time.time() - 100.0
+    state_path.write_text(json.dumps(state))
+    expired = create_scheduler()
+    expired.profitability_state_path = str(state_path)
+    expired._profitability_state_fingerprint = "runtime-a"
+    expired.profitability_state_ttl_seconds = 1.0
+    expired._load_spec_profitability_state()
+    assert not expired._spec_profitability_history
 
 
 def test_decode_active_prefill_token_budget():

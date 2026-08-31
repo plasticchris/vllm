@@ -104,6 +104,7 @@ def test_adaptive_prefill_control_reacts_once_per_prefill_observation():
         _adaptive_high_load_latencies=deque([30.0] * 127, maxlen=128),
         _adaptive_prefill_observations=0,
         _adaptive_prefill_healthy_windows=0,
+        _adaptive_cold_start=True,
         _adaptive_prefill_p99_ms=None,
         _adaptive_decode_p99_ms=30.0,
         _adaptive_prefill_penalty_p99_ms=None,
@@ -128,6 +129,7 @@ def test_adaptive_prefill_control_reacts_once_per_prefill_observation():
     assert engine._adaptive_control_p99_ms >= 500
     assert engine._adaptive_prefill_interval == 36
     assert engine._adaptive_prefill_budget == 816
+    assert engine._adaptive_cold_start is False
 
     decode_output = SimpleNamespace(
         high_prefill_load=True,
@@ -138,6 +140,41 @@ def test_adaptive_prefill_control_reacts_once_per_prefill_observation():
     for _ in range(16):
         EngineCore._observe_prefill_control(engine, decode_output)
     assert engine._adaptive_prefill_interval == 36
+
+
+def test_adaptive_prefill_cold_start_reacts_to_first_prefill():
+    engine = SimpleNamespace(
+        prefill_schedule_adaptive_target_ms=250.0,
+        prefill_schedule_adaptive_update_interval=1,
+        prefill_schedule_adaptive_max_interval=128,
+        prefill_schedule_adaptive_min_token_budget=816,
+        prefill_schedule_high_load_interval=24,
+        _adaptive_prefill_interval=24,
+        _adaptive_prefill_max_budget=2448,
+        _adaptive_prefill_budget=2448,
+        _adaptive_prefill_latencies=deque(maxlen=128),
+        _adaptive_decode_latencies=deque(maxlen=128),
+        _adaptive_high_load_latencies=deque(maxlen=128),
+        _adaptive_prefill_observations=0,
+        _adaptive_prefill_healthy_windows=0,
+        _adaptive_cold_start=True,
+        _adaptive_prefill_p99_ms=None,
+        _adaptive_decode_p99_ms=None,
+        _adaptive_prefill_penalty_p99_ms=None,
+        _adaptive_control_p99_ms=None,
+        _last_prefill_service_time=0.0,
+    )
+    output = SimpleNamespace(
+        high_prefill_load=True,
+        scheduled_timestamp=time.monotonic() - 0.6,
+        scheduled_prefill_tokens=408,
+        model_step_elapsed_ms=0.0,
+    )
+    EngineCore._observe_prefill_control(engine, output)
+    assert engine._adaptive_prefill_interval == 36
+    assert engine._adaptive_prefill_budget == 816
+    assert engine._adaptive_prefill_observations == 1
+    assert engine._adaptive_cold_start is False
 
 
 def test_adaptive_prefill_control_forces_aged_service():
@@ -179,6 +216,8 @@ def test_adaptive_prefill_control_resets_after_quiet_period():
         _adaptive_decode_p99_ms=30.0,
         _adaptive_prefill_penalty_p99_ms=570.0,
         _adaptive_control_p99_ms=600.0,
+        _adaptive_cold_start=False,
+        _adaptive_reset_count=2,
         _adaptive_quiet_since=1.0,
     )
     EngineCore._reset_adaptive_prefill_control(engine)
@@ -186,6 +225,8 @@ def test_adaptive_prefill_control_resets_after_quiet_period():
     assert engine._adaptive_prefill_budget == 2448
     assert not engine._adaptive_high_load_latencies
     assert engine._adaptive_control_p99_ms is None
+    assert engine._adaptive_cold_start is True
+    assert engine._adaptive_reset_count == 3
     assert engine._adaptive_quiet_since is None
 
 
@@ -227,4 +268,6 @@ def test_attach_kv_cache_stats_without_request_output():
     assert outputs[0].prefill_control_oldest_wait_seconds == 12.0
     assert outputs[0].prefill_control_aging_interval == 24
     assert outputs[0].prefill_control_aging_token_budget == 1632
+    assert outputs[0].prefill_control_high_load is None
+    assert outputs[0].prefill_control_cold_start is None
     assert outputs[0].spec_profitability["last_selected_k"] == 2

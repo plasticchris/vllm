@@ -179,6 +179,8 @@ class EngineCore:
         self._adaptive_aging_interval: int | None = None
         self._adaptive_aging_token_budget: int | None = None
         self._adaptive_high_load = False
+        self._adaptive_cold_start = True
+        self._adaptive_reset_count = 0
         self._adaptive_quiet_since: float | None = None
         self._last_prefill_service_time = time.monotonic()
         self._prefill_schedule_step = 0
@@ -698,6 +700,24 @@ class EngineCore:
             output.prefill_control_aging_token_budget = getattr(
                 self, "_adaptive_aging_token_budget", None
             )
+            output.prefill_control_high_load = getattr(
+                self, "_adaptive_high_load", None
+            )
+            output.prefill_control_cold_start = getattr(
+                self, "_adaptive_cold_start", None
+            )
+            output.prefill_control_observations = getattr(
+                self, "_adaptive_prefill_observations", None
+            )
+            output.prefill_control_reset_count = getattr(
+                self, "_adaptive_reset_count", None
+            )
+            quiet_since = getattr(self, "_adaptive_quiet_since", None)
+            output.prefill_control_quiet_seconds = (
+                max(time.monotonic() - quiet_since, 0.0)
+                if quiet_since is not None
+                else None
+            )
             output.spec_profitability = spec_profitability
 
     def _prefill_load_is_high(self) -> bool:
@@ -788,8 +808,9 @@ class EngineCore:
             if baseline is not None and prefill_p99 is not None
             else None
         )
+        cold_start = getattr(self, "_adaptive_cold_start", False)
         if (
-            len(self._adaptive_high_load_latencies) < 16
+            (not cold_start and len(self._adaptive_high_load_latencies) < 16)
             or self._adaptive_prefill_observations
             % self.prefill_schedule_adaptive_update_interval
             != 0
@@ -798,6 +819,7 @@ class EngineCore:
 
         control_p99 = self._adaptive_control_p99_ms
         assert control_p99 is not None
+        self._adaptive_cold_start = False
         if control_p99 > target:
             self._adaptive_prefill_healthy_windows = 0
             self._adaptive_prefill_interval = min(
@@ -848,6 +870,8 @@ class EngineCore:
         self._adaptive_decode_p99_ms = None
         self._adaptive_prefill_penalty_p99_ms = None
         self._adaptive_control_p99_ms = None
+        self._adaptive_cold_start = True
+        self._adaptive_reset_count = getattr(self, "_adaptive_reset_count", 0) + 1
         self._adaptive_quiet_since = None
 
     def _should_throttle_prefills(

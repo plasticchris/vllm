@@ -210,6 +210,9 @@ class SpeculativeConfig:
     profitability_state_save_interval: int = Field(default=16, ge=1)
     """New profitability observations between atomic state checkpoints."""
 
+    profitability_state_ttl_seconds: float = Field(default=86400.0, gt=0.0)
+    """Maximum age of compatible persisted profitability observations."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""

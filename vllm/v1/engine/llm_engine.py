@@ -123,7 +123,15 @@ class LLMEngine:
             float | None,
             int | None,
             int | None,
-        ] = (None, None, None, None, None, None, None, None, None)
+            bool | None,
+            bool | None,
+            int | None,
+            int | None,
+            float | None,
+        ] = (
+            None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None,
+        )
         self.last_request_kv_tokens: dict[str, int] = {}
         self.last_spec_profitability: dict[str, Any] | None = None
         self.logger_manager: StatLoggerManager | None = None
@@ -352,6 +360,11 @@ class LLMEngine:
             outputs.prefill_control_oldest_wait_seconds,
             outputs.prefill_control_aging_interval,
             outputs.prefill_control_aging_token_budget,
+            outputs.prefill_control_high_load,
+            outputs.prefill_control_cold_start,
+            outputs.prefill_control_observations,
+            outputs.prefill_control_reset_count,
+            outputs.prefill_control_quiet_seconds,
         )
         self.last_spec_profitability = outputs.spec_profitability
 

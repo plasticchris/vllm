@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import atexit
+import hashlib
 import itertools
 import json
 import os
@@ -8,6 +9,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -292,8 +294,11 @@ class Scheduler(SchedulerInterface):
         self._last_spec_profitability_exploration = False
         self.profitability_state_path: str | None = None
         self.profitability_state_save_interval = 16
+        self.profitability_state_ttl_seconds = 86400.0
+        self._profitability_state_fingerprint = ""
         self._spec_profitability_unsaved = 0
         self._spec_profitability_loaded_samples = 0
+        self._spec_profitability_state_age_seconds: float | None = None
         if speculative_config is not None:
             self.long_context_threshold = speculative_config.long_context_threshold
             self.long_context_num_spec_tokens = (
@@ -316,6 +321,14 @@ class Scheduler(SchedulerInterface):
             self.profitability_state_path = speculative_config.profitability_state_path
             self.profitability_state_save_interval = (
                 speculative_config.profitability_state_save_interval
+            )
+            self.profitability_state_ttl_seconds = (
+                speculative_config.profitability_state_ttl_seconds
+            )
+            self._profitability_state_fingerprint = (
+                self._build_spec_profitability_fingerprint(
+                    vllm_config, speculative_config
+                )
             )
             self._load_spec_profitability_state()
             if self.profitability_state_path:
@@ -377,6 +390,7 @@ class Scheduler(SchedulerInterface):
         self.prefill_capacity_bound = False
         self._prefill_rr_cursor = 0
         self._idle_prefill_rr_cursor = 0
+        self._short_prefill_priority_streak = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -389,6 +403,16 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.mamba_prefill_subblock_tokens = (
+            self.scheduler_config.mamba_prefill_subblock_tokens
+        )
+        if (
+            self.mamba_prefill_subblock_tokens is not None
+            and self.block_size % self.mamba_prefill_subblock_tokens != 0
+        ):
+            raise ValueError(
+                "mamba_prefill_subblock_tokens must divide the Mamba cache block"
+            )
         prefill_budgets = {
             "decode_active_prefill_token_budget": (
                 self.scheduler_config.decode_active_prefill_token_budget
@@ -455,13 +479,14 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        subblock_tokens: int | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
-        In "align" cache mode the SSM state is only materialized at chunk
-        ends, so chunk ends are steered onto cacheable positions: block
-        boundaries by default, plus mandatory early stops (the prompt's
-        partial-tail hash boundary, a detected shared-prefix junction).
+        In "align" cache mode the SSM state is materialized at chunk ends.
+        Chunk ends are block-aligned by default. A configured subblock may
+        retain an unpublished partial state for the same request, while hash
+        publication remains aligned; mandatory prefix junctions still win.
         """
         start = (
             request.num_computed_tokens
@@ -483,9 +508,17 @@ class Scheduler(SchedulerInterface):
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
-        # Every non-final prefill chunk must end on a block boundary so
-        # its running state cannot later be published under the wrong hash.
-        if end < prefill_end:
+        subblock_end = start + min(subblock_tokens or num_new_tokens, num_new_tokens)
+        use_partial_state = (
+            subblock_tokens is not None
+            and subblock_end < prefill_end
+            and subblock_end % block_size != 0
+        )
+        # Experimental partial slices retain an unhashed recurrent state in the
+        # current logical block; aligned boundaries remain the publication points.
+        if use_partial_state:
+            end = subblock_end
+        elif end < prefill_end:
             end = end // block_size * block_size
 
         next_block_boundary = (start // block_size + 1) * block_size
@@ -518,16 +551,31 @@ class Scheduler(SchedulerInterface):
         return max(end - start, 0)
 
     def _fair_prefill_selection(
-        self, candidate_ids: list[str], budget: int, minimum_chunk: int
+        self,
+        candidate_ids: list[str],
+        budget: int,
+        minimum_chunk: int,
+        priority_id: str | None = None,
     ) -> tuple[set[str], int]:
         max_selected = max(1, budget // minimum_chunk)
         count = min(len(candidate_ids), max_selected)
-        start = self._prefill_rr_cursor % len(candidate_ids)
-        selected = {
-            candidate_ids[(start + offset) % len(candidate_ids)]
-            for offset in range(count)
-        }
-        self._prefill_rr_cursor = (start + count) % len(candidate_ids)
+        if priority_id is not None and priority_id in candidate_ids:
+            other_ids = [item for item in candidate_ids if item != priority_id]
+            selected = {priority_id}
+            if other_ids and count > 1:
+                start = self._prefill_rr_cursor % len(other_ids)
+                selected.update(
+                    other_ids[(start + offset) % len(other_ids)]
+                    for offset in range(count - 1)
+                )
+                self._prefill_rr_cursor = (start + count - 1) % len(other_ids)
+        else:
+            start = self._prefill_rr_cursor % len(candidate_ids)
+            selected = {
+                candidate_ids[(start + offset) % len(candidate_ids)]
+                for offset in range(count)
+            }
+            self._prefill_rr_cursor = (start + count) % len(candidate_ids)
         return selected, max(1, budget // count)
 
     def _idle_prefill_block_budgets(
@@ -536,17 +584,26 @@ class Scheduler(SchedulerInterface):
         token_budget: int,
         block_size: int,
         max_chunk: int,
+        priority_id: str | None = None,
     ) -> dict[str, int]:
         """Distribute whole idle-prefill blocks without wasting the remainder."""
         if not candidate_ids or token_budget < block_size:
             return {}
         total_blocks = token_budget // block_size
         max_blocks = max(1, max_chunk // block_size)
-        start = self._idle_prefill_rr_cursor % len(candidate_ids)
-        ordered = [
-            candidate_ids[(start + offset) % len(candidate_ids)]
-            for offset in range(len(candidate_ids))
-        ]
+        if priority_id is not None and priority_id in candidate_ids:
+            other_ids = [item for item in candidate_ids if item != priority_id]
+            start = self._idle_prefill_rr_cursor % max(len(other_ids), 1)
+            ordered = [priority_id] + [
+                other_ids[(start + offset) % len(other_ids)]
+                for offset in range(len(other_ids))
+            ]
+        else:
+            start = self._idle_prefill_rr_cursor % len(candidate_ids)
+            ordered = [
+                candidate_ids[(start + offset) % len(candidate_ids)]
+                for offset in range(len(candidate_ids))
+            ]
         selected = ordered[: min(len(ordered), total_blocks)]
         budgets = {request_id: block_size for request_id in selected}
         remaining = total_blocks - len(selected)
@@ -565,8 +622,100 @@ class Scheduler(SchedulerInterface):
             if not made_progress:
                 break
         advance = extra_blocks if extra_blocks else len(selected)
-        self._idle_prefill_rr_cursor = (start + max(advance, 1)) % len(candidate_ids)
+        rotation_size = (
+            len(candidate_ids) - 1
+            if priority_id is not None and priority_id in candidate_ids
+            else len(candidate_ids)
+        )
+        if rotation_size:
+            self._idle_prefill_rr_cursor = (
+                start + max(advance - int(priority_id is not None), 1)
+            ) % rotation_size
         return budgets
+
+    def _select_short_waiting_prefill(self) -> str | None:
+        threshold = self.scheduler_config.short_prefill_priority_token_threshold
+        if threshold is None:
+            return None
+        candidates: list[tuple[Request, RequestQueue]] = []
+        long_prefills: list[Request] = [
+            request
+            for request in self.running
+            if request.is_prefill_chunk and request.num_prompt_tokens > threshold
+        ]
+        for request_queue in (self.skipped_waiting, self.waiting):
+            for request in request_queue:
+                is_prefill = request.num_computed_tokens < request.num_tokens - 1
+                if not is_prefill or request.status != RequestStatus.WAITING:
+                    continue
+                if request.num_prompt_tokens <= threshold:
+                    candidates.append((request, request_queue))
+                else:
+                    long_prefills.append(request)
+        if not candidates:
+            self._short_prefill_priority_streak = 0
+            return None
+
+        max_burst = self.scheduler_config.short_prefill_priority_max_burst
+        oldest_long_age = max(
+            (time.time() - request.arrival_time for request in long_prefills),
+            default=0.0,
+        )
+        if oldest_long_age >= self.scheduler_config.short_prefill_priority_aging_seconds:
+            max_burst = 1
+        if long_prefills and self._short_prefill_priority_streak >= max_burst:
+            self._short_prefill_priority_streak = 0
+            return None
+
+        request, request_queue = min(
+            candidates,
+            key=lambda item: (
+                item[0].num_prompt_tokens - item[0].num_computed_tokens,
+                item[0].arrival_time,
+            ),
+        )
+        request_queue.remove_request(request)
+        request_queue.prepend_request(request)
+        self._short_prefill_priority_streak += 1
+        return request.request_id
+
+    @staticmethod
+    def _build_spec_profitability_fingerprint(
+        vllm_config: VllmConfig, speculative_config: Any
+    ) -> str:
+        try:
+            from vllm.platforms import current_platform
+
+            device_name = current_platform.get_device_name()
+        except Exception:
+            device_name = "unknown"
+        tunable_path = os.environ.get("PYTORCH_TUNABLEOP_FILENAME")
+        tunable_digest = None
+        if tunable_path:
+            path = Path(tunable_path)
+            candidates = [path] if path.is_file() else sorted(
+                path.parent.glob(f"{path.stem}[0-9]*{path.suffix}")
+            )
+            if candidates:
+                digest = hashlib.sha256()
+                for candidate in candidates:
+                    digest.update(candidate.name.encode())
+                    digest.update(candidate.read_bytes())
+                tunable_digest = digest.hexdigest()
+        identity = {
+            "model": vllm_config.model_config.compute_hash(),
+            "device": device_name,
+            "tensor_parallel_size": vllm_config.parallel_config.tensor_parallel_size,
+            "num_speculative_tokens": speculative_config.num_speculative_tokens,
+            "batch_schedule": speculative_config.num_speculative_tokens_per_batch_size,
+            "profitability_window": speculative_config.profitability_window,
+            "mamba_prefill_subblock_tokens": (
+                vllm_config.scheduler_config.mamba_prefill_subblock_tokens
+            ),
+            "tunable_ops": tunable_digest,
+        }
+        payload = json.dumps(identity, sort_keys=True, default=str).encode()
+        return hashlib.sha256(payload).hexdigest()
 
     def _load_spec_profitability_state(self) -> None:
         path = self.profitability_state_path
@@ -575,8 +724,14 @@ class Scheduler(SchedulerInterface):
         try:
             with open(path) as state_file:
                 state = json.load(state_file)
-            if state.get("version") != 1:
+            if state.get("version") != 2:
                 raise ValueError("unsupported state version")
+            if state.get("fingerprint") != self._profitability_state_fingerprint:
+                raise ValueError("state fingerprint does not match this runtime")
+            saved_at = float(state["saved_at"])
+            state_age = max(time.time() - saved_at, 0.0)
+            if state_age > self.profitability_state_ttl_seconds:
+                raise ValueError("state has expired")
             loaded_history: dict[tuple[int, int], deque[float]] = {}
             loaded_steps: dict[int, int] = {}
             loaded_samples = 0
@@ -597,6 +752,7 @@ class Scheduler(SchedulerInterface):
             self._spec_profitability_history.update(loaded_history)
             self._spec_profitability_steps.update(loaded_steps)
             self._spec_profitability_loaded_samples = loaded_samples
+            self._spec_profitability_state_age_seconds = state_age
             logger.info(
                 "Loaded %d speculative profitability samples from %s",
                 loaded_samples,
@@ -616,7 +772,9 @@ class Scheduler(SchedulerInterface):
         if not path or not self._spec_profitability_history:
             return
         state = {
-            "version": 1,
+            "version": 2,
+            "fingerprint": self._profitability_state_fingerprint,
+            "saved_at": time.time(),
             "history": {
                 f"{batch_size}:{k}": list(history)
                 for (batch_size, k), history in sorted(
@@ -751,6 +909,9 @@ class Scheduler(SchedulerInterface):
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound and active_decode
         )
+        priority_prefill_id = (
+            None if defer_prefills else self._select_short_waiting_prefill()
+        )
         configured_prefill_budget = (
             self.scheduler_config.decode_active_prefill_token_budget
             if decode_active_prefill_token_budget is None
@@ -760,11 +921,15 @@ class Scheduler(SchedulerInterface):
         selected_prefills: set[str] | None = None
         prefill_request_budget: int | None = None
         if prefill_token_budget is not None and not defer_prefills:
-            candidate_ids = [
+            candidate_ids = (
+                [priority_prefill_id] if priority_prefill_id is not None else []
+            )
+            candidate_ids.extend(
                 request.request_id
                 for request in self.running
                 if request.is_prefill_chunk
-            ]
+                and request.request_id != priority_prefill_id
+            )
             available_slots = max(
                 self.max_num_running_reqs
                 - len(self.running)
@@ -778,6 +943,7 @@ class Scheduler(SchedulerInterface):
                 request.request_id
                 for request in waiting[:available_slots]
                 if request.num_computed_tokens < request.num_tokens - 1
+                and request.request_id != priority_prefill_id
             )
             if candidate_ids:
                 minimum_chunk = (
@@ -787,7 +953,10 @@ class Scheduler(SchedulerInterface):
                 )
                 selected_prefills, prefill_request_budget = (
                     self._fair_prefill_selection(
-                        candidate_ids, prefill_token_budget, minimum_chunk
+                        candidate_ids,
+                        prefill_token_budget,
+                        minimum_chunk,
+                        priority_id=priority_prefill_id,
                     )
                 )
 
@@ -813,21 +982,27 @@ class Scheduler(SchedulerInterface):
                 0,
             )
             waiting = list(self.skipped_waiting) + list(self.waiting)
-            candidate_ids = [
+            candidate_ids = (
+                [priority_prefill_id] if priority_prefill_id is not None else []
+            )
+            candidate_ids.extend(
                 request.request_id
                 for request in self.running
                 if request.is_prefill_chunk
-            ]
+                and request.request_id != priority_prefill_id
+            )
             candidate_ids.extend(
                 request.request_id
                 for request in waiting[:available_slots]
                 if request.num_computed_tokens < request.num_tokens - 1
+                and request.request_id != priority_prefill_id
             )
             idle_prefill_budgets = self._idle_prefill_block_budgets(
                 candidate_ids,
                 token_budget,
                 self.block_size,
                 long_prefill_threshold,
+                priority_id=priority_prefill_id,
             )
 
         # First, schedule the RUNNING requests.
@@ -858,7 +1033,12 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if request.is_prefill_chunk and (
-                defer_prefills
+                (
+                    priority_prefill_id is not None
+                    and request.num_prompt_tokens
+                    > self.scheduler_config.short_prefill_priority_token_threshold
+                )
+                or defer_prefills
                 or (
                     selected_prefills is not None
                     and request.request_id not in selected_prefills
@@ -919,7 +1099,11 @@ class Scheduler(SchedulerInterface):
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request,
+                    num_new_tokens,
+                    subblock_tokens=(
+                        self.mamba_prefill_subblock_tokens if active_decode else None
+                    ),
                 )
 
             if num_new_tokens == 0:
@@ -1314,6 +1498,10 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens,
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
+                        subblock_tokens=(
+                            self.mamba_prefill_subblock_tokens
+                            if active_decode else None
+                        ),
                     )
                     if num_new_tokens == 0:
                         break
@@ -2686,6 +2874,8 @@ class Scheduler(SchedulerInterface):
             "last_selected_k": self._last_spec_profitability_selected_k,
             "last_exploration": self._last_spec_profitability_exploration,
             "loaded_samples": self._spec_profitability_loaded_samples,
+            "state_age_seconds": self._spec_profitability_state_age_seconds,
+            "state_fingerprint": self._profitability_state_fingerprint,
             "state_path": self.profitability_state_path,
             "batches": batches,
         }
