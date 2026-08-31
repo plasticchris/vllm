@@ -1272,6 +1272,12 @@ class SpeculativeConfig:
             return AttentionBackendEnum[value.upper()]
         return value
 
+    profitability_state_half_life_seconds: float = Field(default=21600.0, gt=0.0)
+    """Age-based half-life for persisted profitability sample counts."""
+
+    profitability_neighbor_batch_radius: int = Field(default=2, ge=0)
+    """Nearby batch-size radius used to warm-start sparse profitability data."""
+
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
         if self.tensor_parallel_size is not None:

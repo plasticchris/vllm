@@ -5,6 +5,7 @@ import math
 import os
 import queue
 import signal
+import statistics
 import threading
 import time
 from collections import defaultdict, deque
@@ -166,6 +167,7 @@ class EngineCore:
         self._adaptive_decode_latencies = deque(
             maxlen=scheduler_config.prefill_schedule_adaptive_window
         )
+        self._prefill_ms_per_token_samples = deque(maxlen=128)
         self._adaptive_high_load_latencies = deque(
             maxlen=scheduler_config.prefill_schedule_adaptive_window
         )
@@ -179,10 +181,15 @@ class EngineCore:
         self._adaptive_aging_interval: int | None = None
         self._adaptive_aging_token_budget: int | None = None
         self._adaptive_high_load = False
+        self._adaptive_control_tier: str | None = None
         self._adaptive_cold_start = True
         self._adaptive_reset_count = 0
         self._adaptive_quiet_since: float | None = None
         self._last_prefill_service_time = time.monotonic()
+        self._last_mamba_prefill_subblock_tokens: int | None = None
+        self.mamba_prefill_subblock_tokens = (
+            scheduler_config.mamba_prefill_subblock_tokens
+        )
         self._prefill_schedule_step = 0
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
@@ -718,6 +725,16 @@ class EngineCore:
                 if quiet_since is not None
                 else None
             )
+            output.prefill_control_tier = getattr(
+                self, "_adaptive_control_tier", None
+            )
+            output.mamba_prefill_subblock_tokens = getattr(
+                self, "_last_mamba_prefill_subblock_tokens", None
+            )
+            prefill_costs = getattr(self, "_prefill_ms_per_token_samples", ())
+            output.prefill_control_prefill_ms_per_token = (
+                statistics.median(prefill_costs) if prefill_costs else None
+            )
             output.spec_profitability = spec_profitability
 
     def _prefill_load_is_high(self) -> bool:
@@ -746,18 +763,24 @@ class EngineCore:
         return self.scheduler.get_decode_prefill_arrival_gap() >= minimum_lead
 
     def _current_prefill_token_budget(
-        self, high_load: bool | None = None
+        self, high_load: bool | None = None, overlap: bool | None = None
     ) -> int | None:
         if high_load is None:
             high_load = self._prefill_load_is_high()
+        if overlap is None:
+            overlap = high_load
+        if (
+            overlap
+            and getattr(self, "prefill_schedule_adaptive_target_ms", None)
+            is not None
+        ):
+            adaptive_budget = getattr(self, "_adaptive_prefill_budget", None)
+            aging_budget = getattr(self, "_adaptive_aging_token_budget", None)
+            if aging_budget is not None:
+                return max(adaptive_budget or 0, aging_budget)
+            if adaptive_budget is not None:
+                return adaptive_budget
         if high_load:
-            if getattr(self, "prefill_schedule_adaptive_target_ms", None) is not None:
-                adaptive_budget = getattr(self, "_adaptive_prefill_budget", None)
-                aging_budget = getattr(self, "_adaptive_aging_token_budget", None)
-                if aging_budget is not None:
-                    return max(adaptive_budget or 0, aging_budget)
-                if adaptive_budget is not None:
-                    return adaptive_budget
             high_load_budget = getattr(
                 self, "decode_active_prefill_high_load_token_budget", None
             )
@@ -778,7 +801,11 @@ class EngineCore:
         target = getattr(self, "prefill_schedule_adaptive_target_ms", None)
         if (
             target is None
-            or not scheduler_output.high_prefill_load
+            or not getattr(
+                scheduler_output,
+                "prefill_decode_overlap",
+                scheduler_output.high_prefill_load,
+            )
             or scheduler_output.scheduled_timestamp <= 0
         ):
             return
@@ -796,6 +823,11 @@ class EngineCore:
             return
 
         self._last_prefill_service_time = time.monotonic()
+        prefill_costs = getattr(self, "_prefill_ms_per_token_samples", None)
+        if prefill_costs is not None:
+            prefill_costs.append(
+                elapsed_ms / scheduler_output.scheduled_prefill_tokens
+            )
         self._adaptive_prefill_latencies.append(elapsed_ms)
         self._adaptive_prefill_observations += 1
         self._adaptive_prefill_p99_ms = EngineCore._latency_p99(
@@ -837,7 +869,12 @@ class EngineCore:
         elif control_p99 < target * 0.7:
             self._adaptive_prefill_healthy_windows += 1
             if self._adaptive_prefill_healthy_windows >= 3:
-                base_interval = self.prefill_schedule_high_load_interval or 1
+                base_interval = (
+                    self.prefill_schedule_high_load_interval
+                    if getattr(self, "_adaptive_control_tier", None) == "high"
+                    and self.prefill_schedule_high_load_interval
+                    else self.prefill_schedule_interval
+                )
                 self._adaptive_prefill_interval = max(
                     base_interval, math.floor(self._adaptive_prefill_interval * 0.8)
                 )
@@ -855,6 +892,47 @@ class EngineCore:
         else:
             self._adaptive_prefill_healthy_windows = 0
 
+    def _activate_adaptive_prefill_tier(self, tier: str) -> None:
+        if getattr(self, "_adaptive_control_tier", None) == tier:
+            return
+        self._adaptive_control_tier = tier
+        self._last_prefill_service_time = time.monotonic()
+        self._adaptive_prefill_interval = (
+            self.prefill_schedule_high_load_interval
+            if tier == "high" and self.prefill_schedule_high_load_interval
+            else self.prefill_schedule_interval
+        )
+        self._adaptive_prefill_budget = self._adaptive_prefill_max_budget
+        self._adaptive_prefill_latencies.clear()
+        self._adaptive_decode_latencies.clear()
+        self._adaptive_high_load_latencies.clear()
+        self._adaptive_prefill_observations = 0
+        self._adaptive_prefill_healthy_windows = 0
+        self._adaptive_prefill_p99_ms = None
+        self._adaptive_decode_p99_ms = None
+        self._adaptive_prefill_penalty_p99_ms = None
+        self._adaptive_control_p99_ms = None
+        self._adaptive_cold_start = True
+
+    def _current_mamba_prefill_subblock(
+        self, overlap: bool, high_load: bool
+    ) -> int | None:
+        base = getattr(self, "mamba_prefill_subblock_tokens", None)
+        if not overlap or base is None:
+            return None
+        target = getattr(self, "prefill_schedule_adaptive_target_ms", None)
+        observed = getattr(self, "_adaptive_control_p99_ms", None)
+        if high_load or (
+            target is not None and observed is not None and observed > target
+        ):
+            selected = max(base // 2, 1)
+        elif target is not None and observed is not None and observed < target * 0.7:
+            selected = base * 2
+        else:
+            selected = base
+        self._last_mamba_prefill_subblock_tokens = selected
+        return selected
+
     def _reset_adaptive_prefill_control(self) -> None:
         self._adaptive_prefill_interval = (
             self.prefill_schedule_high_load_interval
@@ -870,23 +948,30 @@ class EngineCore:
         self._adaptive_decode_p99_ms = None
         self._adaptive_prefill_penalty_p99_ms = None
         self._adaptive_control_p99_ms = None
+        self._adaptive_control_tier = None
         self._adaptive_cold_start = True
         self._adaptive_reset_count = getattr(self, "_adaptive_reset_count", 0) + 1
         self._adaptive_quiet_since = None
 
     def _should_throttle_prefills(
-        self, high_load: bool | None = None
+        self, high_load: bool | None = None, overlap: bool | None = None
     ) -> bool:
         """Whether this step should protect active decodes from prefill work."""
         if high_load is None:
             high_load = self._prefill_load_is_high()
+        if overlap is None:
+            scheduler = getattr(self, "scheduler", None)
+            overlap = high_load or (
+                scheduler is not None and scheduler.has_decode_prefill_overlap()
+            )
         interval = self.prefill_schedule_interval
         force_prefill_service = False
         self._adaptive_aging_interval = None
         self._adaptive_aging_token_budget = None
-        if high_load:
+        if overlap:
             if getattr(self, "prefill_schedule_adaptive_target_ms", None) is not None:
                 now = time.monotonic()
+                tier = "high" if high_load else "overlap"
                 reset_seconds = getattr(
                     self, "prefill_schedule_adaptive_reset_seconds", None
                 )
@@ -896,11 +981,11 @@ class EngineCore:
                     and reset_seconds is not None
                     and now - quiet_since >= reset_seconds
                 ):
-                    self._reset_adaptive_prefill_control()
+                    EngineCore._reset_adaptive_prefill_control(self)
+                if hasattr(self, "_adaptive_control_tier"):
+                    EngineCore._activate_adaptive_prefill_tier(self, tier)
                 self._adaptive_quiet_since = None
-                if not self._adaptive_high_load:
-                    self._adaptive_high_load = True
-                    self._last_prefill_service_time = now
+                self._adaptive_high_load = high_load
                 interval = self._adaptive_prefill_interval
                 max_wait = self.prefill_schedule_adaptive_max_wait_seconds
                 oldest_wait = self.scheduler.get_oldest_prefill_wait_seconds()
@@ -921,14 +1006,17 @@ class EngineCore:
                         )
                     if now - self._last_prefill_service_time >= max_wait:
                         force_prefill_service = True
-            else:
+            elif high_load:
                 interval = (
                     getattr(self, "prefill_schedule_high_load_interval", None)
                     or interval
                 )
         else:
             now = time.monotonic()
-            if getattr(self, "_adaptive_high_load", False):
+            if (
+                getattr(self, "_adaptive_control_tier", None) is not None
+                and getattr(self, "_adaptive_quiet_since", None) is None
+            ):
                 self._adaptive_quiet_since = now
             self._adaptive_high_load = False
             self._adaptive_oldest_prefill_wait_seconds = 0.0
@@ -941,7 +1029,7 @@ class EngineCore:
                 and reset_seconds is not None
                 and now - quiet_since >= reset_seconds
             ):
-                self._reset_adaptive_prefill_control()
+                EngineCore._reset_adaptive_prefill_control(self)
         step = self._prefill_schedule_step
         self._prefill_schedule_step += 1
         return not force_prefill_service and interval > 1 and step % interval != 0
@@ -958,13 +1046,25 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         high_prefill_load = self._prefill_load_is_high()
+        prefill_decode_overlap = self.scheduler.has_decode_prefill_overlap()
+        throttle_prefills = self._should_throttle_prefills(
+            high_prefill_load, prefill_decode_overlap
+        )
+        mamba_subblock = self._current_mamba_prefill_subblock(
+            prefill_decode_overlap, high_prefill_load
+        )
         schedule_started = time.monotonic()
         scheduler_output = self.scheduler.schedule(
-            self._should_throttle_prefills(high_prefill_load),
-            self._current_prefill_token_budget(high_prefill_load),
+            throttle_prefills,
+            self._current_prefill_token_budget(
+                high_prefill_load, prefill_decode_overlap
+            ),
+            mamba_subblock,
         )
         scheduler_output.scheduled_timestamp = schedule_started
         scheduler_output.high_prefill_load = high_prefill_load
+        scheduler_output.prefill_decode_overlap = prefill_decode_overlap
+        scheduler_output.mamba_prefill_subblock_tokens = mamba_subblock
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -1026,13 +1126,25 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             high_prefill_load = self._prefill_load_is_high()
+            prefill_decode_overlap = self.scheduler.has_decode_prefill_overlap()
+            throttle_prefills = self._should_throttle_prefills(
+                high_prefill_load, prefill_decode_overlap
+            )
+            mamba_subblock = self._current_mamba_prefill_subblock(
+                prefill_decode_overlap, high_prefill_load
+            )
             schedule_started = time.monotonic()
             scheduler_output = self.scheduler.schedule(
-                self._should_throttle_prefills(high_prefill_load),
-                self._current_prefill_token_budget(high_prefill_load),
+                throttle_prefills,
+                self._current_prefill_token_budget(
+                    high_prefill_load, prefill_decode_overlap
+                ),
+                mamba_subblock,
             )
             scheduler_output.scheduled_timestamp = schedule_started
             scheduler_output.high_prefill_load = high_prefill_load
+            scheduler_output.prefill_decode_overlap = prefill_decode_overlap
+            scheduler_output.mamba_prefill_subblock_tokens = mamba_subblock
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -2429,7 +2541,7 @@ class DPEngineCoreProc(EngineCoreProc):
         return False
 
     def _should_throttle_prefills(
-        self, high_load: bool | None = None
+        self, high_load: bool | None = None, overlap: bool | None = None
     ) -> bool:
         # step_counter is identical across DP ranks. On a fresh wave the
         # counter is 0, so prefills are admitted immediately after idle.

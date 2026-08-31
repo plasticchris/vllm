@@ -259,6 +259,8 @@ class SchedulerOutput:
     scheduled_timestamp: float = 0.0
     model_step_elapsed_ms: float = 0.0
     high_prefill_load: bool = False
+    prefill_decode_overlap: bool = False
+    mamba_prefill_subblock_tokens: int | None = None
     scheduled_prefill_tokens: int = 0
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.

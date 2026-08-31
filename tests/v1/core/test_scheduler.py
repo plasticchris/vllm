@@ -5782,3 +5782,68 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.num_preemptions == 0
     assert b.request_id not in req_to_blocks
+
+
+def test_prefill_priority_uses_remaining_uncached_work(monkeypatch):
+    scheduler = create_scheduler()
+    scheduler.scheduler_config.short_prefill_priority_token_threshold = 1024
+    cached_long, uncached_short = create_requests(
+        num_requests=2,
+        num_tokens=8000,
+        req_ids=["cached-long", "uncached-short"],
+    )
+    scheduler.add_request(cached_long)
+    scheduler.add_request(uncached_short)
+    remaining = {"cached-long": 128, "uncached-short": 4096}
+    monkeypatch.setattr(
+        scheduler,
+        "_estimated_uncached_prefill_tokens",
+        lambda request: remaining[request.request_id],
+    )
+    assert scheduler._select_short_waiting_prefill() == "cached-long"
+
+
+def test_decode_prefill_overlap_detects_waiting_prefill():
+    scheduler = create_scheduler()
+    decode, prefill = create_requests(
+        num_requests=2, num_tokens=64, req_ids=["decode", "prefill"]
+    )
+    decode.num_computed_tokens = decode.num_prompt_tokens
+    scheduler.running.append(decode)
+    scheduler.add_request(prefill)
+    assert scheduler.has_decode_prefill_overlap()
+
+
+def test_profitability_warm_starts_from_neighbor_batches():
+    scheduler = create_scheduler()
+    scheduler.profitability_aware_min_batch_size = 4
+    scheduler.profitability_min_samples = 4
+    scheduler.profitability_neighbor_batch_radius = 1
+    scheduler._spec_profitability_history = {
+        (5, 2): deque([1.2], maxlen=16),
+        (5, 3): deque([1.0], maxlen=16),
+        (4, 2): deque([1.3, 1.3, 1.3], maxlen=16),
+        (4, 3): deque([0.9, 0.9, 0.9], maxlen=16),
+    }
+    assert scheduler._profitability_adjusted_spec_tokens(5, 3) == 2
+    assert scheduler._last_spec_profitability_warm_start_batches == [4]
+
+
+def test_profitability_state_decays_loaded_samples(tmp_path):
+    state_path = tmp_path / "profitability-decay.json"
+    writer = create_scheduler()
+    writer.profitability_state_path = str(state_path)
+    writer._spec_profitability_history = {
+        (5, 2): deque(range(1, 9), maxlen=8),
+    }
+    writer._save_spec_profitability_state()
+    state = json.loads(state_path.read_text())
+    state["saved_at"] = time.time() - 100.0
+    state_path.write_text(json.dumps(state))
+
+    reader = create_scheduler()
+    reader.profitability_state_path = str(state_path)
+    reader._spec_profitability_window = 8
+    reader.profitability_state_half_life_seconds = 100.0
+    reader._load_spec_profitability_state()
+    assert list(reader._spec_profitability_history[(5, 2)]) == [5, 6, 7, 8]

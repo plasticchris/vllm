@@ -4,6 +4,7 @@ import atexit
 import hashlib
 import itertools
 import json
+import math
 import os
 import time
 from collections import defaultdict, deque
@@ -292,9 +293,12 @@ class Scheduler(SchedulerInterface):
         self._last_spec_profitability_batch_size: int | None = None
         self._last_spec_profitability_selected_k: int | None = None
         self._last_spec_profitability_exploration = False
+        self._last_spec_profitability_warm_start_batches: list[int] = []
         self.profitability_state_path: str | None = None
         self.profitability_state_save_interval = 16
         self.profitability_state_ttl_seconds = 86400.0
+        self.profitability_state_half_life_seconds = 21600.0
+        self.profitability_neighbor_batch_radius = 2
         self._profitability_state_fingerprint = ""
         self._spec_profitability_unsaved = 0
         self._spec_profitability_loaded_samples = 0
@@ -324,6 +328,12 @@ class Scheduler(SchedulerInterface):
             )
             self.profitability_state_ttl_seconds = (
                 speculative_config.profitability_state_ttl_seconds
+            )
+            self.profitability_state_half_life_seconds = (
+                speculative_config.profitability_state_half_life_seconds
+            )
+            self.profitability_neighbor_batch_radius = (
+                speculative_config.profitability_neighbor_batch_radius
             )
             self._profitability_state_fingerprint = (
                 self._build_spec_profitability_fingerprint(
@@ -633,6 +643,24 @@ class Scheduler(SchedulerInterface):
             ) % rotation_size
         return budgets
 
+    def _estimated_uncached_prefill_tokens(self, request: Request) -> int:
+        if request.num_computed_tokens > 0:
+            return max(request.num_prompt_tokens - request.num_computed_tokens, 0)
+        if (
+            not self.kv_cache_manager.enable_caching
+            or request.skip_reading_prefix_cache
+        ):
+            return request.num_prompt_tokens
+        try:
+            _, cached_tokens, _ = (
+                self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes, request.num_tokens - 1
+                )
+            )
+        except Exception:
+            cached_tokens = 0
+        return max(request.num_prompt_tokens - cached_tokens, 0)
+
     def _select_short_waiting_prefill(self) -> str | None:
         threshold = self.scheduler_config.short_prefill_priority_token_threshold
         if threshold is None:
@@ -641,14 +669,15 @@ class Scheduler(SchedulerInterface):
         long_prefills: list[Request] = [
             request
             for request in self.running
-            if request.is_prefill_chunk and request.num_prompt_tokens > threshold
+            if request.is_prefill_chunk
+            and self._estimated_uncached_prefill_tokens(request) > threshold
         ]
         for request_queue in (self.skipped_waiting, self.waiting):
             for request in request_queue:
                 is_prefill = request.num_computed_tokens < request.num_tokens - 1
                 if not is_prefill or request.status != RequestStatus.WAITING:
                     continue
-                if request.num_prompt_tokens <= threshold:
+                if self._estimated_uncached_prefill_tokens(request) <= threshold:
                     candidates.append((request, request_queue))
                 else:
                     long_prefills.append(request)
@@ -670,7 +699,7 @@ class Scheduler(SchedulerInterface):
         request, request_queue = min(
             candidates,
             key=lambda item: (
-                item[0].num_prompt_tokens - item[0].num_computed_tokens,
+                self._estimated_uncached_prefill_tokens(item[0]),
                 item[0].arrival_time,
             ),
         )
@@ -743,7 +772,13 @@ class Scheduler(SchedulerInterface):
                     if isinstance(value, (int, float)) and value > 0
                 ]
                 if valid:
-                    history = deque(valid, maxlen=self._spec_profitability_window)
+                    retention = 0.5 ** (
+                        state_age / self.profitability_state_half_life_seconds
+                    )
+                    keep = max(1, math.ceil(len(valid) * retention))
+                    history = deque(
+                        valid[-keep:], maxlen=self._spec_profitability_window
+                    )
                     loaded_history[(batch_size, k)] = history
                     loaded_samples += len(history)
             for key, value in state.get("steps", {}).items():
@@ -809,6 +844,35 @@ class Scheduler(SchedulerInterface):
             except FileNotFoundError:
                 pass
 
+    def _profitability_history_for_batch(
+        self, batch_size: int, k: int
+    ) -> tuple[list[float], list[int]]:
+        exact = list(self._spec_profitability_history.get((batch_size, k), ()))
+        if len(exact) >= self.profitability_min_samples:
+            return exact, []
+        radius = self.profitability_neighbor_batch_radius
+        neighbors = sorted(
+            (
+                (abs(other_batch - batch_size), other_batch, list(history))
+                for (other_batch, other_k), history in (
+                    self._spec_profitability_history.items()
+                )
+                if other_k == k
+                and other_batch != batch_size
+                and abs(other_batch - batch_size) <= radius
+                and history
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        combined = exact.copy()
+        sources: list[int] = []
+        for _, other_batch, history in neighbors:
+            combined.extend(history)
+            sources.append(other_batch)
+            if len(combined) >= self.profitability_min_samples:
+                break
+        return combined[-self._spec_profitability_window :], sources
+
     def _profitability_adjusted_spec_tokens(
         self, batch_size: int, base_tokens: int
     ) -> int:
@@ -822,21 +886,18 @@ class Scheduler(SchedulerInterface):
         ):
             lower_tokens = 2
             self._spec_profitability_steps[batch_size] += 1
-            base_history = self._spec_profitability_history.get(
-                (batch_size, base_tokens)
+            base_history, base_sources = self._profitability_history_for_batch(
+                batch_size, base_tokens
             )
-            lower_history = self._spec_profitability_history.get(
-                (batch_size, lower_tokens)
+            lower_history, lower_sources = self._profitability_history_for_batch(
+                batch_size, lower_tokens
             )
-            if (
-                lower_history is None
-                or len(lower_history) < self.profitability_min_samples
-            ):
+            self._last_spec_profitability_warm_start_batches = sorted(
+                set(base_sources + lower_sources)
+            )
+            if len(lower_history) < self.profitability_min_samples:
                 selected = lower_tokens
-            elif (
-                base_history is None
-                or len(base_history) < self.profitability_min_samples
-            ):
+            elif len(base_history) < self.profitability_min_samples:
                 selected = base_tokens
             else:
                 base_rate = sum(base_history) / len(base_history)
@@ -865,6 +926,7 @@ class Scheduler(SchedulerInterface):
         self,
         throttle_prefills: bool = False,
         decode_active_prefill_token_budget: int | None = None,
+        mamba_prefill_subblock_tokens: int | None = None,
     ) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -906,6 +968,18 @@ class Scheduler(SchedulerInterface):
 
         # Protect active decodes with both cadence and an aggregate prefill cap.
         active_decode = any(not r.is_prefill_chunk for r in self.running)
+        active_mamba_subblock = (
+            mamba_prefill_subblock_tokens
+            if mamba_prefill_subblock_tokens is not None
+            else self.mamba_prefill_subblock_tokens
+        )
+        if (
+            active_mamba_subblock is not None
+            and self.block_size % active_mamba_subblock != 0
+        ):
+            raise ValueError(
+                "dynamic Mamba prefill subblock must divide cache block"
+            )
         defer_prefills = (
             throttle_prefills and not self.prefill_capacity_bound and active_decode
         )
@@ -1035,7 +1109,7 @@ class Scheduler(SchedulerInterface):
             if request.is_prefill_chunk and (
                 (
                     priority_prefill_id is not None
-                    and request.num_prompt_tokens
+                    and self._estimated_uncached_prefill_tokens(request)
                     > self.scheduler_config.short_prefill_priority_token_threshold
                 )
                 or defer_prefills
@@ -1102,7 +1176,7 @@ class Scheduler(SchedulerInterface):
                     request,
                     num_new_tokens,
                     subblock_tokens=(
-                        self.mamba_prefill_subblock_tokens if active_decode else None
+                        active_mamba_subblock if active_decode else None
                     ),
                 )
 
@@ -1499,7 +1573,7 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens,
                         num_external_computed_tokens,
                         subblock_tokens=(
-                            self.mamba_prefill_subblock_tokens
+                            active_mamba_subblock
                             if active_decode else None
                         ),
                     )
@@ -2843,6 +2917,15 @@ class Scheduler(SchedulerInterface):
             counts[request_id] = allocated_blocks * self.block_size
         return counts
 
+    def has_decode_prefill_overlap(self) -> bool:
+        has_decode = any(not request.is_prefill_chunk for request in self.running)
+        if not has_decode:
+            return False
+        return any(request.is_prefill_chunk for request in self.running) or any(
+            request.num_output_tokens == 0
+            for request in (*self.waiting, *self.skipped_waiting)
+        )
+
     def get_oldest_prefill_wait_seconds(self) -> float:
         arrivals = [
             request.arrival_time
@@ -2873,6 +2956,7 @@ class Scheduler(SchedulerInterface):
             "last_batch_size": self._last_spec_profitability_batch_size,
             "last_selected_k": self._last_spec_profitability_selected_k,
             "last_exploration": self._last_spec_profitability_exploration,
+            "warm_start_batches": self._last_spec_profitability_warm_start_batches,
             "loaded_samples": self._spec_profitability_loaded_samples,
             "state_age_seconds": self._spec_profitability_state_age_seconds,
             "state_fingerprint": self._profitability_state_fingerprint,

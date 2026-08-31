@@ -165,7 +165,8 @@ def test_adaptive_prefill_cold_start_reacts_to_first_prefill():
         _last_prefill_service_time=0.0,
     )
     output = SimpleNamespace(
-        high_prefill_load=True,
+        high_prefill_load=False,
+        prefill_decode_overlap=True,
         scheduled_timestamp=time.monotonic() - 0.6,
         scheduled_prefill_tokens=408,
         model_step_elapsed_ms=0.0,
@@ -271,3 +272,35 @@ def test_attach_kv_cache_stats_without_request_output():
     assert outputs[0].prefill_control_high_load is None
     assert outputs[0].prefill_control_cold_start is None
     assert outputs[0].spec_profitability["last_selected_k"] == 2
+
+
+def test_dynamic_mamba_prefill_subblock_tracks_decode_pressure():
+    engine = SimpleNamespace(
+        mamba_prefill_subblock_tokens=408,
+        prefill_schedule_adaptive_target_ms=250.0,
+        _adaptive_control_p99_ms=None,
+        _last_mamba_prefill_subblock_tokens=None,
+    )
+    assert EngineCore._current_mamba_prefill_subblock(engine, True, False) == 408
+    engine._adaptive_control_p99_ms = 100.0
+    assert EngineCore._current_mamba_prefill_subblock(engine, True, False) == 816
+    engine._adaptive_control_p99_ms = 300.0
+    assert EngineCore._current_mamba_prefill_subblock(engine, True, False) == 204
+    engine._adaptive_control_p99_ms = 100.0
+    assert EngineCore._current_mamba_prefill_subblock(engine, True, True) == 204
+    assert EngineCore._current_mamba_prefill_subblock(engine, False, False) is None
+
+
+def test_overlap_controller_applies_adaptive_prefill_budget():
+    engine = SimpleNamespace(
+        prefill_schedule_adaptive_target_ms=250.0,
+        _adaptive_prefill_budget=816,
+        _adaptive_aging_token_budget=None,
+        decode_active_prefill_token_budget=2448,
+    )
+    assert EngineCore._current_prefill_token_budget(
+        engine, high_load=False, overlap=True
+    ) == 816
+    assert EngineCore._current_prefill_token_budget(
+        engine, high_load=False, overlap=False
+    ) == 2448

@@ -267,6 +267,10 @@ class SchedulerInterface(ABC):
         """Return the age of the oldest active prefill request."""
         return 0.0
 
+    def has_decode_prefill_overlap(self) -> bool:
+        """Return whether active decode and pending prefill work coexist."""
+        return False
+
     def get_spec_profitability_stats(self) -> dict[str, object] | None:
         """Return online speculative-decoding controller telemetry."""
         return None
