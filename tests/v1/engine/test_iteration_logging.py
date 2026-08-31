@@ -100,12 +100,14 @@ def test_adaptive_prefill_control_reacts_once_per_prefill_observation():
         _adaptive_prefill_max_budget=2448,
         _adaptive_prefill_budget=2448,
         _adaptive_prefill_latencies=deque(maxlen=128),
-        _adaptive_decode_latencies=deque([30.0] * 8, maxlen=128),
+        _adaptive_decode_latencies=deque([30.0] * 127, maxlen=128),
+        _adaptive_high_load_latencies=deque([30.0] * 127, maxlen=128),
         _adaptive_prefill_observations=0,
         _adaptive_prefill_healthy_windows=0,
         _adaptive_prefill_p99_ms=None,
         _adaptive_decode_p99_ms=30.0,
         _adaptive_prefill_penalty_p99_ms=None,
+        _adaptive_control_p99_ms=None,
         _last_prefill_service_time=0.0,
     )
     output = SimpleNamespace(
@@ -118,6 +120,12 @@ def test_adaptive_prefill_control_reacts_once_per_prefill_observation():
 
     assert engine._adaptive_prefill_p99_ms >= 500
     assert engine._adaptive_prefill_penalty_p99_ms >= 470
+    assert engine._adaptive_control_p99_ms == 30.0
+    assert engine._adaptive_prefill_interval == 24
+
+    output.scheduled_timestamp = time.monotonic() - 0.6
+    EngineCore._observe_prefill_control(engine, output)
+    assert engine._adaptive_control_p99_ms >= 500
     assert engine._adaptive_prefill_interval == 36
     assert engine._adaptive_prefill_budget == 816
 
@@ -140,21 +148,38 @@ def test_adaptive_prefill_control_forces_aged_service():
         prefill_schedule_adaptive_max_wait_seconds=10.0,
         _adaptive_prefill_interval=256,
         _adaptive_high_load=True,
+        _adaptive_oldest_prefill_wait_seconds=0.0,
+        _adaptive_prefill_max_budget=2448,
+        prefill_schedule_adaptive_min_token_budget=816,
         _last_prefill_service_time=time.monotonic() - 11.0,
         _prefill_schedule_step=7,
+        scheduler=SimpleNamespace(
+            get_oldest_prefill_wait_seconds=lambda: 20.0
+        ),
     )
     assert not EngineCore._should_throttle_prefills(engine, high_load=True)
-    assert time.monotonic() - engine._last_prefill_service_time < 1.0
+    assert engine._adaptive_aging_interval == 29
+    assert engine._adaptive_aging_token_budget == 1632
+    assert engine._adaptive_oldest_prefill_wait_seconds == 20.0
 
 
 def test_attach_kv_cache_stats_without_request_output():
     engine = SimpleNamespace(
         scheduler=SimpleNamespace(
-            get_kv_cache_block_counts=lambda: (20, 5, 75, 100)
+            get_kv_cache_block_counts=lambda: (20, 5, 75, 100),
+            get_kv_cache_token_counts=lambda: (320, 80, 1200, 1600),
+            get_spec_profitability_stats=lambda: {
+                "last_selected_k": 2,
+                "batches": {},
+            },
         ),
         _adaptive_prefill_interval=48,
         _adaptive_prefill_budget=816,
         _adaptive_prefill_p99_ms=410.0,
+        _adaptive_control_p99_ms=42.0,
+        _adaptive_oldest_prefill_wait_seconds=12.0,
+        _adaptive_aging_interval=24,
+        _adaptive_aging_token_budget=1632,
     )
     outputs = {}
     EngineCore._attach_kv_cache_stats(engine, outputs)
@@ -165,4 +190,13 @@ def test_attach_kv_cache_stats_without_request_output():
     assert outputs[0].kv_cache_evictable_blocks == 5
     assert outputs[0].kv_cache_pinned_blocks == 75
     assert outputs[0].kv_cache_total_blocks == 100
+    assert outputs[0].kv_cache_immediate_free_tokens == 320
+    assert outputs[0].kv_cache_evictable_tokens == 80
+    assert outputs[0].kv_cache_pinned_tokens == 1200
+    assert outputs[0].kv_cache_total_tokens == 1600
     assert outputs[0].prefill_control_interval == 48
+    assert outputs[0].prefill_control_slo_p99_ms == 42.0
+    assert outputs[0].prefill_control_oldest_wait_seconds == 12.0
+    assert outputs[0].prefill_control_aging_interval == 24
+    assert outputs[0].prefill_control_aging_token_budget == 1632
+    assert outputs[0].spec_profitability["last_selected_k"] == 2

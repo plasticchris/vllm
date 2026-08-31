@@ -248,6 +248,25 @@ class SchedulerInterface(ABC):
         """Return immediate, evictable, pinned, and total GPU KV blocks."""
         raise NotImplementedError
 
+    def get_kv_cache_token_counts(self) -> tuple[int, int, int, int]:
+        """Return immediate, evictable, pinned, and total GPU KV tokens."""
+        block_size = getattr(self, "block_size", 1)
+        immediate, evictable, pinned, total = self.get_kv_cache_block_counts()
+        return (
+            immediate * block_size,
+            evictable * block_size,
+            pinned * block_size,
+            total * block_size,
+        )
+
+    def get_oldest_prefill_wait_seconds(self) -> float:
+        """Return the age of the oldest active prefill request."""
+        return 0.0
+
+    def get_spec_profitability_stats(self) -> dict[str, object] | None:
+        """Return online speculative-decoding controller telemetry."""
+        return None
+
     @abstractmethod
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

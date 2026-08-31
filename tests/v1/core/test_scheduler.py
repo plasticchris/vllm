@@ -195,6 +195,11 @@ def test_profitability_aware_dynamic_speculation_selects_faster_k():
         (5, 3): deque([1.0, 1.0, 1.1, 1.0], maxlen=8),
     }
     assert scheduler._profitability_adjusted_spec_tokens(5, 3) == 2
+    stats = scheduler.get_spec_profitability_stats()
+    assert stats is not None
+    assert stats["last_batch_size"] == 5
+    assert stats["last_selected_k"] == 2
+    assert stats["batches"]["5"]["k2_samples"] == 4
     scheduler._spec_profitability_history = {
         (5, 2): deque([1.0, 1.0, 1.1, 1.0], maxlen=8),
         (5, 3): deque([1.2, 1.1, 1.3, 1.2], maxlen=8),
@@ -216,6 +221,10 @@ def test_profitability_controller_explores_both_depths():
     }
     scheduler._spec_profitability_steps[5] = 3
     assert scheduler._profitability_adjusted_spec_tokens(5, 3) == 3
+    stats = scheduler.get_spec_profitability_stats()
+    assert stats is not None
+    assert stats["last_exploration"] is True
+    assert stats["last_selected_k"] == 3
 
 
 def test_decode_active_prefill_token_budget():

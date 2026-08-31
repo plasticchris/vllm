@@ -163,11 +163,18 @@ class EngineCore:
         self._adaptive_decode_latencies = deque(
             maxlen=scheduler_config.prefill_schedule_adaptive_window
         )
+        self._adaptive_high_load_latencies = deque(
+            maxlen=scheduler_config.prefill_schedule_adaptive_window
+        )
         self._adaptive_prefill_observations = 0
         self._adaptive_prefill_healthy_windows = 0
         self._adaptive_prefill_p99_ms: float | None = None
         self._adaptive_decode_p99_ms: float | None = None
         self._adaptive_prefill_penalty_p99_ms: float | None = None
+        self._adaptive_control_p99_ms: float | None = None
+        self._adaptive_oldest_prefill_wait_seconds = 0.0
+        self._adaptive_aging_interval: int | None = None
+        self._adaptive_aging_token_budget: int | None = None
         self._adaptive_high_load = False
         self._last_prefill_service_time = time.monotonic()
         self._prefill_schedule_step = 0
@@ -636,6 +643,13 @@ class EngineCore:
             pinned_blocks,
             total_blocks,
         ) = self.scheduler.get_kv_cache_block_counts()
+        (
+            immediate_tokens,
+            evictable_tokens,
+            pinned_tokens,
+            total_tokens,
+        ) = self.scheduler.get_kv_cache_token_counts()
+        spec_profitability = self.scheduler.get_spec_profitability_stats()
         if not outputs:
             outputs[0] = EngineCoreOutputs()
         free_blocks = immediate_blocks + evictable_blocks
@@ -647,6 +661,10 @@ class EngineCore:
             output.kv_cache_evictable_blocks = evictable_blocks
             output.kv_cache_pinned_blocks = pinned_blocks
             output.kv_cache_total_blocks = total_blocks
+            output.kv_cache_immediate_free_tokens = immediate_tokens
+            output.kv_cache_evictable_tokens = evictable_tokens
+            output.kv_cache_pinned_tokens = pinned_tokens
+            output.kv_cache_total_tokens = total_tokens
             output.prefill_control_interval = getattr(
                 self, "_adaptive_prefill_interval", None
             )
@@ -662,6 +680,19 @@ class EngineCore:
             output.prefill_control_penalty_p99_ms = getattr(
                 self, "_adaptive_prefill_penalty_p99_ms", None
             )
+            output.prefill_control_slo_p99_ms = getattr(
+                self, "_adaptive_control_p99_ms", None
+            )
+            output.prefill_control_oldest_wait_seconds = getattr(
+                self, "_adaptive_oldest_prefill_wait_seconds", None
+            )
+            output.prefill_control_aging_interval = getattr(
+                self, "_adaptive_aging_interval", None
+            )
+            output.prefill_control_aging_token_budget = getattr(
+                self, "_adaptive_aging_token_budget", None
+            )
+            output.spec_profitability = spec_profitability
 
     def _prefill_load_is_high(self) -> bool:
         high_load_interval = getattr(
@@ -696,6 +727,9 @@ class EngineCore:
         if high_load:
             if getattr(self, "prefill_schedule_adaptive_target_ms", None) is not None:
                 adaptive_budget = getattr(self, "_adaptive_prefill_budget", None)
+                aging_budget = getattr(self, "_adaptive_aging_token_budget", None)
+                if aging_budget is not None:
+                    return max(adaptive_budget or 0, aging_budget)
                 if adaptive_budget is not None:
                     return adaptive_budget
             high_load_budget = getattr(
@@ -704,6 +738,13 @@ class EngineCore:
             if high_load_budget is not None:
                 return high_load_budget
         return getattr(self, "decode_active_prefill_token_budget", None)
+
+    @staticmethod
+    def _latency_p99(values: deque[float]) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        return ordered[math.ceil(len(ordered) * 0.99) - 1]
 
     def _observe_prefill_control(self, scheduler_output: SchedulerOutput) -> None:
         elapsed_ms = (time.monotonic() - scheduler_output.scheduled_timestamp) * 1000
@@ -715,32 +756,43 @@ class EngineCore:
             or scheduler_output.scheduled_timestamp <= 0
         ):
             return
+
+        self._adaptive_high_load_latencies.append(elapsed_ms)
+        self._adaptive_control_p99_ms = EngineCore._latency_p99(
+            self._adaptive_high_load_latencies
+        )
         if scheduler_output.scheduled_prefill_tokens <= 0:
             self._adaptive_decode_latencies.append(elapsed_ms)
             if len(self._adaptive_decode_latencies) >= 4:
-                values = sorted(self._adaptive_decode_latencies)
-                self._adaptive_decode_p99_ms = values[
-                    math.ceil(len(values) * 0.99) - 1
-                ]
+                self._adaptive_decode_p99_ms = EngineCore._latency_p99(
+                    self._adaptive_decode_latencies
+                )
             return
 
         self._last_prefill_service_time = time.monotonic()
         self._adaptive_prefill_latencies.append(elapsed_ms)
         self._adaptive_prefill_observations += 1
-        values = sorted(self._adaptive_prefill_latencies)
-        p99 = values[math.ceil(len(values) * 0.99) - 1]
-        self._adaptive_prefill_p99_ms = p99
+        self._adaptive_prefill_p99_ms = EngineCore._latency_p99(
+            self._adaptive_prefill_latencies
+        )
         baseline = self._adaptive_decode_p99_ms
+        prefill_p99 = self._adaptive_prefill_p99_ms
         self._adaptive_prefill_penalty_p99_ms = (
-            max(p99 - baseline, 0.0) if baseline is not None else None
+            max(prefill_p99 - baseline, 0.0)
+            if baseline is not None and prefill_p99 is not None
+            else None
         )
         if (
-            self._adaptive_prefill_observations
+            len(self._adaptive_high_load_latencies) < 16
+            or self._adaptive_prefill_observations
             % self.prefill_schedule_adaptive_update_interval
             != 0
         ):
             return
-        if p99 > target:
+
+        control_p99 = self._adaptive_control_p99_ms
+        assert control_p99 is not None
+        if control_p99 > target:
             self._adaptive_prefill_healthy_windows = 0
             self._adaptive_prefill_interval = min(
                 self.prefill_schedule_adaptive_max_interval,
@@ -754,7 +806,7 @@ class EngineCore:
                 halved = self._adaptive_prefill_budget // 2
                 aligned = (halved // minimum_budget) * minimum_budget
                 self._adaptive_prefill_budget = max(minimum_budget, aligned)
-        elif p99 < target * 0.7:
+        elif control_p99 < target * 0.7:
             self._adaptive_prefill_healthy_windows += 1
             if self._adaptive_prefill_healthy_windows >= 3:
                 base_interval = self.prefill_schedule_high_load_interval or 1
@@ -783,20 +835,34 @@ class EngineCore:
             high_load = self._prefill_load_is_high()
         interval = self.prefill_schedule_interval
         force_prefill_service = False
+        self._adaptive_aging_interval = None
+        self._adaptive_aging_token_budget = None
         if high_load:
             if getattr(self, "prefill_schedule_adaptive_target_ms", None) is not None:
                 now = time.monotonic()
                 if not self._adaptive_high_load:
                     self._adaptive_high_load = True
                     self._last_prefill_service_time = now
-                max_wait = self.prefill_schedule_adaptive_max_wait_seconds
-                if (
-                    max_wait is not None
-                    and now - self._last_prefill_service_time >= max_wait
-                ):
-                    force_prefill_service = True
-                    self._last_prefill_service_time = now
                 interval = self._adaptive_prefill_interval
+                max_wait = self.prefill_schedule_adaptive_max_wait_seconds
+                oldest_wait = self.scheduler.get_oldest_prefill_wait_seconds()
+                self._adaptive_oldest_prefill_wait_seconds = oldest_wait
+                if max_wait is not None and oldest_wait >= max_wait:
+                    debt_ratio = oldest_wait / max_wait
+                    aging_interval = max(
+                        1, math.ceil(interval / ((1.0 + debt_ratio) ** 2))
+                    )
+                    self._adaptive_aging_interval = aging_interval
+                    interval = min(interval, aging_interval)
+                    minimum_budget = self.prefill_schedule_adaptive_min_token_budget
+                    maximum_budget = self._adaptive_prefill_max_budget
+                    if minimum_budget is not None and maximum_budget is not None:
+                        self._adaptive_aging_token_budget = min(
+                            maximum_budget,
+                            minimum_budget * math.ceil(debt_ratio),
+                        )
+                    if now - self._last_prefill_service_time >= max_wait:
+                        force_prefill_service = True
             else:
                 interval = (
                     getattr(self, "prefill_schedule_high_load_interval", None)
@@ -804,6 +870,7 @@ class EngineCore:
                 )
         else:
             self._adaptive_high_load = False
+            self._adaptive_oldest_prefill_wait_seconds = 0.0
         step = self._prefill_schedule_step
         self._prefill_schedule_step += 1
         return not force_prefill_service and interval > 1 and step % interval != 0

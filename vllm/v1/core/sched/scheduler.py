@@ -286,6 +286,9 @@ class Scheduler(SchedulerInterface):
             tuple[int, int], deque[float]
         ] = {}
         self._spec_profitability_steps: defaultdict[int, int] = defaultdict(int)
+        self._last_spec_profitability_batch_size: int | None = None
+        self._last_spec_profitability_selected_k: int | None = None
+        self._last_spec_profitability_exploration = False
         if speculative_config is not None:
             self.long_context_threshold = speculative_config.long_context_threshold
             self.long_context_num_spec_tokens = (
@@ -556,32 +559,53 @@ class Scheduler(SchedulerInterface):
     def _profitability_adjusted_spec_tokens(
         self, batch_size: int, base_tokens: int
     ) -> int:
+        selected = base_tokens
+        exploration = False
         minimum_batch = self.profitability_aware_min_batch_size
-        if minimum_batch is None or batch_size < minimum_batch or base_tokens != 3:
-            return base_tokens
-        lower_tokens = 2
-        self._spec_profitability_steps[batch_size] += 1
-        base_history = self._spec_profitability_history.get((batch_size, base_tokens))
-        lower_history = self._spec_profitability_history.get(
-            (batch_size, lower_tokens)
-        )
-        if lower_history is None or len(lower_history) < self.profitability_min_samples:
-            return lower_tokens
-        if base_history is None or len(base_history) < self.profitability_min_samples:
-            return base_tokens
-        base_rate = sum(base_history) / len(base_history)
-        lower_rate = sum(lower_history) / len(lower_history)
-        selected = (
-            lower_tokens
-            if lower_rate > base_rate * (1.0 + self.profitability_hysteresis)
-            else base_tokens
-        )
         if (
-            self._spec_profitability_steps[batch_size]
-            % self.profitability_exploration_interval
-            == 0
+            minimum_batch is not None
+            and batch_size >= minimum_batch
+            and base_tokens == 3
         ):
-            return base_tokens if selected == lower_tokens else lower_tokens
+            lower_tokens = 2
+            self._spec_profitability_steps[batch_size] += 1
+            base_history = self._spec_profitability_history.get(
+                (batch_size, base_tokens)
+            )
+            lower_history = self._spec_profitability_history.get(
+                (batch_size, lower_tokens)
+            )
+            if (
+                lower_history is None
+                or len(lower_history) < self.profitability_min_samples
+            ):
+                selected = lower_tokens
+            elif (
+                base_history is None
+                or len(base_history) < self.profitability_min_samples
+            ):
+                selected = base_tokens
+            else:
+                base_rate = sum(base_history) / len(base_history)
+                lower_rate = sum(lower_history) / len(lower_history)
+                selected = (
+                    lower_tokens
+                    if lower_rate
+                    > base_rate * (1.0 + self.profitability_hysteresis)
+                    else base_tokens
+                )
+                if (
+                    self._spec_profitability_steps[batch_size]
+                    % self.profitability_exploration_interval
+                    == 0
+                ):
+                    selected = (
+                        base_tokens if selected == lower_tokens else lower_tokens
+                    )
+                    exploration = True
+        self._last_spec_profitability_batch_size = batch_size
+        self._last_spec_profitability_selected_k = selected
+        self._last_spec_profitability_exploration = exploration
         return selected
 
     def schedule(
@@ -2264,15 +2288,17 @@ class Scheduler(SchedulerInterface):
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
+        batch_size = len(scheduler_output.num_scheduled_tokens)
+        minimum_batch = getattr(self, "profitability_aware_min_batch_size", None)
         if (
-            getattr(self, "profitability_aware_min_batch_size", None) is not None
+            minimum_batch is not None
+            and batch_size >= minimum_batch
             and scheduler_output.scheduled_prefill_tokens == 0
             and scheduler_output.model_step_elapsed_ms > 0
             and spec_step_num_tokens in (2, 3)
             and spec_step_requests > 0
             and spec_step_committed_tokens > 0
         ):
-            batch_size = len(scheduler_output.num_scheduled_tokens)
             key = (batch_size, spec_step_num_tokens)
             history = self._spec_profitability_history.get(key)
             if history is None:
@@ -2510,6 +2536,48 @@ class Scheduler(SchedulerInterface):
         total = max(block_pool.num_gpu_blocks - 1, 0)
         pinned = max(total - immediate - evictable, 0)
         return immediate, evictable, pinned, total
+
+    def get_kv_cache_token_counts(self) -> tuple[int, int, int, int]:
+        immediate, evictable, pinned, total = self.get_kv_cache_block_counts()
+        return (
+            immediate * self.block_size,
+            evictable * self.block_size,
+            pinned * self.block_size,
+            total * self.block_size,
+        )
+
+    def get_oldest_prefill_wait_seconds(self) -> float:
+        arrivals = [
+            request.arrival_time
+            for request in self.running
+            if request.is_prefill_chunk
+        ]
+        arrivals.extend(
+            request.arrival_time
+            for request in (*self.waiting, *self.skipped_waiting)
+            if request.num_output_tokens == 0
+        )
+        return max(time.time() - min(arrivals), 0.0) if arrivals else 0.0
+
+    def get_spec_profitability_stats(self) -> dict[str, object] | None:
+        if self.profitability_aware_min_batch_size is None:
+            return None
+        batches: dict[str, dict[str, float | int | None]] = {}
+        for (batch_size, k), history in sorted(
+            self._spec_profitability_history.items()
+        ):
+            batch = batches.setdefault(str(batch_size), {})
+            batch[f"k{k}_samples"] = len(history)
+            batch[f"k{k}_tokens_per_ms"] = (
+                sum(history) / len(history) if history else None
+            )
+            batch["steps"] = self._spec_profitability_steps[batch_size]
+        return {
+            "last_batch_size": self._last_spec_profitability_batch_size,
+            "last_selected_k": self._last_spec_profitability_selected_k,
+            "last_exploration": self._last_spec_profitability_exploration,
+            "batches": batches,
+        }
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

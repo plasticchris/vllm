@@ -238,11 +238,20 @@ class EngineCoreOutputs(
     kv_cache_evictable_blocks: int | None = None
     kv_cache_pinned_blocks: int | None = None
     kv_cache_total_blocks: int | None = None
+    kv_cache_immediate_free_tokens: int | None = None
+    kv_cache_evictable_tokens: int | None = None
+    kv_cache_pinned_tokens: int | None = None
+    kv_cache_total_tokens: int | None = None
     prefill_control_interval: int | None = None
     prefill_control_token_budget: int | None = None
     prefill_control_p99_ms: float | None = None
     prefill_control_decode_p99_ms: float | None = None
     prefill_control_penalty_p99_ms: float | None = None
+    prefill_control_slo_p99_ms: float | None = None
+    prefill_control_oldest_wait_seconds: float | None = None
+    prefill_control_aging_interval: int | None = None
+    prefill_control_aging_token_budget: int | None = None
+    spec_profitability: dict[str, Any] | None = None
     timestamp: float = 0.0
 
     utility_output: UtilityOutput | None = None

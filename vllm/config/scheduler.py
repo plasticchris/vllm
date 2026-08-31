@@ -191,8 +191,8 @@ class SchedulerConfig:
     prefill_schedule_adaptive_target_ms: float | None = Field(
         default=None, gt=0.0
     )
-    """Enable closed-loop high-load prefill control with this scheduler-step
-    p99 latency target in milliseconds."""
+    """Enable closed-loop high-load prefill control with this decode-visible
+    scheduler-step p99 latency target in milliseconds."""
 
     prefill_schedule_adaptive_window: int = Field(default=128, ge=16)
     """Number of high-load scheduler-step latencies in the control window."""
