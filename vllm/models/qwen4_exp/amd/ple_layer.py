@@ -3,6 +3,7 @@
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 import math
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -18,7 +19,14 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    create_fp8_scale_parameter,
+    create_fp8_weight_parameter,
+    is_fp8,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -64,6 +72,62 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
             variance = grouped.square().mean(dim=-1, keepdim=True)
             normalized = (grouped * torch.rsqrt(variance + self.eps)).flatten(-2)
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
+
+
+class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
+    """FP8 PLE embedding with one global checkpoint scale."""
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size, params_dtype
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        if os.getenv("VLLM_PLE_INPROC_CPU", "0") == "1":
+            with torch.device("cpu"):
+                weight = create_fp8_weight_parameter(
+                    sum(output_partition_sizes), input_size_per_partition, weight_loader
+                )
+            weight.data = weight.data.pin_memory()
+            weight._vllm_keep_cpu = True
+        else:
+            weight = create_fp8_weight_parameter(
+                sum(output_partition_sizes), input_size_per_partition, weight_loader
+            )
+        layer.register_parameter("weight", weight)
+
+        weight_scale = create_fp8_scale_parameter(
+            PerTensorScaleParameter,
+            output_partition_sizes,
+            input_size_per_partition,
+            None,
+            weight_loader,
+            scale_dtype=torch.bfloat16,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("PLE FP8 weights only support embedding lookup")
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if layer.weight.device.type == "cpu":
+            output = F.embedding(input_.to(device="cpu"), layer.weight)
+            return output.to(
+                device=input_.device,
+                non_blocking=layer.weight.is_pinned(),
+            )
+        return F.embedding(input_, layer.weight)
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -172,6 +236,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         max_num_reqs: int,
         prefix: str,
         layer_name: str,
+        params_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -224,11 +289,21 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
+        ple_dtype = getattr(config, "ple_embedding_dtype", None)
+        if ple_dtype not in (None, "float8_e4m3fn"):
+            raise ValueError(f"Unsupported PLE embedding dtype: {ple_dtype}")
+        quant_method = (
+            Qwen4ExpPLEFp8EmbeddingMethod()
+            if ple_dtype == "float8_e4m3fn"
+            else None
+        )
         self.ngram_embedding = PLEVocabParallelEmbedding(
             padded_vocab_size,
             self.head_dim,
+            params_dtype=params_dtype,
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
+            quant_method=quant_method,
         )
         self.register_buffer(
             "positions_buffer",
@@ -344,9 +419,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
         ngram_ids = torch.cat(id_blocks, dim=-1)
+        # Preserve the checkpoint storage dtype through the lookup. FP8 PLE
+        # embeddings must remain FP8 until Qwen4ExpPLELayer applies the global
+        # checkpoint scale; copying into a BF16 buffer here would silently skip
+        # dequantization in _dequantize_embeddings.
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
-            dtype=self.ngram_embedding.params_dtype,
+            dtype=self.ngram_embedding.weight.dtype,
         )
         torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
             ngram_ids,
@@ -460,6 +539,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             vllm_config.scheduler_config.max_num_seqs,
             f"{prefix}.ple_embedding",
             prefix,
+            params_dtype=model_config.dtype,
         )
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
@@ -501,6 +581,24 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def _get_embedding_weight_scale(self) -> torch.Tensor | None:
+        embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+        return getattr(embedding, "weight_scale", None)
+
+    def _dequantize_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not is_fp8(embeddings):
+            return embeddings
+        weight_scale = self._get_embedding_weight_scale()
+        if weight_scale is None:
+            raise RuntimeError("FP8 PLE embedding is missing its global scale")
+        if weight_scale.device != embeddings.device:
+            raise RuntimeError("FP8 PLE embedding scale must be on the output device")
+        return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
@@ -1045,6 +1143,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"{hidden_states.shape[0]}"
             )
         embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
@@ -1126,6 +1225,7 @@ direct_register_custom_op(
 
 __all__ = [
     "Qwen4ExpNGramEmbedding",
+    "Qwen4ExpPLEFp8EmbeddingMethod",
     "Qwen4ExpPLEGroupedNorm",
     "Qwen4ExpPLELayer",
 ]

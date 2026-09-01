@@ -41,6 +41,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         heads_per_ngram: int = 8,
         ngram_vocab_size_base: int = 20_000_000,
         make_ngram_vocab_size_divisible_by: int = 128,
+        ple_embedding_dtype: str | None = None,
         output_gate_type: str = "sigmoid",
         rope_parameters: dict[str, Any] | None = None,
         layer_types: list[str] | None = None,
@@ -84,6 +85,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.heads_per_ngram = heads_per_ngram
         self.ngram_vocab_size_base = ngram_vocab_size_base
         self.make_ngram_vocab_size_divisible_by = make_ngram_vocab_size_divisible_by
+        self.ple_embedding_dtype = ple_embedding_dtype
         self.output_gate_type = output_gate_type
 
         self._validate_ple_config()
@@ -118,6 +120,10 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
             raise ValueError("ngram_vocab_size_base must be positive")
         if self.make_ngram_vocab_size_divisible_by <= 0:
             raise ValueError("make_ngram_vocab_size_divisible_by must be positive")
+        if self.ple_embedding_dtype not in (None, "float8_e4m3fn"):
+            raise ValueError(
+                f"Unsupported PLE embedding dtype: {self.ple_embedding_dtype}"
+            )
 
     def _validate_ple_layer_ids(self) -> None:
         invalid = [
