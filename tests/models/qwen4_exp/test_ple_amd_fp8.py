@@ -126,4 +126,3 @@ def test_amd_ple_fp8_ngram_forward_preserves_storage_dtype(monkeypatch) -> None:
 
     assert observed_dtypes == [torch.float8_e4m3fn]
     assert output.dtype == torch.float8_e4m3fn
-
