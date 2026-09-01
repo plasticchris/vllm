@@ -100,6 +100,37 @@ class SchedulerConfig:
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens. 0 disables the cap (default)."""
 
+    max_num_queued_reqs: int | None = Field(default=None, ge=0)
+    """Maximum number of requests that can be in-flight (waiting or running)
+    at the same time, or None for no limit. When the limit is reached, new
+    requests are rejected with HTTP 503 so the client can retry on another
+    instance. This bounds vLLM's otherwise unbounded request queue and is
+    primarily a coarse capacity valve."""
+
+    max_num_queued_tokens: int | None = Field(default=None, ge=0)
+    """Maximum total prompt tokens of requests currently in the prefill
+    phase, or None for no limit. When the limit is reached, new requests
+    are rejected with HTTP 503.
+
+    This is a TTFT QoS mechanism: by setting it to
+    ``target_TTFT * prefill_throughput`` you reject requests when the
+    prefill backlog would exceed the latency target.  In a disaggregated
+    prefill-decode setup this maps directly to the prefill pool's
+    capacity.
+
+    Note: the count is conservative.  A partially prefilled request
+    still contributes its full ``prompt_len`` until it transitions out
+    of the prefill phase, because the scheduler's per-iteration
+    ``num_computed_tokens`` progress is not propagated to the API
+    server process during prefill (``EngineCoreOutput`` is only
+    emitted once the request starts producing tokens).  Similarly,
+    prefix-cache hits (``num_cached_tokens``) are only known to the
+    OutputProcessor after prefill completes.  This overestimates the
+    real backlog, causing earlier rejection than strictly necessary
+    — the safe direction for QoS.  The impact is limited to long
+    prompts under chunked prefill; short prompts that prefill in a
+    single iteration are unaffected."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -300,6 +331,10 @@ class SchedulerConfig:
         #   https://github.com/vllm-project/vllm/issues/29585
         factors.append(self.max_num_batched_tokens)
 
+        # PLE and other model components allocate static per-request buffers.
+        # Their shapes are captured in compiled graphs.
+        factors.append(self.max_num_seqs)
+
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -327,19 +362,6 @@ class SchedulerConfig:
             logger.info_once(
                 "Chunked prefill is enabled with max_num_batched_tokens=%d.",
                 self.max_num_batched_tokens,
-            )
-
-        if self.max_num_partial_prefills > 1:
-            if self.long_prefill_token_threshold == 0:
-                self.long_prefill_token_threshold = int(max_model_len * 0.04)
-
-            logger.info(
-                "Concurrent partial prefills enabled with "
-                "max_num_partial_prefills=%d, max_long_partial_prefills=%d, "
-                "long_prefill_token_threshold=%d",
-                self.max_num_partial_prefills,
-                self.max_long_partial_prefills,
-                self.long_prefill_token_threshold,
             )
 
         self.verify_max_model_len(max_model_len)
@@ -373,24 +395,11 @@ class SchedulerConfig:
                 self.max_num_seqs * max_model_len,
             )
 
-        if self.max_num_partial_prefills > 1:
-            if not self.enable_chunked_prefill:
-                raise ValueError(
-                    "Chunked prefill must be enabled to set "
-                    "max_num_partial_prefills > 1."
-                )
-
-            if self.long_prefill_token_threshold > max_model_len:
-                raise ValueError(
-                    "long_prefill_token_threshold "
-                    f"({self.long_prefill_token_threshold}) cannot be greater "
-                    f"than the max_model_len ({max_model_len})."
-                )
-
-        if self.max_long_partial_prefills > self.max_num_partial_prefills:
+        if self.long_prefill_token_threshold > max_model_len:
             raise ValueError(
-                f"{self.max_long_partial_prefills=} must be less than or equal to "
-                f"{self.max_num_partial_prefills=}."
+                "long_prefill_token_threshold "
+                f"({self.long_prefill_token_threshold}) cannot be greater "
+                f"than the max_model_len ({max_model_len})."
             )
 
         return self
