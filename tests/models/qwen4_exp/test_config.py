@@ -89,6 +89,29 @@ def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
     assert returned_multi_hidden is multi_hidden
 
 
+def test_qwen4_exp_mtp_local_argmax_uses_sharded_logits_processor() -> None:
+    from vllm.models.qwen4_exp.nvidia.mtp import Qwen4ExpMTP
+
+    expected = torch.tensor([7])
+    lm_head = object()
+    captured = {}
+
+    def get_top_tokens(head, hidden_states):
+        captured["args"] = (head, hidden_states)
+        return expected
+
+    hidden_states = torch.randn(1, 4)
+    model = SimpleNamespace(
+        lm_head=lm_head,
+        logits_processor=SimpleNamespace(get_top_tokens=get_top_tokens),
+    )
+
+    actual = Qwen4ExpMTP.get_top_tokens(model, hidden_states, spec_step_idx=2)
+
+    assert actual is expected
+    assert captured["args"] == (lm_head, hidden_states)
+
+
 @pytest.mark.parametrize("wrapped_config", [False, True])
 def test_qwen4_exp_mtp_override_sets_draft_config(
     wrapped_config: bool,

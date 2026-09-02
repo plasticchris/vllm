@@ -376,6 +376,133 @@ def _build_qsa_metadata_kernel(
             tl.extra.cuda.gdc_launch_dependents()
 
 
+@triton.jit(do_not_specialize=["num_tokens"])
+def _update_qsa_draft_metadata_kernel(
+    seq_lens_ptr,
+    block_table_ptr,
+    token_to_req_ptr,
+    logical_positions_ptr,
+    slot_mapping_ptr,
+    block_table_stride_0: tl.constexpr,
+    block_table_stride_1: tl.constexpr,
+    num_tokens,
+    storage_block_size: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    circular_buffer_size: tl.constexpr,
+    num_block_table_columns: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Advance QSA side-cache metadata for one autoregressive draft step."""
+    token_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    in_bounds = token_idx < num_tokens
+    # Initial metadata permanently marks CUDA-graph padding with -1. Preserve
+    # that validity mask while the live rows advance between MTP steps.
+    was_valid = (
+        tl.load(logical_positions_ptr + token_idx, mask=in_bounds, other=-1) >= 0
+    )
+    valid = in_bounds & was_valid
+    request_idx = tl.load(token_to_req_ptr + token_idx, mask=valid, other=0)
+    logical_position = tl.load(seq_lens_ptr + request_idx, mask=valid, other=0) - 1
+    valid &= logical_position >= 0
+    tl.store(
+        logical_positions_ptr + token_idx,
+        tl.where(valid, logical_position, -1),
+        mask=in_bounds,
+    )
+
+    if circular_buffer_size > 0:
+        valid &= num_block_table_columns > 0
+        physical_block = tl.load(
+            block_table_ptr + request_idx * block_table_stride_0,
+            mask=valid,
+            other=-1,
+        )
+        valid &= physical_block >= 0
+        slot = physical_block * circular_buffer_size + (
+            logical_position % circular_buffer_size
+        )
+    else:
+        compressed_position = tl.maximum(logical_position, 0) // compress_ratio
+        logical_block = compressed_position // storage_block_size
+        valid &= logical_block < num_block_table_columns
+        if compress_ratio != 1:
+            valid &= ((logical_position + 1) % compress_ratio) == 0
+        physical_block = tl.load(
+            block_table_ptr
+            + request_idx * block_table_stride_0
+            + logical_block * block_table_stride_1,
+            mask=valid,
+            other=-1,
+        )
+        valid &= physical_block >= 0
+        slot = physical_block * storage_block_size + (
+            compressed_position % storage_block_size
+        )
+
+    tl.store(slot_mapping_ptr + token_idx, tl.where(valid, slot, -1), mask=in_bounds)
+
+
+def update_qsa_draft_metadata_triton(
+    metadata: "QSAForwardMetadata", circular_buffer_size: int
+) -> None:
+    """Advance one QSA metadata instance without rebuilding common metadata."""
+    if metadata.num_actual_tokens == 0:
+        return
+    block_table = metadata.block_table
+    _update_qsa_draft_metadata_kernel[(cdiv(metadata.num_actual_tokens, 128),)](
+        metadata.seq_lens,
+        block_table,
+        metadata.token_to_req,
+        metadata.logical_positions,
+        metadata.slot_mapping,
+        block_table.stride(0),
+        block_table.stride(1),
+        metadata.num_actual_tokens,
+        metadata.storage_block_size,
+        metadata.compress_ratio,
+        circular_buffer_size,
+        block_table.shape[1],
+        BLOCK_SIZE=128,
+        num_warps=4,
+    )
+
+
+def _update_qsa_draft_metadata_torch(
+    metadata: "QSAForwardMetadata", circular_buffer_size: int
+) -> None:
+    """PyTorch reference for the fused-draft QSA metadata update."""
+    if metadata.num_actual_tokens == 0:
+        return
+    logical_positions = metadata.logical_positions
+    valid = logical_positions >= 0
+    requests = metadata.token_to_req.long().clamp(0, metadata.seq_lens.shape[0] - 1)
+    advanced_positions = metadata.seq_lens.index_select(0, requests).long() - 1
+    logical_positions.copy_(torch.where(valid, advanced_positions, -1))
+
+    block_table = metadata.block_table
+    if circular_buffer_size > 0:
+        slots = circular_qsa_slot_mapping(
+            block_table,
+            metadata.token_to_req,
+            logical_positions,
+            circular_buffer_size,
+        )
+    else:
+        slots = compressed_qsa_slot_mapping(
+            block_table,
+            metadata.token_to_req,
+            logical_positions,
+            metadata.storage_block_size,
+            metadata.compress_ratio,
+        )
+    metadata.slot_mapping.copy_(torch.where(valid, slots, -1))
+
+
+update_qsa_draft_metadata = (
+    update_qsa_draft_metadata_triton if HAS_TRITON else _update_qsa_draft_metadata_torch
+)
+
+
 def build_qsa_metadata_triton(
     common_attn_metadata: CommonAttentionMetadata,
     token_to_req_buffer: torch.Tensor,
@@ -568,6 +695,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_draft_decode_metadata_update = True
 
     def __init__(
         self,
@@ -654,6 +782,16 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
         )
+
+    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
+        # Fused MTP decode keeps one token per live request. token_to_req and
+        # k_work_metadata therefore remain invariant; seq_lens is advanced by
+        # update_draft_inputs before this callback, so only logical positions
+        # and the two QSA side-cache slot mappings need to be refreshed.
+        circular_buffer_size = (
+            self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+        )
+        update_qsa_draft_metadata(metadata, circular_buffer_size)
 
 
 class QSAStateBackend(AttentionBackend):

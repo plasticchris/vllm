@@ -367,6 +367,7 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
 
     getattr(speculator, method_name)(
         num_reqs=2,
+        num_speculative_steps=4,
         skip_attn=True,
         batch_desc=batch_desc,
         seq_lens_cpu_upper_bound=None,
@@ -375,6 +376,34 @@ def test_multi_step_decode_replays_captured_graph_as_expected(
 
     assert generate_draft.call_count == expected_eager_calls
     assert run_fullgraph.call_count == expected_graph_replays
+
+
+def test_fused_multi_step_decode_honors_runtime_draft_depth():
+    speculator = object.__new__(_TestSpeculator)
+    speculator.num_speculative_steps = 4
+    speculator.current_draft_step = torch.tensor(0)
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.arange(2),
+        query_start_loc=torch.arange(3),
+    )
+    speculator.idx_mapping = torch.arange(2)
+    speculator._generate_draft = Mock()
+    batch_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE,
+        num_tokens=2,
+        num_reqs=2,
+    )
+
+    speculator._fused_multi_step_decode(
+        num_reqs=2,
+        num_speculative_steps=2,
+        skip_attn=True,
+        batch_desc=batch_desc,
+        seq_lens_cpu_upper_bound=None,
+        num_tokens_across_dp=None,
+    )
+
+    assert speculator._generate_draft.call_count == 1
 
 
 def test_update_draft_decode_metadata_updates_fa3_scheduler_metadata(

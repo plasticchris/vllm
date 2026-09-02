@@ -226,6 +226,66 @@ def _qsa_sparse_paged_attention_reference(
     return output
 
 
+def _draft_qsa_metadata(
+    *,
+    seq_lens: list[int],
+    logical_positions: list[int],
+    token_to_req: list[int],
+    block_table: list[list[int]],
+    storage_block_size: int,
+    compress_ratio: int,
+):
+    num_tokens = len(logical_positions)
+    return qsa_cache.QSAForwardMetadata(
+        block_table=torch.tensor(block_table, dtype=torch.int32),
+        slot_mapping=torch.full((num_tokens,), -1, dtype=torch.int64),
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        query_start_loc=torch.arange(len(seq_lens) + 1, dtype=torch.int32),
+        token_to_req=torch.tensor(token_to_req, dtype=torch.int32),
+        logical_positions=torch.tensor(logical_positions, dtype=torch.int64),
+        k_work_metadata=torch.empty(0, 2, dtype=torch.int32),
+        num_actual_tokens=num_tokens,
+        storage_block_size=storage_block_size,
+        compress_ratio=compress_ratio,
+    )
+
+
+def test_qsa_fused_draft_update_advances_circular_slots() -> None:
+    metadata = _draft_qsa_metadata(
+        seq_lens=[8, 9],
+        logical_positions=[6, 7, -1],
+        token_to_req=[0, 1, 0],
+        block_table=[[2], [5]],
+        storage_block_size=8,
+        compress_ratio=4,
+    )
+
+    qsa_cache._update_qsa_draft_metadata_torch(metadata, circular_buffer_size=8)
+
+    assert metadata.logical_positions.tolist() == [7, 8, -1]
+    assert metadata.slot_mapping.tolist() == [23, 40, -1]
+
+
+def test_qsa_fused_draft_update_advances_compressed_slots() -> None:
+    metadata = _draft_qsa_metadata(
+        seq_lens=[8, 9],
+        logical_positions=[6, 7, -1],
+        token_to_req=[0, 1, 0],
+        block_table=[[2], [5]],
+        storage_block_size=16,
+        compress_ratio=4,
+    )
+
+    qsa_cache._update_qsa_draft_metadata_torch(metadata, circular_buffer_size=0)
+
+    assert metadata.logical_positions.tolist() == [7, 8, -1]
+    assert metadata.slot_mapping.tolist() == [33, -1, -1]
+
+
+def test_qsa_builder_supports_fused_draft_metadata_updates() -> None:
+    assert QSAMetadataBuilder.supports_draft_decode_metadata_update
+
+
 @requires_qsa_kernels
 def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     device = torch.device("cuda")

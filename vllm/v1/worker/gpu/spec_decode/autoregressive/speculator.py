@@ -540,6 +540,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     def _fused_multi_step_decode(
         self,
         num_reqs: int,
+        num_speculative_steps: int,
         skip_attn: bool,
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
@@ -582,6 +583,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             slot_mappings_by_layer,
             num_tokens_across_dp,
             batch_desc.cg_mode,
+            num_speculative_steps,
         )
 
     def _generate_fused_drafts(
@@ -592,6 +594,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        num_speculative_steps: int | None = None,
     ) -> None:
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
@@ -602,7 +605,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             else []
         )
 
-        for step in range(1, self.num_speculative_steps):
+        runtime_steps = (
+            self.num_speculative_steps
+            if num_speculative_steps is None
+            else num_speculative_steps
+        )
+        for step in range(1, runtime_steps):
             self.current_draft_step.fill_(step)
             self._generate_draft(
                 num_reqs,
@@ -613,7 +621,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode,
             )
             if (
-                step < self.num_speculative_steps - 1
+                step < runtime_steps - 1
                 and attn_metadata is not None
                 and self.advance_draft_positions
             ):

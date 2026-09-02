@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     convert_to_wna16_moe_kernel_format,
     map_wna16_backend,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization import moe_wna16
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -27,6 +28,16 @@ from vllm.model_executor.layers.quantization.moe_wna16 import (
     MoeWNA16Method,
 )
 from vllm.platforms import current_platform
+
+
+def test_rdna3_wna16_receives_full_intermediate_size():
+    class CompressedTensorsWNA16RDNA3MoEMethod:
+        pass
+
+    layer = object.__new__(RoutedExperts)
+    assert layer._needs_intermediate_size_param(
+        CompressedTensorsWNA16RDNA3MoEMethod()
+    )
 
 
 def test_map_wna16_backend_supports_triton():

@@ -210,6 +210,7 @@ class RoutedExperts(PluggableLayer):
         return quant_method.__class__.__name__ in (
             "AutoGPTQMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
+            "CompressedTensorsWNA16RDNA3MoEMethod",
             "CompressedTensorsW4A16FlydslMoEMethod",
         )
 
