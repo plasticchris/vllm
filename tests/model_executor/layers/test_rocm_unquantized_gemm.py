@@ -42,6 +42,31 @@ def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch):
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
 
 
+def test_rocm_unquantized_gemm_uses_tuned_rocblas_shape(monkeypatch):
+    x = torch.empty(3, 2560, dtype=torch.bfloat16)
+    weight = torch.empty(12288, 2560, dtype=torch.bfloat16)
+    expected = torch.empty(3, 12288, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
+    monkeypatch.setattr(utils, "num_compute_units", lambda: 96)
+
+    linear_mock = MagicMock(return_value=expected)
+    monkeypatch.setattr(torch.nn.functional, "linear", linear_mock)
+    wvsplitk_mock = MagicMock()
+    monkeypatch.setattr(utils.ops, "wvSplitK", wvsplitk_mock)
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+
+    assert out is expected
+    linear_mock.assert_called_once_with(x, weight, None)
+    wvsplitk_mock.assert_not_called()
+
+
 def test_rocm_unquantized_gemm_makes_skinny_activation_contiguous(monkeypatch):
     x = torch.randn(64, 4, dtype=torch.float16).t()
     weight = torch.randn(128, 64, dtype=torch.float16)
@@ -149,10 +174,10 @@ def test_rocm_unquantized_gemm_noncontiguous_activation_real_kernel(monkeypatch,
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
-def test_rocm_unquantized_gemm_gfx1x_n_gt_5_falls_back(monkeypatch):
-    # wvSplitK skinny GEMM handles n in [1, 5] (see PR #40687); n > 5 must
+def test_rocm_unquantized_gemm_gfx1x_n_gt_12_falls_back(monkeypatch):
+    # The tuned wvSplitK dispatch handles n in [1, 12]; larger batches must
     # fall back to torch.nn.functional.linear.
-    x = torch.randn(6, 64, dtype=torch.float16)
+    x = torch.randn(13, 64, dtype=torch.float16)
     weight = torch.randn(128, 64, dtype=torch.float16)
 
     monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)

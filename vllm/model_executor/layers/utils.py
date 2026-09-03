@@ -265,6 +265,15 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 # skinny_gemms.cu but deliberately unselected here.
 _WVSPLITK_N = frozenset(range(1, 13))
 
+# Qwen3.8-Flash-Next's combined 12,288-wide projection is large enough that
+# rocBLAS beats the bandwidth-oriented wvSplitK kernel even at MTP widths.
+# RX 7900 XTX medians for N=1/3/4 were 61.2/60.6/61.3 us (rocBLAS) versus
+# 74.5/75.1/75.1 us (wvSplitK). Keep the exception shape-specific so smaller
+# projections retain wvSplitK's 1.1-6.8x advantage.
+_ROCBLAS_SKINNY_SHAPES = frozenset(
+    (n, 12288, 2560) for n in (1, 3, 4)
+)
+
 
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
@@ -336,6 +345,8 @@ def rocm_unquantized_gemm_impl(
     )
 
     if use_skinny:
+        if (n, m, k) in _ROCBLAS_SKINNY_SHAPES:
+            return torch.nn.functional.linear(x, weight, bias)
         # The skinny kernels assume contiguous K elements.
         x_view = x.reshape(-1, x.size(-1)).contiguous()
         if m > 8 and n in _WVSPLITK_N:

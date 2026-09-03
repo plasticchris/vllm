@@ -321,6 +321,14 @@ class Scheduler(SchedulerInterface):
         self.profitability_min_samples = 0
         self.profitability_exploration_interval = 32
         self.profitability_hysteresis = 0.0
+        self.profitability_acceptance_threshold: float | None = None
+        self._spec_acceptance_history: deque[float] = deque(maxlen=8)
+        self._spec_acceptance_request_ids: frozenset[str] = frozenset()
+        self._spec_request_profitability_history: dict[int, deque[float]] = {
+            2: deque(maxlen=16),
+            3: deque(maxlen=16),
+        }
+        self._last_spec_profitability_acceptance_gated = False
         self._spec_profitability_window = 16
         self._spec_profitability_history: dict[
             tuple[int, int], deque[float]
@@ -357,7 +365,17 @@ class Scheduler(SchedulerInterface):
             self.profitability_hysteresis = (
                 speculative_config.profitability_hysteresis
             )
+            self.profitability_acceptance_threshold = (
+                speculative_config.profitability_acceptance_threshold
+            )
+            self._spec_acceptance_history = deque(
+                maxlen=speculative_config.profitability_acceptance_window
+            )
             self._spec_profitability_window = speculative_config.profitability_window
+            self._spec_request_profitability_history = {
+                2: deque(maxlen=self._spec_profitability_window),
+                3: deque(maxlen=self._spec_profitability_window),
+            }
             self.profitability_state_path = speculative_config.profitability_state_path
             self.profitability_state_save_interval = (
                 speculative_config.profitability_state_save_interval
@@ -771,6 +789,12 @@ class Scheduler(SchedulerInterface):
             "num_speculative_tokens": speculative_config.num_speculative_tokens,
             "batch_schedule": speculative_config.num_speculative_tokens_per_batch_size,
             "profitability_window": speculative_config.profitability_window,
+            "profitability_acceptance_threshold": (
+                speculative_config.profitability_acceptance_threshold
+            ),
+            "profitability_acceptance_window": (
+                speculative_config.profitability_acceptance_window
+            ),
             "mamba_prefill_subblock_tokens": (
                 vllm_config.scheduler_config.mamba_prefill_subblock_tokens
             ),
@@ -907,10 +931,21 @@ class Scheduler(SchedulerInterface):
         return combined[-self._spec_profitability_window :], sources
 
     def _profitability_adjusted_spec_tokens(
-        self, batch_size: int, base_tokens: int
+        self,
+        batch_size: int,
+        base_tokens: int,
+        request_ids: Iterable[str] = (),
     ) -> int:
         selected = base_tokens
         exploration = False
+        acceptance_gated = False
+        request_signature = frozenset(request_ids)
+        if request_signature != self._spec_acceptance_request_ids:
+            self._spec_acceptance_request_ids = request_signature
+            self._spec_acceptance_history.clear()
+            for history in self._spec_request_profitability_history.values():
+                history.clear()
+
         minimum_batch = self.profitability_aware_min_batch_size
         if (
             minimum_batch is not None
@@ -919,12 +954,26 @@ class Scheduler(SchedulerInterface):
         ):
             lower_tokens = 2
             self._spec_profitability_steps[batch_size] += 1
-            base_history, base_sources = self._profitability_history_for_batch(
-                batch_size, base_tokens
-            )
-            lower_history, lower_sources = self._profitability_history_for_batch(
-                batch_size, lower_tokens
-            )
+            step = self._spec_profitability_steps[batch_size]
+            if request_signature:
+                # Generated content strongly affects draft acceptance. Re-sample
+                # both depths for each active request instead of inheriting a
+                # decision made by unrelated content. Global/persisted history
+                # remains the warm-start path for callers without request IDs.
+                base_history = list(
+                    self._spec_request_profitability_history[base_tokens]
+                )
+                lower_history = list(
+                    self._spec_request_profitability_history[lower_tokens]
+                )
+                base_sources = lower_sources = []
+            else:
+                base_history, base_sources = self._profitability_history_for_batch(
+                    batch_size, base_tokens
+                )
+                lower_history, lower_sources = self._profitability_history_for_batch(
+                    batch_size, lower_tokens
+                )
             self._last_spec_profitability_warm_start_batches = sorted(
                 set(base_sources + lower_sources)
             )
@@ -941,18 +990,27 @@ class Scheduler(SchedulerInterface):
                     > base_rate * (1.0 + self.profitability_hysteresis)
                     else base_tokens
                 )
-                if (
-                    self._spec_profitability_steps[batch_size]
-                    % self.profitability_exploration_interval
-                    == 0
-                ):
-                    selected = (
-                        base_tokens if selected == lower_tokens else lower_tokens
-                    )
-                    exploration = True
+
+            threshold = self.profitability_acceptance_threshold
+            if (
+                threshold is not None
+                and len(self._spec_acceptance_history)
+                >= self.profitability_min_samples
+                and sum(self._spec_acceptance_history)
+                / len(self._spec_acceptance_history)
+                < threshold
+            ):
+                selected = lower_tokens
+                acceptance_gated = True
+
+            if step % self.profitability_exploration_interval == 0:
+                selected = base_tokens if selected == lower_tokens else lower_tokens
+                exploration = True
+                acceptance_gated = False
         self._last_spec_profitability_batch_size = batch_size
         self._last_spec_profitability_selected_k = selected
         self._last_spec_profitability_exploration = exploration
+        self._last_spec_profitability_acceptance_gated = acceptance_gated
         return selected
 
     def _get_local_prefix_cache_hit(
@@ -2033,7 +2091,9 @@ class Scheduler(SchedulerInterface):
                     self.greedy_num_spec_tokens,
                 )
             num_spec_tokens_to_schedule = self._profitability_adjusted_spec_tokens(
-                len(num_scheduled_tokens), num_spec_tokens_to_schedule
+                len(num_scheduled_tokens),
+                num_spec_tokens_to_schedule,
+                num_scheduled_tokens,
             )
 
         scheduled_encoder_input_stats = None
@@ -2943,9 +3003,23 @@ class Scheduler(SchedulerInterface):
             if history is None:
                 history = deque(maxlen=self._spec_profitability_window)
                 self._spec_profitability_history[key] = history
-            history.append(
+            observed_rate = (
                 spec_step_committed_tokens / scheduler_output.model_step_elapsed_ms
             )
+            history.append(observed_rate)
+            if self._spec_acceptance_request_ids:
+                self._spec_request_profitability_history[
+                    spec_step_num_tokens
+                ].append(observed_rate)
+            if spec_step_num_tokens == 3:
+                accepted = max(
+                    spec_step_committed_tokens
+                    - spec_step_requests * self.num_sampled_tokens_per_step,
+                    0,
+                )
+                self._spec_acceptance_history.append(
+                    accepted / (spec_step_requests * spec_step_num_tokens)
+                )
             self._spec_profitability_unsaved += 1
             if (
                 self._spec_profitability_unsaved
@@ -3247,6 +3321,28 @@ class Scheduler(SchedulerInterface):
             "last_batch_size": self._last_spec_profitability_batch_size,
             "last_selected_k": self._last_spec_profitability_selected_k,
             "last_exploration": self._last_spec_profitability_exploration,
+            "last_acceptance_gated": (
+                self._last_spec_profitability_acceptance_gated
+            ),
+            "recent_k3_acceptance": (
+                sum(self._spec_acceptance_history)
+                / len(self._spec_acceptance_history)
+                if self._spec_acceptance_history
+                else None
+            ),
+            "recent_k3_acceptance_samples": len(self._spec_acceptance_history),
+            "request_k2_tokens_per_ms": (
+                sum(self._spec_request_profitability_history[2])
+                / len(self._spec_request_profitability_history[2])
+                if self._spec_request_profitability_history[2]
+                else None
+            ),
+            "request_k3_tokens_per_ms": (
+                sum(self._spec_request_profitability_history[3])
+                / len(self._spec_request_profitability_history[3])
+                if self._spec_request_profitability_history[3]
+                else None
+            ),
             "warm_start_batches": self._last_spec_profitability_warm_start_batches,
             "loaded_samples": self._spec_profitability_loaded_samples,
             "state_age_seconds": self._spec_profitability_state_age_seconds,

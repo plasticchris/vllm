@@ -314,6 +314,72 @@ def test_profitability_controller_explores_both_depths():
     assert stats["last_selected_k"] == 3
 
 
+def test_profitability_controller_prefers_current_request_measurements():
+    scheduler = create_scheduler()
+    scheduler.profitability_aware_min_batch_size = 1
+    scheduler.profitability_min_samples = 2
+    scheduler.profitability_exploration_interval = 100
+    scheduler._spec_profitability_history = {
+        (1, 2): deque([2.0, 2.0], maxlen=8),
+        (1, 3): deque([1.0, 1.0], maxlen=8),
+    }
+    scheduler._spec_acceptance_request_ids = frozenset({"req"})
+    scheduler._spec_request_profitability_history[2].extend([1.0, 1.0])
+    scheduler._spec_request_profitability_history[3].extend([2.0, 2.0])
+
+    assert scheduler._profitability_adjusted_spec_tokens(1, 3, ["req"]) == 3
+
+
+def test_profitability_acceptance_gate_tracks_active_content():
+    scheduler = create_scheduler()
+    scheduler.profitability_aware_min_batch_size = 1
+    scheduler.profitability_min_samples = 2
+    scheduler.profitability_exploration_interval = 100
+    scheduler.profitability_acceptance_threshold = 0.5
+    scheduler._spec_profitability_history = {
+        (1, 2): deque([1.0, 1.0], maxlen=8),
+        (1, 3): deque([1.5, 1.5], maxlen=8),
+    }
+    scheduler._spec_acceptance_request_ids = frozenset({"req-a"})
+    scheduler._spec_request_profitability_history[2].extend([1.0, 1.0])
+    scheduler._spec_request_profitability_history[3].extend([1.5, 1.5])
+    scheduler._spec_acceptance_history.extend([0.2, 0.3])
+
+    assert scheduler._profitability_adjusted_spec_tokens(1, 3, ["req-a"]) == 2
+    stats = scheduler.get_spec_profitability_stats()
+    assert stats is not None
+    assert stats["last_acceptance_gated"] is True
+    assert stats["recent_k3_acceptance"] == pytest.approx(0.25)
+
+    # A new request must not inherit the previous request's acceptance or
+    # throughput decision; it starts by sampling K=2.
+    assert scheduler._profitability_adjusted_spec_tokens(1, 3, ["req-b"]) == 2
+    assert not scheduler._spec_acceptance_history
+    assert not scheduler._spec_request_profitability_history[2]
+    assert not scheduler._spec_request_profitability_history[3]
+
+
+def test_profitability_acceptance_gate_periodically_probes_k3():
+    scheduler = create_scheduler()
+    scheduler.profitability_aware_min_batch_size = 1
+    scheduler.profitability_min_samples = 2
+    scheduler.profitability_exploration_interval = 4
+    scheduler.profitability_acceptance_threshold = 0.5
+    scheduler._spec_profitability_history = {
+        (1, 2): deque([1.0, 1.0], maxlen=8),
+        (1, 3): deque([1.5, 1.5], maxlen=8),
+    }
+    scheduler._spec_acceptance_request_ids = frozenset({"req"})
+    scheduler._spec_request_profitability_history[2].extend([1.0, 1.0])
+    scheduler._spec_request_profitability_history[3].extend([1.5, 1.5])
+    scheduler._spec_acceptance_history.extend([0.2, 0.3])
+    scheduler._spec_profitability_steps[1] = 3
+
+    assert scheduler._profitability_adjusted_spec_tokens(1, 3, ["req"]) == 3
+    assert scheduler._last_spec_profitability_exploration is True
+    assert scheduler._last_spec_profitability_acceptance_gated is False
+
+
 def test_request_kv_token_counts_use_scheduler_allocations():
     scheduler = Mock()
     scheduler.requests = {"a": Mock(), "b": Mock()}

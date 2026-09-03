@@ -499,6 +499,15 @@ class SpeculativeConfig:
     profitability_hysteresis: float = Field(default=0.03, ge=0.0, le=0.5)
     """Required committed-token throughput advantage before switching to K=2."""
 
+    profitability_acceptance_threshold: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    """Optional recent K=3 draft acceptance floor. Below this value the
+    controller temporarily uses K=2, with periodic K=3 probes for recovery."""
+
+    profitability_acceptance_window: int = Field(default=8, ge=2)
+    """Per-active-request K=3 acceptance observations used by the content gate."""
+
     profitability_state_path: str | None = None
     """Optional JSON file used to warm-start online profitability history."""
 
