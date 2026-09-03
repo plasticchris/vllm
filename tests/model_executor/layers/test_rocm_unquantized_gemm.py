@@ -42,6 +42,44 @@ def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch):
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "shape,expected_cu_count",
+    [
+        ((4, 6144, 2560), 128),
+        ((4, 2560, 6144), 128),
+        ((4, 4608, 4608), 112),
+    ],
+)
+def test_rocm_unquantized_gemm_uses_tuned_wvsplitk_cu_count(
+    monkeypatch, shape, expected_cu_count
+):
+    n, m, k = shape
+    x = torch.empty(n, k, dtype=torch.bfloat16)
+    weight = torch.empty(m, k, dtype=torch.bfloat16)
+    expected = torch.empty(n, m, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(utils, "use_aiter_triton_gemm", lambda *args: False)
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx9", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: False)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1250", lambda: False)
+    monkeypatch.setattr(utils, "num_compute_units", lambda: 48)
+
+    wvsplitk_mock = MagicMock(return_value=expected)
+    monkeypatch.setattr(utils.ops, "wvSplitK", wvsplitk_mock)
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, None)
+
+    assert out.data_ptr() == expected.data_ptr()
+    wvsplitk_mock.assert_called_once()
+    call_args = wvsplitk_mock.call_args.args
+    assert call_args[0] is weight
+    assert call_args[1].data_ptr() == x.data_ptr()
+    assert call_args[1].shape == x.shape
+    assert call_args[2:] == (expected_cu_count, None)
+
+
 def test_rocm_unquantized_gemm_uses_tuned_rocblas_shape(monkeypatch):
     x = torch.empty(3, 2560, dtype=torch.bfloat16)
     weight = torch.empty(12288, 2560, dtype=torch.bfloat16)

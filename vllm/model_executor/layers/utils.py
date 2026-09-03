@@ -274,6 +274,20 @@ _ROCBLAS_SKINNY_SHAPES = frozenset(
     (n, 12288, 2560) for n in (1, 3, 4)
 )
 
+# wvSplitK's CuCount controls launched workgroups, not a hardware limit. The
+# default physical WGP count (48 on RX 7900 XTX) under-fills a few MTP3 verify
+# shapes. Repeated 9x1000-call medians selected these shape-specific counts:
+#   (N, M, K)       48 WGPs   tuned     gain
+#   (4, 6144, 2560) 35.09 us  34.51 us  1.7%
+#   (4, 2560, 6144) 42.05 us  37.35 us 11.2%
+#   (4, 4608, 4608) 48.79 us  48.01 us  1.6%
+# Smaller differences are deliberately left at the physical count.
+_WVSPLITK_CU_OVERRIDES = {
+    (4, 6144, 2560): 128,
+    (4, 2560, 6144): 128,
+    (4, 4608, 4608): 112,
+}
+
 
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
@@ -350,7 +364,7 @@ def rocm_unquantized_gemm_impl(
         # The skinny kernels assume contiguous K elements.
         x_view = x.reshape(-1, x.size(-1)).contiguous()
         if m > 8 and n in _WVSPLITK_N:
-            cu_count = num_compute_units()
+            cu_count = _WVSPLITK_CU_OVERRIDES.get((n, m, k), cu_count)
             out = ops.wvSplitK(weight, x_view, cu_count, bias)
             return out.reshape(*x.shape[:-1], weight.shape[0])
         elif m % 4 == 0 and n == 1 and k <= 8192 and bias is None:
