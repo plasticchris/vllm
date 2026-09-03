@@ -3400,6 +3400,52 @@ def test_deepseek_v4_draft_group_annotated_on_packed_path():
     assert "model.layers.3.self_attn.attn" in flagged[0].layer_names
 
 
+def _qwen4_exp_specs():
+    """Qwen4Exp hybrid cache with an unmarked MTP QSA layer registered last."""
+    common = dict(num_kv_heads=2, head_size=256, dtype=torch.float8_e4m3fn)
+    return {
+        "model.layers.0.self_attn.attn": FullAttentionSpec(
+            block_size=64, **common
+        ),
+        "model.layers.1.self_attn.attn": FullAttentionSpec(
+            block_size=64, **common
+        ),
+        "model.layers.2.linear_attn": new_mamba_spec(
+            block_size=64, mamba_cache_mode="align"
+        ),
+        "model.layers.3.linear_attn": new_mamba_spec(
+            block_size=64, mamba_cache_mode="align"
+        ),
+        "draft.mtp.layers.48.self_attn.attn": FullAttentionSpec(
+            block_size=64, **common
+        ),
+    }
+
+
+def test_qwen4_exp_draft_group_annotated_on_packed_path():
+    groups = get_kv_cache_groups(
+        _spec_decode_grouping_config(method="mtp", model_type="qwen4_exp"),
+        _qwen4_exp_specs(),
+    )
+
+    flagged = [group for group in groups if group.is_eagle_group]
+    assert len(flagged) == 1
+    assert "draft.mtp.layers.48.self_attn.attn" in flagged[0].layer_names
+    assert not any(
+        group.is_eagle_group and isinstance(group.kv_cache_spec, MambaSpec)
+        for group in groups
+    )
+
+
+def test_qwen4_exp_annotation_requires_model_type():
+    groups = get_kv_cache_groups(
+        _spec_decode_grouping_config(method="mtp", model_type="other"),
+        _qwen4_exp_specs(),
+    )
+
+    assert not any(group.is_eagle_group for group in groups)
+
+
 def test_deepseek_v4_annotation_requires_model_type():
     # The positional rule is only sound for DeepseekV4, where the draft layer
     # is known to be registered last. Without that model gate nothing may be
