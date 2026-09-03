@@ -581,6 +581,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        splitting_op = "vllm::qwen4_exp_amd_ple"
+        if (
+            compilation_config.splitting_ops is not None
+            and splitting_op not in compilation_config.splitting_ops
+        ):
+            compilation_config.splitting_ops.append(splitting_op)
 
     def _get_embedding_weight_scale(self) -> torch.Tensor | None:
         embedding = getattr(self.ple_embedding, "ngram_embedding", None)
@@ -1164,6 +1170,33 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         return gated_value.flatten(-2) + conv_output
 
 
+def qwen4_exp_amd_ple(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Run the complete CPU-backed PLE layer outside Inductor graphs."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpPLELayer):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+    result = layer(hidden_states, input_ids, query_start_loc, ngram_context)
+    output.copy_(result)
+
+
+def qwen4_exp_amd_ple_fake(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_amd_ple_ngram_embedding(
     ngram_ids: torch.Tensor,
     output: torch.Tensor,
@@ -1205,6 +1238,14 @@ def qwen4_exp_ple_short_conv_fake(
     layer_name: str,
 ) -> None:
     return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_amd_ple",
+    op_func=qwen4_exp_amd_ple,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_amd_ple_fake,
+)
 
 
 direct_register_custom_op(

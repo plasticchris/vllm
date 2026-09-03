@@ -126,3 +126,31 @@ def test_amd_ple_fp8_ngram_forward_preserves_storage_dtype(monkeypatch) -> None:
 
     assert observed_dtypes == [torch.float8_e4m3fn]
     assert output.dtype == torch.float8_e4m3fn
+
+
+def test_complete_amd_ple_boundary_writes_output(monkeypatch) -> None:
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    expected = torch.randn(2, 4)
+    monkeypatch.setattr(
+        Qwen4ExpPLELayer,
+        "forward",
+        lambda self, hidden_states, input_ids, query_start_loc, ngram_context: expected,
+    )
+    monkeypatch.setattr(
+        ple_layer_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"model.ple": layer}),
+    )
+    output = torch.empty_like(expected)
+
+    ple_layer_module.qwen4_exp_amd_ple(
+        torch.randn_like(expected),
+        torch.tensor([1, 2]),
+        torch.tensor([0, 2], dtype=torch.int32),
+        torch.tensor([[0]]),
+        output,
+        "model.ple",
+    )
+
+    torch.testing.assert_close(output, expected)

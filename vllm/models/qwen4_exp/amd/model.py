@@ -294,12 +294,19 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            hidden_states = hidden_states + self.ple(
+            # PLE owns a CPU-resident embedding lookup and request-shaped state.
+            # Keep the complete layer outside Inductor so those host transfers and
+            # symbolic request dimensions do not enter the compiled GPU graph.
+            ple_output = torch.empty_like(hidden_states)
+            torch.ops.vllm.qwen4_exp_amd_ple(
                 hidden_states,
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                ple_output,
+                self.ple.prefix,
             )
+            hidden_states = hidden_states + ple_output
 
         # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None and prev_injection is not None:
