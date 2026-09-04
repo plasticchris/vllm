@@ -41,6 +41,88 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from ..common.ple import PLEVocabParallelEmbedding
 
 
+_PLE_CPU_PIPELINE_STAGING: dict[tuple[int, torch.dtype, int, int], dict] = {}
+
+
+def _pipelined_cpu_embedding(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    chunk_rows: int,
+) -> torch.Tensor:
+    """Overlap pinned CPU embedding gathers with the preceding chunk's H2D."""
+    if input_.dim() == 0:
+        return F.embedding(input_.to(device="cpu"), weight).to(
+            device=input_.device, non_blocking=weight.is_pinned()
+        )
+    rows = input_.shape[0]
+    ids_per_row = input_.numel() // max(rows, 1)
+    embedding_dim = weight.shape[1]
+    device_index = input_.device.index or 0
+    key = (device_index, weight.dtype, ids_per_row, embedding_dim)
+    state = _PLE_CPU_PIPELINE_STAGING.get(key)
+    required_ids = input_.numel()
+    required_output = chunk_rows * ids_per_row * embedding_dim
+    if (
+        state is None
+        or state["ids"].numel() < required_ids
+        or state["outputs"][0].numel() < required_output
+    ):
+        state = {
+            "ids": torch.empty(required_ids, dtype=torch.long, pin_memory=True),
+            "outputs": [
+                torch.empty(
+                    required_output,
+                    dtype=weight.dtype,
+                    pin_memory=True,
+                )
+                for _ in range(2)
+            ],
+            "events": [torch.cuda.Event() for _ in range(2)],
+            "used": [False, False],
+            "stream": torch.cuda.Stream(device=input_.device),
+        }
+        _PLE_CPU_PIPELINE_STAGING[key] = state
+
+    ids_cpu = state["ids"][:required_ids]
+    current_stream = torch.cuda.current_stream(input_.device)
+    ids_cpu.copy_(input_.reshape(-1), non_blocking=True)
+    # The CPU gather cannot start until all n-gram IDs have arrived. This is the
+    # only required host synchronization; chunk output copies overlap below.
+    current_stream.synchronize()
+
+    output = torch.empty(
+        (*input_.shape, embedding_dim),
+        dtype=weight.dtype,
+        device=input_.device,
+    )
+    output_flat = output.view(-1, embedding_dim)
+    ids_cpu = ids_cpu.view(rows, ids_per_row)
+    copy_stream = state["stream"]
+    for chunk_index, start in enumerate(range(0, rows, chunk_rows)):
+        end = min(rows, start + chunk_rows)
+        slot = chunk_index & 1
+        if state["used"][slot]:
+            state["events"][slot].synchronize()
+        count = (end - start) * ids_per_row
+        cpu_output = state["outputs"][slot][: count * embedding_dim].view(
+            count, embedding_dim
+        )
+        torch.index_select(
+            weight,
+            0,
+            ids_cpu[start:end].reshape(-1),
+            out=cpu_output,
+        )
+        with torch.cuda.stream(copy_stream):
+            output_flat[start * ids_per_row : end * ids_per_row].copy_(
+                cpu_output, non_blocking=True
+            )
+            state["events"][slot].record(copy_stream)
+        state["used"][slot] = True
+    current_stream.wait_stream(copy_stream)
+    return output
+
+
 class Qwen4ExpPLEGroupedNorm(nn.Module):
     def __init__(
         self,
@@ -122,6 +204,9 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
 
     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
         if layer.weight.device.type == "cpu":
+            chunk_rows = int(os.getenv("VLLM_PLE_PIPELINE_CHUNK_ROWS", "0"))
+            if chunk_rows > 0 and not torch.cuda.is_current_stream_capturing():
+                return _pipelined_cpu_embedding(input_, layer.weight, chunk_rows)
             output = F.embedding(input_.to(device="cpu"), layer.weight)
             return output.to(
                 device=input_.device,

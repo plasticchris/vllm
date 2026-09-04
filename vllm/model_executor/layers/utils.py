@@ -275,14 +275,26 @@ _ROCBLAS_SKINNY_SHAPES = frozenset(
 )
 
 # wvSplitK's CuCount controls launched workgroups, not a hardware limit. The
-# default physical WGP count (48 on RX 7900 XTX) under-fills a few MTP3 verify
-# shapes. Repeated 9x1000-call medians selected these shape-specific counts:
-#   (N, M, K)       48 WGPs   tuned     gain
-#   (4, 6144, 2560) 35.09 us  34.51 us  1.7%
-#   (4, 2560, 6144) 42.05 us  37.35 us 11.2%
-#   (4, 4608, 4608) 48.79 us  48.01 us  1.6%
-# Smaller differences are deliberately left at the physical count.
+# default physical WGP count (48 on RX 7900 XTX) under-fills several exact
+# Qwen3.8 MTP widths. Five-run x 300-call medians selected the settings below;
+# only gains above 3% are added (plus the earlier MTP3 verify settings):
+#   (N, M, K)         tuned   microkernel gain
+#   (1/3/4, 320,10240) 112/80/96   8.1/32.1/31.9%
+#   (1/3/4,10240,320)  96/96/96    9.6/7.5/11.0%
+#   (1,2560,640)       96           5.0%
+#   (1/4,2560,2560)    96/80        3.9/4.2%
+#   (3/4,2560,6144)    32/128       3.2/8.4%
 _WVSPLITK_CU_OVERRIDES = {
+    (1, 320, 10240): 112,
+    (3, 320, 10240): 80,
+    (4, 320, 10240): 96,
+    (1, 10240, 320): 96,
+    (3, 10240, 320): 96,
+    (4, 10240, 320): 96,
+    (1, 2560, 640): 96,
+    (1, 2560, 2560): 96,
+    (4, 2560, 2560): 80,
+    (3, 2560, 6144): 32,
     (4, 6144, 2560): 128,
     (4, 2560, 6144): 128,
     (4, 4608, 4608): 112,

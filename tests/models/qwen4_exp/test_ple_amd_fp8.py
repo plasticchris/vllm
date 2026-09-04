@@ -154,3 +154,19 @@ def test_complete_amd_ple_boundary_writes_output(monkeypatch) -> None:
     )
 
     torch.testing.assert_close(output, expected)
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is None,
+    reason="requires a ROCm GPU",
+)
+@pytest.mark.parametrize("shape", [(17,), (37, 4), (1, 4)])
+def test_pipelined_cpu_embedding_matches_regular_lookup(shape) -> None:
+    ple_layer_module._PLE_CPU_PIPELINE_STAGING.clear()
+    weight = torch.randn(1000, 32, dtype=torch.float16).pin_memory()
+    input_ids = torch.randint(0, weight.shape[0], shape, device="cuda")
+
+    output = ple_layer_module._pipelined_cpu_embedding(input_ids, weight, 8)
+    expected = torch.nn.functional.embedding(input_ids.cpu(), weight).cuda()
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
