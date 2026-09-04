@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 from collections.abc import Callable
 from typing import Any, ParamSpec, TypeVar
 
@@ -17,6 +18,9 @@ from vllm.utils.system_utils import set_env_var
 from .ir.clone_elimination import UnsafeCloneEliminationPass
 from .ir.lowering_pass import VllmIRLoweringPass
 from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
+
+if current_platform.is_rocm():
+    from .fusion.allreduce_rms_fusion import RocmCustomAllReduceFusionPass
 
 if rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled():
     from .fusion.allreduce_rms_fusion import (
@@ -174,7 +178,12 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
 
             if self.pass_config.fuse_allreduce_rms:
-                if rocm_aiter_ops.is_enabled():
+                if (
+                    current_platform.is_rocm()
+                    and os.getenv("VLLM_ROCM_CUSTOM_AR_RMS") == "1"
+                ):
+                    self.passes += [RocmCustomAllReduceFusionPass(config)]
+                elif rocm_aiter_ops.is_enabled():
                     self.passes += [RocmAiterAllReduceFusionPass(config)]
                 else:
                     self.passes += [AllReduceFusionPass(config)]

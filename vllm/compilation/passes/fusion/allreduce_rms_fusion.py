@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import functools
+import importlib
+import os
+import sys
 from importlib.util import find_spec
 from types import ModuleType
 from typing import Any
@@ -83,6 +87,53 @@ def _norm_input_weight_dtype_match(match: pm.Match) -> bool:
 PDL_ADVANCE_LAUNCH_TOKENS = 16
 
 logger = init_logger(__name__)
+
+
+@functools.cache
+def _load_rocm_custom_ar_rms_extension():
+    extension_dir = os.getenv(
+        "VLLM_ROCM_CUSTOM_AR_RMS_EXT_PATH",
+        "/home/hz6bst/.cache/torch_extensions/py312_rocm7253211/rukhm_fused_ar_rmsnorm",
+    )
+    if extension_dir not in sys.path:
+        sys.path.insert(0, extension_dir)
+    return importlib.import_module("rukhm_fused_ar_rmsnorm")
+
+
+def _rocm_custom_fused_allreduce_rmsnorm_impl(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ca = get_tp_group().device_communicator.ca_comm
+    assert ca is not None and not ca.disabled, "vLLM custom allreduce is unavailable"
+    hidden = input_.shape[-1]
+    input_2d = input_.reshape(-1, hidden).contiguous()
+    residual_2d = residual.reshape(-1, hidden).contiguous()
+    ext = _load_rocm_custom_ar_rms_extension()
+    output, residual_output = ext.fused_ar_rmsnorm(
+        ca._ptr, input_2d, residual_2d, weight.contiguous(),
+        ca.buffer_ptrs[ca.rank], ca.max_size, epsilon,
+    )
+    return output.view_as(input_), residual_output.view_as(residual)
+
+
+def _rocm_custom_fused_allreduce_rmsnorm_fake(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(input_), torch.empty_like(residual)
+
+
+if current_platform.is_rocm() and os.getenv("VLLM_ROCM_CUSTOM_AR_RMS") == "1":
+    direct_register_custom_op(
+        op_name="rocm_custom_fused_allreduce_rmsnorm",
+        op_func=_rocm_custom_fused_allreduce_rmsnorm_impl,
+        fake_impl=_rocm_custom_fused_allreduce_rmsnorm_fake,
+    )
 
 flashinfer_comm: ModuleType | None = None
 if find_spec("flashinfer"):
@@ -1180,11 +1231,14 @@ class AiterAllreduceFusedRMSNormPattern(BasePattern, VllmPatternReplacement):
         dtype: torch.dtype,
         device: str | None,
         use_aiter_rmsnorm: bool = True,
+        fused_op: Any | None = None,
     ) -> None:
         super().__init__(dtype, device)
         self.dtype = dtype
         self.epsilon = epsilon
-        self.FUSED_AR_RMSNORM_OP = rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()
+        self.FUSED_AR_RMSNORM_OP = (
+            fused_op or rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()
+        )
 
     def get_inputs(self) -> list[torch.Tensor]:
         return [self.empty(5, 16), self.empty(16)]
@@ -1225,11 +1279,14 @@ class AiterAllreduceFusedAddRMSNormPattern(BasePattern, VllmPatternReplacement):
         dtype: torch.dtype,
         device: str | None,
         use_aiter_rmsnorm: bool = True,
+        fused_op: Any | None = None,
     ) -> None:
         super().__init__(dtype, device)
         self.epsilon = epsilon
         self.dtype = dtype
-        self.FUSED_AR_RMSNORM_OP = rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()
+        self.FUSED_AR_RMSNORM_OP = (
+            fused_op or rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()
+        )
 
     def get_inputs(self) -> list[torch.Tensor]:
         # input, residual, weight
@@ -1562,6 +1619,48 @@ class AiterAllreduceFusedAddRMSNormGroupQuantWithIndexerPattern(
             return quant_out, scale_out, residual_out, idx, bf16_norm
 
         return _replacement
+
+
+class RocmCustomAllReduceFusionPass(VllmFusionPatternMatcherPass):
+    """Fuse vLLM custom allreduce with RMSNorm on RDNA3 decode graphs."""
+
+    def __init__(self, config: VllmConfig) -> None:
+        super().__init__(config, "rocm_custom_allreduce_fusion_pass")
+        self.disabled = True
+        if get_tensor_model_parallel_world_size() <= 1 or config.model_config is None:
+            return
+        ca_comm = get_tp_group().device_communicator.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            logger.warning_once(
+                "RDNA custom allreduce-rmsnorm fusion disabled: custom allreduce unavailable"
+            )
+            return
+        self.max_token_num = min(36, config.scheduler_config.max_num_batched_tokens)
+        fused_op = torch.ops.vllm.rocm_custom_fused_allreduce_rmsnorm.default
+        for epsilon in [1e-5, 1e-6]:
+            self.register(AiterAllreduceFusedRMSNormPattern(
+                epsilon, self.model_dtype, self.device, fused_op=fused_op
+            ))
+            self.register(AiterAllreduceFusedAddRMSNormPattern(
+                epsilon, self.model_dtype, self.device, fused_op=fused_op
+            ))
+            self.register(AiterAllreduceFusedAddRMSNormOutputOnlyPattern(
+                epsilon, self.model_dtype, self.device, fused_op=fused_op
+            ))
+            torch._inductor.pattern_matcher._seen_patterns.clear()
+        self.disabled = False
+        self.dump_patterns(config, self.pm_pass)
+
+    def is_applicable_for_range(self, compile_range: Range) -> bool:
+        return not self.disabled and compile_range.end <= self.max_token_num
+
+    @VllmInductorPass.time_and_log
+    def __call__(self, graph: fx.Graph) -> None:
+        self.matched_count = self.pm_pass.apply(graph)
+        VllmPatternMatcherPass.match_table[self.pass_name] += self.matched_count
+        logger.debug(
+            "%s Replaced %s patterns", self.__class__.__name__, self.matched_count
+        )
 
 
 class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
