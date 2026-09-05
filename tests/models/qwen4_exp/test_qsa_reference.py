@@ -245,6 +245,8 @@ def _draft_qsa_metadata(
         logical_positions=torch.tensor(logical_positions, dtype=torch.int64),
         k_work_metadata=torch.empty(0, 2, dtype=torch.int32),
         num_actual_tokens=num_tokens,
+        max_seq_len=max(seq_lens),
+        compact_indexer=False,
         storage_block_size=storage_block_size,
         compress_ratio=compress_ratio,
     )

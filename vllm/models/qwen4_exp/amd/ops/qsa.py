@@ -742,6 +742,7 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -754,8 +755,16 @@ def qsa_select_paged_tokens(
     if not rows:
         return out
 
-    columns = page_table.shape[1] * k_cache.shape[1]
     block_topk = token_topk // compress_ratio
+    capacity = page_table.shape[1] * k_cache.shape[1]
+    columns = capacity
+    if max_seq_len is not None:
+        # Score only columns reachable by this batch. Keep enough columns for
+        # fixed-width top-k output and align the scoring tile without reading
+        # beyond the physical page-table capacity.
+        live_columns = triton.cdiv(max_seq_len, compress_ratio)
+        live_columns = max(block_topk, triton.cdiv(live_columns, 32) * 32)
+        columns = min(capacity, live_columns)
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
@@ -775,6 +784,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
             compress_ratio,
+            num_columns=columns,
         )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (

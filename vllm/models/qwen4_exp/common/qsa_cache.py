@@ -687,6 +687,8 @@ class QSAForwardMetadata(AttentionMetadata):
     logical_positions: torch.Tensor
     k_work_metadata: torch.Tensor
     num_actual_tokens: int
+    max_seq_len: int
+    compact_indexer: bool
     storage_block_size: int
     compress_ratio: int
 
@@ -715,6 +717,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         else:
             self.compress_ratio = 1
         self.storage_block_size = kv_cache_spec.num_states
+        self.max_decode_query_len = 1 + vllm_config.num_speculative_tokens
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_buffer = torch.empty(
             max_tokens, dtype=torch.int32, device=device
@@ -779,6 +782,10 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             logical_positions=logical_positions,
             k_work_metadata=k_work_metadata,
             num_actual_tokens=num_tokens,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            compact_indexer=(
+                common_attn_metadata.max_query_len > self.max_decode_query_len
+            ),
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
         )
