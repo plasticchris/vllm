@@ -13,10 +13,10 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.ops.triton_unified_attention import _cast_kv_tile
 
-# Keep enough VRAM headroom for prefix-cache graphs and allocator fragmentation.
-# Long prefills are tiled below, so this bounds the per-layer score matrix
-# without changing the selected indices.
-_LOGITS_WORKSPACE_BYTES = 32 * 1024 * 1024
+# Bound the per-layer score matrix; long prefills are tiled below without
+# changing selected indices. Production reserves another 95.4 MiB/GPU by
+# lowering its KV-cache budget before restoring this larger tile.
+_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
