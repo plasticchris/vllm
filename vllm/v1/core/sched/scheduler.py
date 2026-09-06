@@ -1003,7 +1003,14 @@ class Scheduler(SchedulerInterface):
                 selected = lower_tokens
                 acceptance_gated = True
 
-            if step % self.profitability_exploration_interval == 0:
+            # Low-acceptance K3 probes create visible latency spikes because
+            # they run an extra draft pass precisely when most draft work is
+            # discarded. Probe less often while acceptance-gated, but retain a
+            # bounded recovery path if the generated content becomes easier.
+            exploration_interval = self.profitability_exploration_interval
+            if acceptance_gated:
+                exploration_interval *= 32
+            if step % exploration_interval == 0:
                 selected = base_tokens if selected == lower_tokens else lower_tokens
                 exploration = True
                 acceptance_gated = False

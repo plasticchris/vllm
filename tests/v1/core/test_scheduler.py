@@ -373,8 +373,14 @@ def test_profitability_acceptance_gate_periodically_probes_k3():
     scheduler._spec_request_profitability_history[2].extend([1.0, 1.0])
     scheduler._spec_request_profitability_history[3].extend([1.5, 1.5])
     scheduler._spec_acceptance_history.extend([0.2, 0.3])
+    # An acceptance-gated request probes at 32x the normal cadence, avoiding
+    # regular slow K3 steps while still allowing recovery on changed content.
     scheduler._spec_profitability_steps[1] = 3
+    assert scheduler._profitability_adjusted_spec_tokens(1, 3, ["req"]) == 2
+    assert scheduler._last_spec_profitability_exploration is False
+    assert scheduler._last_spec_profitability_acceptance_gated is True
 
+    scheduler._spec_profitability_steps[1] = 127
     assert scheduler._profitability_adjusted_spec_tokens(1, 3, ["req"]) == 3
     assert scheduler._last_spec_profitability_exploration is True
     assert scheduler._last_spec_profitability_acceptance_gated is False
