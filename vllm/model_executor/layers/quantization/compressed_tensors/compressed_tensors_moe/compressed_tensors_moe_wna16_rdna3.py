@@ -11,6 +11,8 @@ Weight format (per expert, same as dense RDNA3 W4A16):
   - Zero points ``[E, groups, N/8]`` packed int32 (synthesized)
 """
 
+import os
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -181,7 +183,9 @@ def _rdna3_fused_moe(
         global_num_experts = layer.w13_weight_packed.shape[0]
 
     # BLOCK_SIZE_M=1 for decode (small M), 4 for prefill
-    block_size_m = 1 if num_tokens <= 4 else 4
+    block_size_m = 1 if num_tokens <= 4 else (
+        8 if os.environ.get("VLLM_ROCM_RDNA3_NATIVE_MOE") else 4
+    )
 
     # --- Token routing ---
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(

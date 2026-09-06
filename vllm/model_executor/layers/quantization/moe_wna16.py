@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import torch
@@ -10,6 +11,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
+    MoEActivation,
     RoutedExperts,
     SharedExperts,
 )
@@ -399,6 +401,14 @@ class MoeWNA16Method(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if os.environ.get("VLLM_ROCM_RDNA3_NATIVE_MOE", "0") in (
+            "1",
+            "true",
+            "yes",
+        ):
+            self._process_rdna3_native_weights(layer)
+            return
+
         has_zp = self.quant_config.has_zp
         converted = convert_to_wna16_moe_kernel_format(
             backend=self.wna16_backend,
@@ -466,6 +476,86 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
         self._setup_kernel(layer)
 
+    def _process_rdna3_native_weights(self, layer: RoutedExperts) -> None:
+        if (
+            self.quant_config.weight_bits != 4
+            or self.quant_config.has_zp
+            or not current_platform.is_rocm()
+        ):
+            raise ValueError(
+                "VLLM_ROCM_RDNA3_NATIVE_MOE requires symmetric INT4 on ROCm"
+            )
+        from vllm import _custom_ops as ops
+        from vllm import _rocm_C  # noqa: F401
+
+        if not hasattr(torch.ops._rocm_C, "moe_gptq_gemm_rdna3"):
+            raise ValueError("native gfx1100 MoE kernel is not built")
+        # AutoRound/GPTQ stores uint8 [E, N, K/2]. The native gfx1100 kernel
+        # consumes shuffled int32 [E, K/8, N]. Repack without changing nibbles.
+        def repack(weight: torch.Tensor) -> torch.Tensor:
+            assert weight.dtype == torch.uint8 and weight.is_contiguous()
+            packed = weight.view(torch.int32).transpose(1, 2).contiguous()
+            empty_g_idx = torch.empty(0, dtype=torch.int32, device=weight.device)
+            for expert in range(packed.shape[0]):
+                ops.gptq_shuffle(packed[expert], empty_g_idx, 4)
+            return packed
+
+        w13_qweight = repack(layer.w13_qweight.data)
+        w2_qweight = repack(layer.w2_qweight.data)
+        w13_scales = layer.w13_scales.transpose(1, 2).contiguous()
+        w2_scales = layer.w2_scales.transpose(1, 2).contiguous()
+        replace_parameter(
+            layer,
+            "w13_qweight",
+            torch.nn.Parameter(w13_qweight, requires_grad=False),
+        )
+        replace_parameter(
+            layer,
+            "w2_qweight",
+            torch.nn.Parameter(w2_qweight, requires_grad=False),
+        )
+        replace_parameter(
+            layer,
+            "w13_scales",
+            torch.nn.Parameter(w13_scales, requires_grad=False),
+        )
+        replace_parameter(
+            layer,
+            "w2_scales",
+            torch.nn.Parameter(w2_scales, requires_grad=False),
+        )
+
+        # Alias the parameter names expected by the native CompressedTensors
+        # runner without registering duplicate state-dict entries.
+        object.__setattr__(layer, "w13_weight_packed", layer.w13_qweight)
+        object.__setattr__(layer, "w2_weight_packed", layer.w2_qweight)
+        object.__setattr__(layer, "w13_weight_scale", layer.w13_scales)
+        object.__setattr__(layer, "w2_weight_scale", layer.w2_scales)
+        # Empty zero-point tensors select the symmetric INT4 fast path in the
+        # native kernel (implicit dequantization zero point 8).
+        empty_qzeros = torch.empty(0, dtype=torch.int32, device=w13_qweight.device)
+        object.__setattr__(layer, "w13_qzeros", empty_qzeros)
+        object.__setattr__(layer, "w2_qzeros", empty_qzeros)
+
+        max_decode_tokens = 16
+        max_topk = max(10, self.moe.experts_per_token)
+        rows = max_decode_tokens * max_topk
+        gate_up = w13_qweight.shape[2]
+        intermediate = gate_up // 2
+        hidden = w2_qweight.shape[2]
+        layer.rdna3_w1_buf = torch.zeros(
+            rows, gate_up, dtype=w13_scales.dtype, device=w13_scales.device
+        )
+        layer.rdna3_act_buf = torch.empty(
+            rows, intermediate, dtype=w13_scales.dtype, device=w13_scales.device
+        )
+        layer.rdna3_out_buf = torch.zeros(
+            max_decode_tokens, hidden, dtype=w13_scales.dtype, device=w13_scales.device
+        )
+        layer.rdna3_empty_tw = torch.empty(0, device=w13_scales.device)
+        self._rdna3_native = True
+        self.moe_kernel = None
+
     def apply(
         self,
         layer: RoutedExperts,
@@ -476,6 +566,25 @@ class MoeWNA16Method(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert not self.is_monolithic
+        if getattr(self, "_rdna3_native", False):
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_rdna3 import (  # noqa: E501
+                _rdna3_fused_moe,
+            )
+
+            return _rdna3_fused_moe(
+                x,
+                topk_weights,
+                topk_ids,
+                layer=layer,
+                activation=(
+                    layer.activation
+                    if isinstance(layer.activation, MoEActivation)
+                    else MoEActivation.from_str(layer.activation)
+                ),
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+            )
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(
             x,
