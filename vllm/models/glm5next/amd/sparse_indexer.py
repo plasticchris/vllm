@@ -681,10 +681,11 @@ class SparseAttnIndexerKpool(CustomOp):
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
-        if not rocm_aiter_ops.is_enabled():
+        if index_kpool <= 1 and not rocm_aiter_ops.is_enabled():
             raise RuntimeError(
-                "Sparse attention indexer ROCm path is only supported on AITER. "
-                "Please enable aiter with VLLM_ROCM_USE_AITER=1"
+                "Sparse attention indexer ROCm path requires AITER when "
+                "index_kpool <= 1. Please enable AITER with "
+                "VLLM_ROCM_USE_AITER=1"
             )
         if index_kpool <= 1:
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
