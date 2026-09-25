@@ -10,6 +10,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx1100
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.ops.triton_unified_attention import _cast_kv_tile
 
@@ -18,6 +19,35 @@ from vllm.v1.attention.ops.triton_unified_attention import _cast_kv_tile
 # lowering its KV-cache budget before restoring this larger tile.
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+# The gfx1100 torch top-k runs beside a full logits tile, so its temporaries
+# must fit the same small VRAM reserve as the native kernel's workspace.
+_TORCH_TOPK_SLICE_BYTES = 8 * 1024 * 1024
+
+
+def _torch_top_k_per_row_decode(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    indices: torch.Tensor,
+    topk: int,
+) -> None:
+    """Stable gfx1100 replacement for the native ragged-row top-k.
+
+    Masks ``logits`` in place.
+    """
+    num_rows, width = logits.shape
+    k = min(topk, width)
+    columns = torch.arange(width, device=logits.device)
+    ranks = torch.arange(k, device=logits.device)
+    rows_per_slice = max(1, _TORCH_TOPK_SLICE_BYTES // max(width, 1))
+    indices[:num_rows].fill_(-1)
+    for start in range(0, num_rows, rows_per_slice):
+        end = min(start + rows_per_slice, num_rows)
+        row_ends = visible_blocks[start:end].to(torch.int64).clamp_(min=0, max=width)
+        rows = logits[start:end]
+        rows.masked_fill_(columns >= row_ends.unsqueeze(1), float("-inf"))
+        selected = rows.topk(k, dim=-1, sorted=True).indices
+        selected.masked_fill_(ranks >= row_ends.clamp(max=k).unsqueeze(1), -1)
+        indices[start:end, :k].copy_(selected)
 
 
 @triton.jit
@@ -797,7 +827,14 @@ def qsa_select_paged_tokens(
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
-        if use_cooperative_topk:
+        if on_gfx1100():
+            _torch_top_k_per_row_decode(
+                logits,
+                visible_blocks,
+                blocks,
+                block_topk,
+            )
+        elif use_cooperative_topk:
             torch.ops._C.cooperative_topk(
                 logits,
                 visible_blocks,
