@@ -136,6 +136,7 @@ MoEBackend = Literal[
     "marlin",
     "humming",
     "triton_unfused",
+    "triton_w4a16",
     "aiter",
     "flydsl",
     "hpc",
@@ -259,6 +260,8 @@ class KernelConfig:
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels
+    - "triton_w4a16": Use the Triton MXFP4 W4A16 kernel that decodes weights
+      in-kernel, for GPUs without native MX support (ROCm only)
     - "aiter": Use AMD AITer kernels (ROCm only)
     - "flydsl": Use AMD FlyDSL kernels (ROCm only)
     - "hpc": Use HPC kernels (FP8 and Hopper only)

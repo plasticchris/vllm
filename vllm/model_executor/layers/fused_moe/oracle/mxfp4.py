@@ -124,6 +124,8 @@ class Mxfp4MoeBackend(Enum):
     # Triton
     TRITON = "TRITON"
     TRITON_UNFUSED = "TRITON_UNFUSED"
+    # W4A16 fused_moe-style kernel that decodes MXFP4 in-kernel (no native MX)
+    TRITON_MXFP4_BF16 = "TRITON_MXFP4_BF16"
     # XPU
     XPU = "XPU"
     # CPU
@@ -203,6 +205,13 @@ def backend_to_kernel_cls(
         )
 
         return [UnfusedOAITritonExperts]
+
+    elif backend == Mxfp4MoeBackend.TRITON_MXFP4_BF16:
+        from vllm.model_executor.layers.fused_moe.experts.triton_mxfp4_moe import (
+            TritonMxfp4W4A16Experts,
+        )
+
+        return [TritonMxfp4W4A16Experts]
 
     elif backend == Mxfp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
@@ -297,6 +306,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
         "flashinfer_cutlass_afp8": [Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8],
         "triton": [Mxfp4MoeBackend.TRITON],
         "triton_unfused": [Mxfp4MoeBackend.TRITON_UNFUSED],
+        "triton_w4a16": [Mxfp4MoeBackend.TRITON_MXFP4_BF16],
         "humming": [Mxfp4MoeBackend.HUMMING],
         "marlin": [Mxfp4MoeBackend.MARLIN],
         "aiter": [
@@ -350,6 +360,7 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     if current_platform.is_rocm():
         return [
             Mxfp4MoeBackend.AITER_MXFP4_BF16,
+            Mxfp4MoeBackend.TRITON_MXFP4_BF16,
             Mxfp4MoeBackend.EMULATION,
         ]
     if current_platform.is_xpu():
@@ -721,9 +732,9 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         # b12x plans for the exact model dimensions. B12xExperts validates the
         # required MXFP4 block alignment before selecting the backend.
         return hidden_size, intermediate_size
-    if backend == Mxfp4MoeBackend.EMULATION:
-        # Emulation has no kernel tile; it only needs OCP MX block alignment so the
-        # per-block scale buffers (`dim // OCP_MX_BLOCK_SIZE`) aren't floor-truncated
+    if backend in (Mxfp4MoeBackend.EMULATION, Mxfp4MoeBackend.TRITON_MXFP4_BF16):
+        # Neither has a fixed kernel tile; both only need OCP MX block alignment so
+        # the per-block scale buffers (`dim // OCP_MX_BLOCK_SIZE`) aren't truncated
         # by a non-block-aligned TP/DP shard (e.g. 2880 // 4 = 720).
         intermediate_size = round_up(intermediate_size, OCP_MX_BLOCK_SIZE)
         hidden_size = round_up(hidden_size, OCP_MX_BLOCK_SIZE)
@@ -1758,9 +1769,11 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     elif mxfp4_backend in (
         Mxfp4MoeBackend.XPU,
         Mxfp4MoeBackend.EMULATION,
+        Mxfp4MoeBackend.TRITON_MXFP4_BF16,
     ):
-        # No additional transformation is needed: XPU consumes the checkpoint
-        # layout directly, while emulation dequantizes that layout at runtime.
+        # No additional transformation is needed: XPU and TRITON_MXFP4_BF16
+        # consume the checkpoint layout directly, while emulation dequantizes
+        # that layout at runtime.
         return (
             w13_weight,
             w2_weight,
@@ -1888,6 +1901,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.BATCHED_MARLIN,
         Mxfp4MoeBackend.TRITON,
         Mxfp4MoeBackend.TRITON_UNFUSED,
+        Mxfp4MoeBackend.TRITON_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
