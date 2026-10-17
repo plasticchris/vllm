@@ -6,6 +6,8 @@ Selects architecture-specific native HIP MoE kernels in priority order.
 Falls back to the Triton WNA16 path when no native kernel is available.
 """
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -15,6 +17,13 @@ logger = init_logger(__name__)
 
 def is_supported(weight_quant) -> bool:
     """Check if a native ROCm MoE kernel is available for this config."""
+    if os.getenv("VLLM_ROCM_RDNA3_NATIVE_MOE", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
     if weight_quant.num_bits != 4:
         return False
 

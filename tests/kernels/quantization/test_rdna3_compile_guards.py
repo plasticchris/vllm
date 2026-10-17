@@ -370,6 +370,14 @@ class _FakeWeightQuant:
 class TestMoEDispatchMocked:
     """Mock on_gfx1100() to False and verify RDNA3 MoE is unreachable."""
 
+    def test_is_supported_respects_disabled_env(self, monkeypatch):
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+            rocm_moe_rdna,
+        )
+
+        monkeypatch.setenv("VLLM_ROCM_RDNA3_NATIVE_MOE", "0")
+        assert rocm_moe_rdna.is_supported(_FakeWeightQuant(num_bits=4)) is False
+
     def test_is_supported_false_when_mocked_cdna(self):
         """rocm_moe_rdna.is_supported() must return False when not on gfx1100."""
         from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
