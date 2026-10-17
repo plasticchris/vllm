@@ -48,6 +48,8 @@ def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch):
         ((4, 6144, 2560), 128),
         ((4, 2560, 6144), 128),
         ((4, 4608, 4608), 112),
+        ((1, 62080, 5120), 96),
+        ((5, 62080, 5120), 96),
     ],
 )
 def test_rocm_unquantized_gemm_uses_tuned_wvsplitk_cu_count(

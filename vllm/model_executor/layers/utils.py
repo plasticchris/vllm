@@ -284,6 +284,11 @@ _ROCBLAS_SKINNY_SHAPES = frozenset(
 #   (1,2560,640)       96           5.0%
 #   (1/4,2560,2560)    96/80        3.9/4.2%
 #   (3/4,2560,6144)    32/128       3.2/8.4%
+# The 3.8-27B (vocab 248320/4) lm_head is bandwidth-bound at its full width:
+# interleaved 7-round A/B at (62080, 5120) gives 993->749 us (n=1, -24.5%) and
+# 919->754 us (n=5, -18.0%), while n>=8 stays within noise of 48. n=1 is the
+# MTP draft step (one draft token per rank, local argmax), so this runs every
+# speculative step. See /mnt/scratch/vllm/opt-20261017/FINDINGS.md.
 _WVSPLITK_CU_OVERRIDES = {
     (1, 320, 10240): 112,
     (3, 320, 10240): 80,
@@ -298,6 +303,8 @@ _WVSPLITK_CU_OVERRIDES = {
     (4, 6144, 2560): 128,
     (4, 2560, 6144): 128,
     (4, 4608, 4608): 112,
+    (1, 62080, 5120): 96,
+    (5, 62080, 5120): 96,
 }
 
 
