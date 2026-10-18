@@ -145,16 +145,15 @@ def _make_adaptive_core(request_counts, overlap=True):
     core.prefill_schedule_adaptive_min_token_budget = 816
     core.prefill_schedule_adaptive_max_wait_seconds = 10.0
     core.prefill_schedule_adaptive_reset_seconds = 30.0
-    core._adaptive_prefill_interval = (
-        core.prefill_schedule_high_load_interval
-        or core.prefill_schedule_interval
-    )
+    core._adaptive_prefill_interval = core.prefill_schedule_interval
     # max budget is the DECODE-ACTIVE budget (3072), not the high-load floor.
     core._adaptive_prefill_max_budget = (
         core.decode_active_prefill_token_budget
         or core.decode_active_prefill_high_load_token_budget
     )
     core._adaptive_prefill_budget = core._adaptive_prefill_max_budget
+    core._adaptive_min_prefill_step_ms = None
+    core._adaptive_prefill_step_by_budget = {}
     core._adaptive_prefill_latencies = deque(maxlen=128)
     core._adaptive_decode_latencies = deque(maxlen=128)
     core._prefill_ms_per_token_samples = deque(maxlen=128)
@@ -255,6 +254,45 @@ def test_engine_core_adaptive_prefill_penalty_control():
     assert core._adaptive_prefill_interval > before_interval
     assert core._adaptive_prefill_budget < before_budget or \
         core._adaptive_prefill_budget == 816
+
+
+def test_engine_core_adaptive_prefill_cold_start_not_big_steps():
+    """Cold start must NOT pair the 3072 budget with the 128 high-load
+    interval: 3072 tokens every 128 steps is a ~9s prefill step, and
+    co-running decodes freeze for the whole step (2026-10-18 second-order
+    bug — the first multi-agent run on the concurrency fix stalled decode
+    exactly like this). The overlap tier starts at the base interval (4).
+    """
+    core = _make_adaptive_core((2, 1))
+    core._should_throttle_prefills()
+    assert core._adaptive_control_tier == "overlap"
+    assert core._adaptive_prefill_interval == 4
+    assert core._current_prefill_token_budget() == 3072
+
+
+def test_engine_core_adaptive_prefill_target_floor():
+    """When even the smallest prefill step exceeds the target (816 tokens
+    ≈ 2.4s on qwen3.8), the target is floored at 1.2x the min-step cost:
+    the floor budget at the min interval is the STABLE steady state, and
+    the controller must not keep widening interval / shrinking budget
+    toward an unreachable goal."""
+    core = _make_adaptive_core((2, 1))
+    core._should_throttle_prefills()
+
+    # 16 decode-only steps: baseline p99 100ms, warm gate filled.
+    for _ in range(16):
+        _observe_step(core, 100.0, 0)
+
+    # 16 prefill steps at 816 tokens / 2400ms: penalty 2300ms >> 250ms
+    # target, but the target is floored to max(250, 2400*1.2) = 2880ms.
+    for _ in range(16):
+        _observe_step(core, 2400.0, 816)
+    before_interval = core._adaptive_prefill_interval
+    before_budget = core._adaptive_prefill_budget
+    for _ in range(16):
+        _observe_step(core, 2400.0, 816)
+    assert core._adaptive_prefill_interval == before_interval
+    assert core._adaptive_prefill_budget == before_budget
 
 
 def test_decode_prefill_arrival_gap():

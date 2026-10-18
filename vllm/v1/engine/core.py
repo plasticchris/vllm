@@ -159,20 +159,22 @@ class EngineCore:
         self.prefill_schedule_adaptive_reset_seconds = (
             scheduler_config.prefill_schedule_adaptive_reset_seconds
         )
-        self._adaptive_prefill_interval = (
-            self.prefill_schedule_high_load_interval
-            or self.prefill_schedule_interval
-        )
+        self._adaptive_prefill_interval = self.prefill_schedule_interval
         # Normal-overlap ceiling is the decode-active budget (e.g. 3072);
         # the high-load budget (e.g. 816) is the FLOOR under high load, not
         # the ceiling — using it as the ceiling pinned prefill at 816 tok
         # per step even when the controller had no pressure to shrink
-        # (2026-10-18 concurrency fix).
+        # (2026-10-18 concurrency fix). Cold-start the interval at the BASE
+        # cadence, not the high-load one: starting at 128 with the 3072
+        # budget makes ~9s prefill steps (2026-10-18 second-order bug;
+        # decodes froze 9s each).
         self._adaptive_prefill_max_budget = (
             self.decode_active_prefill_token_budget
             or self.decode_active_prefill_high_load_token_budget
         )
         self._adaptive_prefill_budget = self._adaptive_prefill_max_budget
+        self._adaptive_min_prefill_step_ms: float | None = None
+        self._adaptive_prefill_step_by_budget = {}
         self._adaptive_prefill_latencies = deque(
             maxlen=scheduler_config.prefill_schedule_adaptive_window
         )
@@ -858,7 +860,6 @@ class EngineCore:
         get_decode_gap = getattr(scheduler, "get_decode_gap_p99_ms", None)
         decode_gap_p99 = get_decode_gap() if get_decode_gap is not None else None
         self._adaptive_decode_gap_p99_ms = decode_gap_p99
-        self._adaptive_control_p99_ms = decode_gap_p99 or model_step_p99
         if scheduler_output.scheduled_prefill_tokens <= 0:
             self._adaptive_decode_latencies.append(elapsed_ms)
             if len(self._adaptive_decode_latencies) >= 4:
@@ -873,6 +874,21 @@ class EngineCore:
             prefill_costs.append(
                 elapsed_ms / scheduler_output.scheduled_prefill_tokens
             )
+        # Track the cheapest step per budget level for the target floor.
+        scheduled_tokens = getattr(
+            scheduler_output, "scheduled_prefill_tokens", 0
+        )
+        step_by_budget = getattr(self, "_adaptive_prefill_step_by_budget", None)
+        if step_by_budget is None:
+            step_by_budget = self._adaptive_prefill_step_by_budget = {}
+        previous = step_by_budget.get(scheduled_tokens)
+        if previous is None or elapsed_ms < previous:
+            step_by_budget[scheduled_tokens] = elapsed_ms
+        if len(step_by_budget) > 32:
+            for key in sorted(step_by_budget)[:-32]:
+                del step_by_budget[key]
+        min_step = min(step_by_budget.values()) if step_by_budget else None
+        self._adaptive_min_prefill_step_ms = min_step
         self._adaptive_prefill_latencies.append(elapsed_ms)
         self._adaptive_prefill_observations += 1
         self._adaptive_prefill_p99_ms = EngineCore._latency_p99(
@@ -884,6 +900,16 @@ class EngineCore:
             max(prefill_p99 - baseline, 0.0)
             if baseline is not None and prefill_p99 is not None
             else None
+        )
+        # Control signal (set AFTER the penalty override, 2026-10-18): the
+        # prefill penalty, falling back to the decode gap / model step only
+        # when no baseline exists yet. The old code assigned the absolute
+        # decode gap here, so the penalty override below never reached the
+        # decision.
+        self._adaptive_control_p99_ms = (
+            self._adaptive_prefill_penalty_p99_ms
+            if self._adaptive_prefill_penalty_p99_ms is not None
+            else (decode_gap_p99 or model_step_p99)
         )
         cold_start = getattr(self, "_adaptive_cold_start", False)
         if (
@@ -905,6 +931,14 @@ class EngineCore:
         penalty = getattr(self, "_adaptive_prefill_penalty_p99_ms", None)
         if penalty is not None:
             control_p99 = penalty
+        # The target is unreachable when even the SMALLEST prefill step
+        # (min token budget) exceeds it: the controller would grind the
+        # budget to the floor and stop there instead of settling. Floor the
+        # target at the observed min-step cost so the floor state is the
+        # steady state (2026-10-18 second-order fix).
+        min_step_ms = getattr(self, "_adaptive_min_prefill_step_ms", None)
+        if min_step_ms is not None:
+            target = max(target, min_step_ms * 1.2)
         self._adaptive_cold_start = False
         if control_p99 > target:
             self._adaptive_prefill_healthy_windows = 0
@@ -1010,11 +1044,12 @@ class EngineCore:
         return selected
 
     def _reset_adaptive_prefill_control(self) -> None:
-        self._adaptive_prefill_interval = (
-            self.prefill_schedule_high_load_interval
-            or self.prefill_schedule_interval
-        )
+        # Base cadence, not high-load (matches the constructor; a reset
+        # re-enters the overlap tier through _activate_adaptive_prefill_tier).
+        self._adaptive_prefill_interval = self.prefill_schedule_interval
         self._adaptive_prefill_budget = self._adaptive_prefill_max_budget
+        self._adaptive_min_prefill_step_ms = None
+        self._adaptive_prefill_step_by_budget = {}
         self._adaptive_prefill_latencies.clear()
         self._adaptive_decode_latencies.clear()
         self._adaptive_high_load_latencies.clear()
