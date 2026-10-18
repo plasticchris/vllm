@@ -255,6 +255,19 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        # Keep the engine's base in step with the scheduler's: the scheduler
+        # clamps a launcher-tuned mamba prefill subblock that stopped dividing
+        # the cache block (the block shifts with the speculative depth), and
+        # the adaptive tiers (base/2, base*2) are derived from this base.
+        if (
+            self.mamba_prefill_subblock_tokens is not None
+            and scheduler_block_size % self.mamba_prefill_subblock_tokens != 0
+        ):
+            from vllm.v1.core.sched.scheduler import clamp_mamba_subblock_to_block
+
+            self.mamba_prefill_subblock_tokens = clamp_mamba_subblock_to_block(
+                scheduler_block_size, self.mamba_prefill_subblock_tokens
+            )
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion

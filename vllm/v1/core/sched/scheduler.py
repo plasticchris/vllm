@@ -77,6 +77,24 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def clamp_mamba_subblock_to_block(block_size: int, requested: int) -> int:
+    """Largest divisor of ``block_size // 2`` that is <= ``requested``.
+
+    The Mamba cache block size shifts with the speculative depth: the
+    mamba conv state grows one row per draft token and the attention
+    block is padded to whole attention pages to hold the mamba page, so
+    a base tuned for one depth (e.g. 408 for the 816-token block at
+    K=4) stops dividing the block when the depth changes (the 800-token
+    block at flat K=2). Clamping to a divisor of block/2 keeps the base
+    and both adaptive tiers (base/2, base*2) dividing the cache block.
+    """
+    half = block_size // 2
+    for candidate in range(min(requested, half), 0, -1):
+        if half % candidate == 0:
+            return candidate
+    return 1
+
+
 class _TsvTrace:
     def __init__(self, path: str | None, columns: str, flush_interval: float = 1):
         self.path = path
@@ -460,16 +478,27 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        self.mamba_prefill_subblock_tokens = (
-            self.scheduler_config.mamba_prefill_subblock_tokens
-        )
+        requested_subblock = self.scheduler_config.mamba_prefill_subblock_tokens
         if (
-            self.mamba_prefill_subblock_tokens is not None
-            and self.block_size % self.mamba_prefill_subblock_tokens != 0
+            requested_subblock is not None
+            and self.block_size % requested_subblock != 0
         ):
-            raise ValueError(
-                "mamba_prefill_subblock_tokens must divide the Mamba cache block"
+            # The block size shifts with the speculative depth (see
+            # clamp_mamba_subblock_to_block), so a launcher-tuned base can
+            # stop dividing it. Clamp instead of dead-ending startup.
+            self.mamba_prefill_subblock_tokens = clamp_mamba_subblock_to_block(
+                self.block_size, requested_subblock
             )
+            logger.warning(
+                "mamba_prefill_subblock_tokens=%d does not divide the Mamba "
+                "cache block %d (it shifts with the speculative depth); "
+                "clamping to %d",
+                requested_subblock,
+                self.block_size,
+                self.mamba_prefill_subblock_tokens,
+            )
+        else:
+            self.mamba_prefill_subblock_tokens = requested_subblock
         self.mamba_has_prefill_checkpoint_blocks = (
             self.has_mamba_layers
             and not self.use_eagle
