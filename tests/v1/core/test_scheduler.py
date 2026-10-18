@@ -120,6 +120,143 @@ def test_engine_core_high_load_prefill_policy():
     assert core._current_prefill_token_budget() == 3072
 
 
+def _make_adaptive_core(request_counts, overlap=True):
+    """EngineCore stub with the adaptive prefill controller configured like
+    serve-qwen38-27b-direct.sh (2026-10-18 concurrency fix)."""
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = Mock()
+    core.scheduler.get_request_counts.return_value = request_counts
+    core.scheduler.has_decode_prefill_overlap.return_value = overlap
+    core.scheduler.get_max_decode_tokens.return_value = 128
+    core.scheduler.get_decode_prefill_arrival_gap.return_value = 2.0
+    core.scheduler.get_oldest_prefill_wait_seconds.return_value = 0.0
+    core.scheduler.get_decode_gap_p99_ms.return_value = None
+    core.prefill_schedule_interval = 4
+    core.prefill_schedule_high_load_interval = 128
+    core.prefill_schedule_high_load_threshold = 8
+    core.prefill_schedule_high_load_decode_tokens = 8
+    core.prefill_schedule_high_load_decode_lead_seconds = 1.0
+    core.decode_active_prefill_token_budget = 3072
+    core.decode_active_prefill_high_load_token_budget = 816
+    core.prefill_schedule_adaptive_target_ms = 250.0
+    core.prefill_schedule_adaptive_window = 128
+    core.prefill_schedule_adaptive_update_interval = 1
+    core.prefill_schedule_adaptive_max_interval = 512
+    core.prefill_schedule_adaptive_min_token_budget = 816
+    core.prefill_schedule_adaptive_max_wait_seconds = 10.0
+    core.prefill_schedule_adaptive_reset_seconds = 30.0
+    core._adaptive_prefill_interval = (
+        core.prefill_schedule_high_load_interval
+        or core.prefill_schedule_interval
+    )
+    # max budget is the DECODE-ACTIVE budget (3072), not the high-load floor.
+    core._adaptive_prefill_max_budget = (
+        core.decode_active_prefill_token_budget
+        or core.decode_active_prefill_high_load_token_budget
+    )
+    core._adaptive_prefill_budget = core._adaptive_prefill_max_budget
+    core._adaptive_prefill_latencies = deque(maxlen=128)
+    core._adaptive_decode_latencies = deque(maxlen=128)
+    core._prefill_ms_per_token_samples = deque(maxlen=128)
+    core._adaptive_high_load_latencies = deque(maxlen=128)
+    core._adaptive_prefill_observations = 0
+    core._adaptive_prefill_healthy_windows = 0
+    core._adaptive_prefill_p99_ms = None
+    core._adaptive_decode_p99_ms = None
+    core._adaptive_decode_gap_p99_ms = None
+    core._adaptive_prefill_penalty_p99_ms = None
+    core._adaptive_control_p99_ms = None
+    core._adaptive_oldest_prefill_wait_seconds = 0.0
+    core._adaptive_aging_interval = None
+    core._adaptive_aging_token_budget = None
+    core._adaptive_high_load = False
+    core._adaptive_control_tier = None
+    core._adaptive_cold_start = True
+    core._adaptive_reset_count = 0
+    core._adaptive_quiet_since = None
+    core._last_prefill_service_time = time.monotonic()
+    core._prefill_schedule_step = 0
+    return core
+
+
+def _observe_step(core, elapsed_ms, prefill_tokens):
+    so = Mock()
+    so.scheduled_timestamp = time.monotonic() - elapsed_ms / 1000.0
+    so.prefill_decode_overlap = True
+    so.scheduled_prefill_tokens = prefill_tokens
+    core._observe_prefill_control(so)
+
+
+def test_engine_core_adaptive_prefill_overlap_budget_not_pinned():
+    """Three pi sessions + one queued turn (< threshold 8) must NOT pin
+    prefill at the high-load floor: overlap tier runs the decode-active
+    budget (3072) on the normal interval (4)."""
+    core = _make_adaptive_core((3, 1))
+    assert core._prefill_load_is_high() is False
+    assert core._current_prefill_token_budget() == 3072
+    core._should_throttle_prefills()  # activates the overlap tier
+    assert core._adaptive_control_tier == "overlap"
+    assert core._adaptive_prefill_interval == 4
+    assert core._current_prefill_token_budget() == 3072
+
+
+def test_engine_core_adaptive_prefill_high_load_clamps_budget():
+    """A genuine >=8-request fanout enters the high tier: interval at least
+    the high-load interval, budget clamped to the high-load floor (816) —
+    but regrows when load drops back to overlap."""
+    core = _make_adaptive_core((3, 1))
+    core._should_throttle_prefills()
+    assert core._adaptive_control_tier == "overlap"
+
+    core.scheduler.get_request_counts.return_value = (6, 2)
+    assert core._prefill_load_is_high() is True
+    core._should_throttle_prefills()
+    assert core._adaptive_control_tier == "high"
+    assert core._adaptive_prefill_interval >= 128
+    assert core._current_prefill_token_budget() == 816
+    assert core._adaptive_prefill_budget == 816
+
+    core.scheduler.get_request_counts.return_value = (3, 1)
+    core._should_throttle_prefills()
+    assert core._adaptive_control_tier == "overlap"
+    # Hysteresis: interval/budget regrow via healthy windows, but the budget
+    # ceiling is the decode-active budget again, not the high-load floor.
+    core._adaptive_high_load_latencies.extend([100.0] * 16)  # fill warm gate
+    for _ in range(4):
+        _observe_step(core, 100.0, 816)
+    assert core._adaptive_prefill_budget > 816
+
+
+def test_engine_core_adaptive_prefill_penalty_control():
+    """The controller must react to the prefill PENALTY (extra step latency
+    over the decode-only baseline), not the absolute decode gap: a 100ms
+    penalty is healthy (< 0.7 * 250ms) and regrows; a 400ms penalty is
+    unhealthy and throttles harder."""
+    core = _make_adaptive_core((3, 1))
+    core._should_throttle_prefills()
+
+    # Decode-only baseline: 16 steps establish the baseline p99 AND fill the
+    # 16-sample warm gate that skips control decisions before it.
+    for _ in range(16):
+        _observe_step(core, 100.0, 0)
+    assert core._adaptive_decode_p99_ms is not None
+
+    # Healthy prefill: 200ms steps -> 100ms penalty < 175ms.
+    for _ in range(3):
+        _observe_step(core, 200.0, 816)
+    assert core._adaptive_prefill_healthy_windows == 0  # regrown and reset
+    assert core._adaptive_prefill_budget == core._adaptive_prefill_max_budget
+
+    # Unhealthy prefill: 500ms steps -> 400ms penalty > 250ms.
+    before_interval = core._adaptive_prefill_interval
+    before_budget = core._adaptive_prefill_budget
+    for _ in range(2):
+        _observe_step(core, 500.0, 816)
+    assert core._adaptive_prefill_interval > before_interval
+    assert core._adaptive_prefill_budget < before_budget or \
+        core._adaptive_prefill_budget == 816
+
+
 def test_decode_prefill_arrival_gap():
     scheduler = Scheduler.__new__(Scheduler)
     decode = Mock(is_prefill_chunk=False, arrival_time=10.0)

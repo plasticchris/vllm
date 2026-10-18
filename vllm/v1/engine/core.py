@@ -163,9 +163,14 @@ class EngineCore:
             self.prefill_schedule_high_load_interval
             or self.prefill_schedule_interval
         )
+        # Normal-overlap ceiling is the decode-active budget (e.g. 3072);
+        # the high-load budget (e.g. 816) is the FLOOR under high load, not
+        # the ceiling — using it as the ceiling pinned prefill at 816 tok
+        # per step even when the controller had no pressure to shrink
+        # (2026-10-18 concurrency fix).
         self._adaptive_prefill_max_budget = (
-            self.decode_active_prefill_high_load_token_budget
-            or self.decode_active_prefill_token_budget
+            self.decode_active_prefill_token_budget
+            or self.decode_active_prefill_high_load_token_budget
         )
         self._adaptive_prefill_budget = self._adaptive_prefill_max_budget
         self._adaptive_prefill_latencies = deque(
@@ -802,9 +807,19 @@ class EngineCore:
             adaptive_budget = getattr(self, "_adaptive_prefill_budget", None)
             aging_budget = getattr(self, "_adaptive_aging_token_budget", None)
             if aging_budget is not None:
-                return max(adaptive_budget or 0, aging_budget)
-            if adaptive_budget is not None:
-                return adaptive_budget
+                budget = max(adaptive_budget or 0, aging_budget)
+            elif adaptive_budget is not None:
+                budget = adaptive_budget
+            else:
+                budget = None
+            if high_load and budget is not None:
+                high_load_budget = getattr(
+                    self, "decode_active_prefill_high_load_token_budget", None
+                )
+                if high_load_budget is not None:
+                    budget = min(budget, high_load_budget)
+            if budget is not None:
+                return budget
         if high_load:
             high_load_budget = getattr(
                 self, "decode_active_prefill_high_load_token_budget", None
@@ -881,6 +896,15 @@ class EngineCore:
 
         control_p99 = self._adaptive_control_p99_ms
         assert control_p99 is not None
+        # Prefer the prefill penalty (extra step latency prefill adds over
+        # the decode-only baseline). The absolute decode gap cannot drop
+        # below the batch's natural decode-step time at >=2-3 concurrent
+        # decodes (MTP verify + TP all-reduce), so targeting it pinned the
+        # controller at max throttle under ordinary multi-session load
+        # (2026-10-18). The penalty is 0 when prefill adds nothing.
+        penalty = getattr(self, "_adaptive_prefill_penalty_p99_ms", None)
+        if penalty is not None:
+            control_p99 = penalty
         self._adaptive_cold_start = False
         if control_p99 > target:
             self._adaptive_prefill_healthy_windows = 0
@@ -934,6 +958,19 @@ class EngineCore:
                     self._adaptive_prefill_interval,
                     self.prefill_schedule_high_load_interval,
                 )
+                # Entering high load clamps the budget to the high-load
+                # floor; the healthy-window regrowth below restores it
+                # when the tier drops back to overlap.
+                high_load_budget = getattr(
+                    self, "decode_active_prefill_high_load_token_budget", None
+                )
+                if (
+                    high_load_budget is not None
+                    and self._adaptive_prefill_budget is not None
+                ):
+                    self._adaptive_prefill_budget = min(
+                        self._adaptive_prefill_budget, high_load_budget
+                    )
             return
         self._adaptive_prefill_interval = (
             self.prefill_schedule_high_load_interval
