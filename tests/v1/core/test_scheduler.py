@@ -164,6 +164,12 @@ def _make_adaptive_core(request_counts, overlap=True):
     core._adaptive_decode_p99_ms = None
     core._adaptive_decode_gap_p99_ms = None
     core._adaptive_prefill_penalty_p99_ms = None
+    # Drain penalty (async-scheduling blind spot, 2026-10-19): mirrors __init__
+    core._adaptive_drain_latencies = deque(maxlen=core.prefill_schedule_adaptive_window)
+    core._adaptive_drain_p99_ms = None
+    core._adaptive_drain_penalty_p99_ms = None
+    core._last_step_had_prefill = False
+    core._last_step_is_drain = False
     core._adaptive_control_p99_ms = None
     core._adaptive_oldest_prefill_wait_seconds = 0.0
     core._adaptive_aging_interval = None
