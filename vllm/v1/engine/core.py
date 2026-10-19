@@ -191,6 +191,18 @@ class EngineCore:
         self._adaptive_decode_p99_ms: float | None = None
         self._adaptive_decode_gap_p99_ms: float | None = None
         self._adaptive_prefill_penalty_p99_ms: float | None = None
+        # Drain penalty (async-scheduling blind spot, 2026-10-19): the decode
+        # step IMMEDIATELY FOLLOWING a prefill step carries the prefill's GPU
+        # cost that async scheduling deferred off-step. This -- not the prefill
+        # step's own wall -- is what stalls concurrent decodes, and it is the
+        # control signal the sub-block/interval controller should actually use.
+        self._adaptive_drain_latencies: deque[float] = deque(
+            maxlen=scheduler_config.prefill_schedule_adaptive_window
+        )
+        self._adaptive_drain_p99_ms: float | None = None
+        self._adaptive_drain_penalty_p99_ms: float | None = None
+        self._last_step_had_prefill = False
+        self._last_step_is_drain = False
         self._adaptive_control_p99_ms: float | None = None
         self._adaptive_oldest_prefill_wait_seconds = 0.0
         self._adaptive_aging_interval: int | None = None
@@ -743,6 +755,12 @@ class EngineCore:
             output.prefill_control_penalty_p99_ms = getattr(
                 self, "_adaptive_prefill_penalty_p99_ms", None
             )
+            output.prefill_control_drain_p99_ms = getattr(
+                self, "_adaptive_drain_p99_ms", None
+            )
+            output.prefill_control_drain_penalty_p99_ms = getattr(
+                self, "_adaptive_drain_penalty_p99_ms", None
+            )
             output.prefill_control_slo_p99_ms = getattr(
                 self, "_adaptive_control_p99_ms", None
             )
@@ -859,6 +877,32 @@ class EngineCore:
     def _observe_prefill_control(self, scheduler_output: SchedulerOutput) -> None:
         elapsed_ms = (time.monotonic() - scheduler_output.scheduled_timestamp) * 1000
         scheduler_output.model_step_elapsed_ms = elapsed_ms
+        # Drain penalty (async-scheduling blind spot, 2026-10-19): a decode
+        # step that immediately follows a prefill step absorbs the prefill's
+        # GPU cost that async scheduling deferred off-step. Measure it
+        # unconditionally (it is the raw observation; the control decision
+        # below is what consumes it) and update the per-step prefill flag
+        # after we've read the previous value.
+        step_had_prefill = scheduler_output.scheduled_prefill_tokens > 0
+        # This decode step is a "drain" step iff the previous step had prefill
+        # (under async scheduling that prefill's GPU cost lands here). Capture
+        # it in its own deque AND keep it OUT of the clean decode baseline,
+        # otherwise the baseline is inflated by the drains and every penalty
+        # nets to ~0 -- which is exactly the blind spot that let the old
+        # controller conclude prefill was harmless and relax the sub-block.
+        is_drain = (
+            not step_had_prefill and getattr(self, "_last_step_had_prefill", False)
+        )
+        self._last_step_is_drain = is_drain
+        drain_deque = getattr(self, "_adaptive_drain_latencies", None)
+        if (
+            drain_deque is not None
+            and scheduler_output.scheduled_timestamp > 0
+            and is_drain
+        ):
+            drain_deque.append(elapsed_ms)
+            self._adaptive_drain_p99_ms = EngineCore._latency_p99(drain_deque)
+        self._last_step_had_prefill = step_had_prefill
         target = getattr(self, "prefill_schedule_adaptive_target_ms", None)
         if (
             target is None
@@ -880,7 +924,10 @@ class EngineCore:
         decode_gap_p99 = get_decode_gap() if get_decode_gap is not None else None
         self._adaptive_decode_gap_p99_ms = decode_gap_p99
         if scheduler_output.scheduled_prefill_tokens <= 0:
-            self._adaptive_decode_latencies.append(elapsed_ms)
+            # Only CLEAN decode steps (not right after a prefill) form the
+            # baseline; drain steps are tracked separately above.
+            if not getattr(self, "_last_step_is_drain", False):
+                self._adaptive_decode_latencies.append(elapsed_ms)
             if len(self._adaptive_decode_latencies) >= 4:
                 self._adaptive_decode_p99_ms = EngineCore._latency_p99(
                     self._adaptive_decode_latencies
@@ -920,15 +967,34 @@ class EngineCore:
             if baseline is not None and prefill_p99 is not None
             else None
         )
+        # Drain penalty (async-scheduling blind spot, 2026-10-19): the extra
+        # latency the decode step right after a prefill absorbs, over the
+        # decode-only baseline. Under async scheduling this -- not the
+        # prefill step's own wall -- is what stalls concurrent decodes, so it
+        # must enter the control signal. It is 0 when prefill adds nothing.
+        drain_p99 = getattr(self, "_adaptive_drain_p99_ms", None)
+        self._adaptive_drain_penalty_p99_ms = (
+            max(drain_p99 - baseline, 0.0)
+            if baseline is not None and drain_p99 is not None
+            else None
+        )
         # Control signal (set AFTER the penalty override, 2026-10-18): the
         # prefill penalty, falling back to the decode gap / model step only
         # when no baseline exists yet. The old code assigned the absolute
         # decode gap here, so the penalty override below never reached the
-        # decision.
+        # decision. Take the WORST of the prefill-step penalty and the
+        # decode-drain penalty: both are real, and the drain is the one the
+        # prefill-step wall undercounts under async scheduling.
+        penalties = [
+            p
+            for p in (
+                self._adaptive_prefill_penalty_p99_ms,
+                self._adaptive_drain_penalty_p99_ms,
+            )
+            if p is not None
+        ]
         self._adaptive_control_p99_ms = (
-            self._adaptive_prefill_penalty_p99_ms
-            if self._adaptive_prefill_penalty_p99_ms is not None
-            else (decode_gap_p99 or model_step_p99)
+            max(penalties) if penalties else (decode_gap_p99 or model_step_p99)
         )
         cold_start = getattr(self, "_adaptive_cold_start", False)
         if (
@@ -1040,6 +1106,11 @@ class EngineCore:
         self._adaptive_decode_p99_ms = None
         self._adaptive_decode_gap_p99_ms = None
         self._adaptive_prefill_penalty_p99_ms = None
+        self._adaptive_drain_p99_ms = None
+        self._adaptive_drain_penalty_p99_ms = None
+        self._adaptive_drain_latencies.clear()
+        self._last_step_had_prefill = False
+        self._last_step_is_drain = False
         self._adaptive_control_p99_ms = None
         self._adaptive_cold_start = True
 
@@ -1056,7 +1127,15 @@ class EngineCore:
         ):
             selected = max(base // 2, 1)
         elif target is not None and observed is not None and observed < target * 0.7:
-            selected = base * 2
+            # Do NOT enlarge past the configured (A/B-tuned) base. Under async
+            # scheduling a prefill step's own wall time undercounts its true GPU
+            # cost: the MTP draft/verify work drains onto the NEXT (decode) step,
+            # so a "low observed penalty" here is not "small drain". Enlarging the
+            # chunk to 2x moves a ~480ms decode stall to ~560ms with no prefill
+            # throughput gain (2026-10-19 per-step telemetry: the post-prefill
+            # decode stall scales 1:1 with sub-block size, 100->200->400).
+            # Hold the validated base; only tighten (base//2) under real pressure.
+            selected = base
         else:
             selected = base
         self._last_mamba_prefill_subblock_tokens = selected
@@ -1078,6 +1157,11 @@ class EngineCore:
         self._adaptive_decode_p99_ms = None
         self._adaptive_decode_gap_p99_ms = None
         self._adaptive_prefill_penalty_p99_ms = None
+        self._adaptive_drain_p99_ms = None
+        self._adaptive_drain_penalty_p99_ms = None
+        self._adaptive_drain_latencies.clear()
+        self._last_step_had_prefill = False
+        self._last_step_is_drain = False
         self._adaptive_control_p99_ms = None
         self._adaptive_control_tier = None
         self._adaptive_cold_start = True

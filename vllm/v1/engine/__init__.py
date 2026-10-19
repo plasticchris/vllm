@@ -280,6 +280,11 @@ class EngineCoreOutputs(
     prefill_control_p99_ms: float | None = None
     prefill_control_decode_p99_ms: float | None = None
     prefill_control_penalty_p99_ms: float | None = None
+    # Drain penalty (async-scheduling blind spot, 2026-10-19): the decode step
+    # right after a prefill absorbs the prefill's deferred GPU cost; this is
+    # what actually stalls concurrent decodes.
+    prefill_control_drain_p99_ms: float | None = None
+    prefill_control_drain_penalty_p99_ms: float | None = None
     prefill_control_slo_p99_ms: float | None = None
     prefill_control_oldest_wait_seconds: float | None = None
     prefill_control_aging_interval: int | None = None

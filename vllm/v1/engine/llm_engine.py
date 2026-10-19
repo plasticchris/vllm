@@ -370,6 +370,8 @@ class LLMEngine:
             outputs.prefill_control_p99_ms,
             outputs.prefill_control_decode_p99_ms,
             outputs.prefill_control_penalty_p99_ms,
+            outputs.prefill_control_drain_p99_ms,
+            outputs.prefill_control_drain_penalty_p99_ms,
             outputs.prefill_control_slo_p99_ms,
             outputs.prefill_control_oldest_wait_seconds,
             outputs.prefill_control_aging_interval,
