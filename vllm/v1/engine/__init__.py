@@ -294,6 +294,12 @@ class EngineCoreOutputs(
     prefill_control_prefill_ms_per_token: float | None = None
     prefill_control_decode_gap_p99_ms: float | None = None
     spec_profitability: dict[str, Any] | None = None
+    # Per-step scheduler bookkeeping (set even when the step produced no
+    # request outputs): prefill = newly computed context tokens this step
+    # (cache hits excluded); scheduled = all tokens scheduled this step
+    # including decode slots and speculative drafts.
+    step_prefill_tokens: int = 0
+    step_scheduled_tokens: int = 0
     timestamp: float = 0.0
 
     utility_output: UtilityOutput | None = None

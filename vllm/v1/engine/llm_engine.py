@@ -138,6 +138,13 @@ class LLMEngine:
         )
         self.last_request_kv_tokens: dict[str, int] = {}
         self.last_spec_profitability: dict[str, Any] | None = None
+        # Per-step breakdown for the serving layer (rukhm). 13 ints:
+        #   (gen_tokens, prefill_sched_tokens, scheduled_total_tokens,
+        #    prompt_computed, prompt_cached, preempted_reqs,
+        #    prefix_cache_queries, prefix_cache_hits, kv_evictions,
+        #    spec_draft_tokens, spec_accepted_tokens, running_reqs,
+        #    waiting_reqs)
+        self.last_step_stats: tuple[int, ...] | None = None
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
             self.logger_manager = StatLoggerManager(
@@ -390,6 +397,50 @@ class LLMEngine:
                 iteration_stats=iteration_stats,
             )
             self.output_processor.update_scheduler_stats(outputs.scheduler_stats)
+            if outputs.scheduler_stats is not None:
+                pc = outputs.scheduler_stats.prefix_cache_stats
+                spec = outputs.scheduler_stats.spec_decoding_stats
+                self.last_step_stats = (
+                    iteration_stats.num_generation_tokens
+                    if iteration_stats
+                    else 0,
+                    outputs.step_prefill_tokens,
+                    outputs.step_scheduled_tokens,
+                    iteration_stats.prompt_token_stats.computed
+                    if iteration_stats
+                    else 0,
+                    iteration_stats.prompt_token_stats.local_cache_hit
+                    if iteration_stats
+                    else 0,
+                    iteration_stats.num_preempted_reqs
+                    if iteration_stats
+                    else 0,
+                    pc.queries,
+                    pc.hits,
+                    len(outputs.scheduler_stats.kv_cache_eviction_events),
+                    spec.num_draft_tokens if spec is not None else 0,
+                    spec.num_accepted_tokens if spec is not None else 0,
+                    outputs.scheduler_stats.num_running_reqs,
+                    outputs.scheduler_stats.num_waiting_reqs,
+                )
+            else:
+                # Scheduled but no request outputs (e.g. KV-pressure stall):
+                # still report the scheduler's own bookkeeping for the step.
+                self.last_step_stats = (
+                    0,
+                    outputs.step_prefill_tokens,
+                    outputs.step_scheduled_tokens,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
 
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):

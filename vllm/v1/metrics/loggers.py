@@ -137,6 +137,12 @@ class LoggingStatLogger(StatLoggerBase):
         self.num_generation_tokens: int = 0
         self.num_corrupted_reqs: int = 0
         self.num_preemptions: int = 0
+        # Step-structure counters over the current logging window: total
+        # steps, steps that did local prefill work (vs pure decode), and
+        # prompt tokens served from the prefix cache without recompute.
+        self.num_steps: int = 0
+        self.num_prefill_steps: int = 0
+        self.num_cached_prompt_tokens: int = 0
 
     def _enable_perf_stats(self) -> bool:
         return self.vllm_config.observability_config.enable_mfu_metrics
@@ -148,6 +154,13 @@ class LoggingStatLogger(StatLoggerBase):
         self.num_generation_tokens += iteration_stats.num_generation_tokens
         self.num_corrupted_reqs += iteration_stats.num_corrupted_reqs
         self.num_preemptions += iteration_stats.num_preempted_reqs
+        self.num_steps += 1
+        self.num_prefill_steps += (
+            1 if iteration_stats.prompt_token_stats.computed > 0 else 0
+        )
+        self.num_cached_prompt_tokens += (
+            iteration_stats.prompt_token_stats.local_cache_hit
+        )
 
     def _get_throughput(self, tracked_stats: int, now: float) -> float:
         # Compute summary metrics for tracked stats
@@ -254,6 +267,13 @@ class LoggingStatLogger(StatLoggerBase):
         return
 
     def log(self):
+        # Capture per-window counters BEFORE _update_stats() resets them.
+        steps, prefill_steps, cached_prompt = (
+            self.num_steps,
+            self.num_prefill_steps,
+            self.num_cached_prompt_tokens,
+        )
+        preemptions = self.num_preemptions
         self._update_stats()
         self.aggregate_scheduler_stats()
         # Avoid log noise on an idle production system
@@ -280,9 +300,19 @@ class LoggingStatLogger(StatLoggerBase):
             log_parts.append("Deferred: %d reqs")
             log_args.append(self.last_scheduler_stats.num_skipped_waiting_reqs)
 
-        if self.num_preemptions > 0:
+        if preemptions > 0:
             log_parts.append("Preemptions: %d")
-            log_args.append(self.num_preemptions)
+            log_args.append(preemptions)
+
+        # Step structure: total steps this window and how many ran local
+        # prefill (vs pure decode); cached prompt tokens show how much of
+        # the prefill load was absorbed by the prefix cache. Distinguishes
+        # "decode starved by prefill steps" from "decode-only slowed".
+        log_parts.append("Steps: %d (%d prefill)")
+        log_args.extend([steps, prefill_steps])
+        if cached_prompt > 0:
+            log_parts.append("Cached prompt: %d tok")
+            log_args.append(cached_prompt)
 
         log_parts.extend(
             [

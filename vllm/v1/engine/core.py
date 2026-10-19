@@ -722,6 +722,12 @@ class EngineCore:
             output.kv_cache_pinned_tokens = pinned_tokens
             output.kv_cache_total_tokens = total_tokens
             output.request_kv_tokens = request_kv_tokens
+            output.step_prefill_tokens = getattr(
+                self, "_last_step_prefill_tokens", 0
+            )
+            output.step_scheduled_tokens = getattr(
+                self, "_last_step_scheduled_tokens", 0
+            )
             output.prefill_control_interval = getattr(
                 self, "_adaptive_prefill_interval", None
             )
@@ -1190,6 +1196,11 @@ class EngineCore:
         scheduler_output.high_prefill_load = high_prefill_load
         scheduler_output.prefill_decode_overlap = prefill_decode_overlap
         scheduler_output.mamba_prefill_subblock_tokens = mamba_subblock
+        # Expose per-step scheduler bookkeeping on the outputs (survives the
+        # empty-output case where the step scheduled work but emitted no
+        # request outputs, e.g. KV-pressure stalls).
+        self._last_step_prefill_tokens = scheduler_output.scheduled_prefill_tokens
+        self._last_step_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -1270,6 +1281,12 @@ class EngineCore:
             scheduler_output.high_prefill_load = high_prefill_load
             scheduler_output.prefill_decode_overlap = prefill_decode_overlap
             scheduler_output.mamba_prefill_subblock_tokens = mamba_subblock
+            self._last_step_prefill_tokens = (
+                scheduler_output.scheduled_prefill_tokens
+            )
+            self._last_step_scheduled_tokens = (
+                scheduler_output.total_num_scheduled_tokens
+            )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
