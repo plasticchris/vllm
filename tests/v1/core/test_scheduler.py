@@ -599,6 +599,326 @@ def test_overlap_mode_ignores_eb_fields():
     assert core._current_mamba_prefill_subblock(False, False) is None
 
 
+def _p51_step_out(scheduler, output):
+    """Advance the scheduler with a ModelRunnerOutput mirroring `output`:
+    a request that is still a prefill chunk AFTER the step emits no token;
+    otherwise (decode, or a prefill completing this step) it samples one."""
+    req_ids = list(output.num_scheduled_tokens.keys())
+    sampled = []
+    for rid in req_ids:
+        request = scheduler.requests[rid]
+        n = output.num_scheduled_tokens[rid]
+        if request.num_computed_tokens + n < request.num_tokens - 1:
+            sampled.append([])  # still mid-prefill after the step
+        else:
+            sampled.append([0])
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+            sampled_token_ids=sampled,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+
+def test_eb_force_serve_progress_behind_unselected_head():
+    """P5-1 (a): the era-A force-serve stall, fixed. Decode active; the
+    aged cold prefill (3600 tok, OLDEST arrival — past k) sits at the
+    head of the waiting queue with a 2-k delta and two more prefills
+    behind it (4 candidates vs the 3072//800 = 3 selection slots). The
+    round-robin cursor (1) makes a PLAIN fair selection drop the head —
+    exactly the P3-4 era-A shape where the unselected head-of-line broke
+    the waiting phase and the force-serve step scheduled NOTHING (4,564
+    consecutive pure-decode steps while the 154-k waiter aged 117-140 s
+    at kvpct ~30%). Post-P5-1 the engine passes the oldest deferred id:
+    it is selected unconditionally and served, the loop then resumes the
+    pre-P5-1 break on the first unselected one behind it, and the 2-k
+    delta is force-served on the very next step — both make progress
+    within <=2 force-serve steps (spec). Sizes fit the test model's
+    4096 max_model_len; the stall mechanism is size-independent."""
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=4096,
+        long_prefill_token_threshold=4096,
+        block_size=800,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    (decode_req,) = create_requests(num_requests=1, num_tokens=800, req_ids=["dec0"])
+    scheduler.add_request(decode_req)
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert decode_req in scheduler.running and not decode_req.is_prefill_chunk
+    # Era-A shape: aged cold HoL, 2-k delta behind it, two more concurrent
+    # prefills (the 4th candidate is what lets the 3-slot selection drop
+    # the head).
+    specs = [
+        ("cold0", 3600, 6.0),  # HoL, oldest arrival (past k = 5.0 s)
+        ("delta0", 2400, 2.0),  # the 2-k delta
+        ("p1", 4000, 0.5),
+        ("p2", 4000, 0.3),
+    ]
+    for rid, tokens, off in specs:
+        (req,) = create_requests(
+            num_requests=1, num_tokens=tokens, req_ids=[rid], max_tokens=8
+        )
+        req.arrival_time = time.time() - off
+        scheduler.add_request(req)
+    # Force-serve step 1 (the engine hands the oldest deferred id).
+    # Pre-P5-1 the loop broke on the unselected HoL -> decode-only; the
+    # wait would keep aging (era A). Post-P5-1 the forced HoL is served.
+    assert scheduler.get_oldest_deferred_prefill_id() == "cold0"
+    scheduler._prefill_rr_cursor = 1
+    output = scheduler.schedule(
+        throttle_prefills=False,
+        decode_active_prefill_token_budget=3072,
+        mamba_prefill_subblock_tokens=100,
+        eb_forced_prefill_id="cold0",
+    )
+    assert output.num_scheduled_tokens["dec0"] == 1  # decode keeps running
+    assert output.num_scheduled_tokens["cold0"] == 100  # aged HoL served
+    assert "delta0" not in output.num_scheduled_tokens  # break resumes after
+    assert "p1" not in output.num_scheduled_tokens
+    _p51_step_out(scheduler, output)
+
+    # Force-serve step 2: the 2-k delta is now the oldest deferred and
+    # the engine forces it — the delta makes progress within <=2 steps
+    # of the k crossing (spec), and the aged cold chunk keeps advancing.
+    assert scheduler.get_oldest_deferred_prefill_id() == "delta0"
+    output = scheduler.schedule(
+        throttle_prefills=False,
+        decode_active_prefill_token_budget=3072,
+        mamba_prefill_subblock_tokens=100,
+        eb_forced_prefill_id="delta0",
+    )
+    assert output.num_scheduled_tokens["delta0"] == 100
+    assert output.num_scheduled_tokens["cold0"] == 100  # running chunk resumes
+    _p51_step_out(scheduler, output)
+    # Both made progress within 2 force-serve steps; nothing starved.
+    assert scheduler.requests["cold0"].num_computed_tokens == 200
+    assert scheduler.requests["delta0"].num_computed_tokens == 100
+
+
+def test_eb_forced_aged_wait_bounded_in_decode_active_loop():
+    """P5-1 (b): a decode-active loop driven by the eb engine branch on the
+    REAL scheduler (1.0 s of clock per step; 4 waiting prefills vs the 3
+    selection slots, cursor dropping the head — the era-A stall shape).
+    Post-P5-1: (i) every force-serve step SCHEDULES its forced id
+    (asserted per step; pre-P5-1 the loop broke on the unselected head and
+    the step was decode-only while the waiter aged past k unboundedly),
+    (ii) the oldest deferred wait stays bounded at k + 2 steps (era A:
+    117-140 s), and (iii) every waiting prefill is first-served within 2k
+    of arrival (the P3-2 zero-starvation criterion)."""
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=4096,
+        long_prefill_token_threshold=4096,
+        block_size=800,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    (decode_req,) = create_requests(
+        num_requests=1, num_tokens=800, req_ids=["dec0"], max_tokens=64
+    )
+    scheduler.add_request(decode_req)
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    k = 5.0
+    step_dt = 1.0
+    now0 = time.time()
+    specs = [  # (req_id, tokens, arrival offset s before now0)
+        ("cold0", 3600, 6.0),  # HoL, oldest (already past k)
+        ("delta0", 2400, 2.0),
+        ("p1", 4000, 0.5),
+        ("p2", 4000, 0.3),
+    ]
+    for rid, tokens, off in specs:
+        (req,) = create_requests(
+            num_requests=1, num_tokens=tokens, req_ids=[rid], max_tokens=8
+        )
+        req.arrival_time = now0 - off
+        scheduler.add_request(req)
+    scheduler._prefill_rr_cursor = 1  # plain selection drops the head
+
+    # EngineCore stub in eb mode driving the real scheduler.
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = scheduler
+    core.prefill_schedule_mode = "eb"
+    core.prefill_schedule_eb_age_seconds = k
+    core.prefill_schedule_eb_idle_subblock = 400
+    core.prefill_schedule_high_load_interval = None
+    core.decode_active_prefill_high_load_token_budget = None
+    core._prefill_schedule_step = 0
+    core._eb_forced_prefill_id = None
+    core._adaptive_oldest_prefill_wait_seconds = 0.0
+    core._adaptive_deferred_prefill_count = None
+    core._adaptive_aging_interval = None
+    core._adaptive_aging_token_budget = None
+    core._adaptive_high_load = False
+    core._adaptive_control_tier = None
+
+    def deferred_wait():
+        """Oldest WAIT-side deferred wait (the population eb bounds)."""
+        ws = [
+            time.time() - r.arrival_time
+            for r in (*scheduler.waiting, *scheduler.skipped_waiting)
+            if r.num_output_tokens == 0
+        ]
+        return max(ws) if ws else 0.0
+
+    first_serve: dict[str, float] = {}
+    max_deferred_wait = 0.0
+    for s in range(1, 13):
+        # Advance the clock 1.0 s (arrival_time = now0 - offset - s).
+        for r in scheduler.requests.values():
+            off = dict((rid, off) for rid, _, off in specs).get(r.request_id)
+            if off is not None:
+                r.arrival_time = now0 - off - s * step_dt
+        throttle = core._should_throttle_prefills()
+        forced = core._eb_forced_prefill_id
+        if throttle:
+            assert forced is None  # a deferring step never forces
+        output = scheduler.schedule(throttle, 3072, 100, forced)
+        # THE P5-1 contract: a force-serve step schedules its forced id.
+        # Pre-P5-1 this fails on step 1 (the unselected head breaks the
+        # loop; the step is decode-only and the waiter keeps aging).
+        if forced is not None:
+            assert forced in output.num_scheduled_tokens, (
+                s,
+                forced,
+                output.num_scheduled_tokens,
+            )
+        for rid in output.num_scheduled_tokens:
+            if rid in first_serve or rid not in dict((r, 0) for r, _, _ in specs):
+                continue
+            first_serve[rid] = time.time() - scheduler.requests[rid].arrival_time
+        max_deferred_wait = max(max_deferred_wait, deferred_wait())
+        _p51_step_out(scheduler, output)
+    # (i) Oldest deferred wait bounded at k + 2 steps (era A: 117-140 s).
+    assert max_deferred_wait <= k + 2 * step_dt + 0.05, max_deferred_wait
+    # (ii) Every waiting prefill first-served within 2k of arrival
+    # (P3-2 zero-starvation criterion).
+    assert set(first_serve) == {rid for rid, _, _ in specs}, first_serve
+    for rid, wait in first_serve.items():
+        assert wait <= 2 * k + 0.05, (rid, wait)
+    # The aged prefill (6 s backlog, already past k) was first-served on
+    # the FIRST step, not 100 s later.
+    assert first_serve["cold0"] <= 6.0 + step_dt + 0.05
+
+
+def test_overlap_head_of_line_break_unchanged():
+    """P5-1 (c) overlap regression pin: with NO forced id (the overlap
+    engine never passes one) the pre-P5-1 head-of-line semantics are
+    intact — an unselected HoL prefill still BREAKS the waiting phase
+    (fair rotation waits its turn at the head), so the step is decode-only
+    even though the selection set holds the three younger prefills. The
+    skip-past is strictly gated on the eb forced id: the identical call
+    with the forced id serves the aged HoL instead of breaking on it, and
+    the loop then resumes the pre-P5-1 break on the first unselected one
+    after it."""
+    scheduler = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=4096,
+        long_prefill_token_threshold=4096,
+        block_size=800,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    (decode_req,) = create_requests(num_requests=1, num_tokens=800, req_ids=["dec0"])
+    scheduler.add_request(decode_req)
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    specs = [
+        ("cold0", 3600, 6.0),  # HoL, oldest
+        ("delta0", 2400, 2.0),
+        ("p1", 4000, 0.5),
+        ("p2", 4000, 0.3),
+    ]
+    for rid, tokens, off in specs:
+        (req,) = create_requests(
+            num_requests=1, num_tokens=tokens, req_ids=[rid], max_tokens=8
+        )
+        req.arrival_time = time.time() - off
+        scheduler.add_request(req)
+    scheduler._prefill_rr_cursor = 1  # plain selection drops the head
+    # overlap step (no forced id): the unselected head breaks the loop,
+    # the step is decode-only (today's cadence semantics — do NOT alter).
+    output = scheduler.schedule(
+        throttle_prefills=False,
+        decode_active_prefill_token_budget=3072,
+        mamba_prefill_subblock_tokens=100,
+    )
+    assert output.num_scheduled_tokens == {"dec0": 1}
+    assert output.scheduled_prefill_tokens == 0
+    _p51_step_out(scheduler, output)
+    # Same shape with the eb forced id: the aged HoL is served (100-tok
+    # base sub-block); the loop then resumes the pre-P5-1 break on the
+    # first unselected one after it (p2 is outside the 3-slot selection,
+    # so it stays out — the step is not an all-queue admission).
+    output = scheduler.schedule(
+        throttle_prefills=False,
+        decode_active_prefill_token_budget=3072,
+        mamba_prefill_subblock_tokens=100,
+        eb_forced_prefill_id="cold0",
+    )
+    assert output.num_scheduled_tokens["cold0"] == 100
+    assert "p2" not in output.num_scheduled_tokens
+
+
+def test_eb_engine_selects_oldest_deferred_for_force_serve():
+    """P5-1 wiring: the eb branch hands schedule() the OLDEST DEFERRED
+    (waiting, zero-output) id on a force-serve step only, resets it on
+    every non-forced eb step (single-shot), leaves it None while idle, and
+    the overlap path never touches the attr (unchanged code path)."""
+    core = _make_eb_core((3, 1), active_decode=True, oldest_wait=1.0)
+    core.scheduler.get_oldest_deferred_prefill_id.return_value = "aged0"
+    core._eb_forced_prefill_id = "stale"
+    assert core._should_throttle_prefills() is True  # below k: defer
+    assert core._eb_forced_prefill_id is None  # stale id reset
+    core.scheduler.get_oldest_prefill_wait_seconds.return_value = 5.0
+    assert core._should_throttle_prefills() is False  # force-serve
+    assert core._eb_forced_prefill_id == "aged0"
+    # Idle (no decode): never forces, id stays None.
+    core.scheduler.has_decode_prefill_overlap.return_value = False
+    assert core._should_throttle_prefills() is False
+    assert core._eb_forced_prefill_id is None
+    # The overlap path never touches the id (unchanged code path).
+    core.scheduler.has_decode_prefill_overlap.return_value = True
+    core.prefill_schedule_mode = "overlap"
+    core._prefill_schedule_step = 0  # fresh cadence (eb steps advanced it)
+    core._eb_forced_prefill_id = "untouched"
+    assert core._should_throttle_prefills() is False  # cadence step 0
+    assert core._eb_forced_prefill_id == "untouched"
+
+
 def test_decode_prefill_arrival_gap():
     scheduler = Scheduler.__new__(Scheduler)
     decode = Mock(is_prefill_chunk=False, arrival_time=10.0)

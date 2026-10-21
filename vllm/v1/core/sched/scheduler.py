@@ -1154,17 +1154,22 @@ class Scheduler(SchedulerInterface):
         )
         # P5-1 (eb force-serve progress guarantee): the engine passes the
         # aged prefill id whose wait reached k on a force-serve step. It
-        # MUST be scheduled this step: it overrides the fairness priority
-        # (an unconditional contract, not a nudge) and the waiting loop
-        # skips past unselected prefills ahead of it instead of breaking
-        # the whole waiting phase (the P3-4 era-A stall: an unselected
-        # head-of-line cold prefill kept breaking the loop, so a
-        # force-serve step scheduled nothing and the wait grew unbounded
-        # past k). Only applies when prefills are admitted this step
-        # (never while deferring); overlap never passes one.
+        # MUST be scheduled this step: it is selected unconditionally
+        # (overriding the fairness priority, which is a nudge) and the
+        # waiting loop skips past unselected prefills ahead of it instead
+        # of breaking the whole waiting phase (the P3-4 era-A stall: an
+        # unselected head-of-line cold prefill kept breaking the loop, so
+        # a force-serve step scheduled nothing and the wait grew
+        # unbounded past k). It is deliberately NOT routed through
+        # ``priority_prefill_id`` itself: that var also drives the
+        # running-chunk short-priority clause (whose invariant is
+        # "set implies threshold configured"), and the forced id is a
+        # waiting request, not a running one. Only applies when prefills
+        # are admitted this step (never while deferring); overlap never
+        # passes one (its attr is always None, so every condition below
+        # degenerates to the pre-P5-1 form).
         forced_prefill_pending = False
         if eb_forced_prefill_id is not None and not defer_prefills:
-            priority_prefill_id = eb_forced_prefill_id
             forced_prefill_pending = True
         configured_prefill_budget = (
             self.scheduler_config.decode_active_prefill_token_budget
@@ -1178,6 +1183,12 @@ class Scheduler(SchedulerInterface):
             candidate_ids = (
                 [priority_prefill_id] if priority_prefill_id is not None else []
             )
+            if forced_prefill_pending and (
+                eb_forced_prefill_id not in candidate_ids
+            ):
+                # P5-1: the forced id must be selectable even if the
+                # admission-slot slice of the waiting queue left it out.
+                candidate_ids.insert(0, eb_forced_prefill_id)
             candidate_ids.extend(
                 request.request_id
                 for request in self.running
@@ -1205,12 +1216,20 @@ class Scheduler(SchedulerInterface):
                     if self.need_mamba_block_aligned_split
                     else 1
                 )
+                # P5-1: the forced id is the unconditional selection
+                # priority on a force-serve step (it wins over the
+                # short-waiting fairness priority, which only nudges).
+                selection_priority = (
+                    eb_forced_prefill_id
+                    if forced_prefill_pending
+                    else priority_prefill_id
+                )
                 selected_prefills, prefill_request_budget = (
                     self._fair_prefill_selection(
                         candidate_ids,
                         prefill_token_budget,
                         minimum_chunk,
-                        priority_id=priority_prefill_id,
+                        priority_id=selection_priority,
                     )
                 )
 
