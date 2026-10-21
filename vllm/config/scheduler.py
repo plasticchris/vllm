@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
+PrefillScheduleMode = Literal["overlap", "eb"]
 
 
 @config
@@ -85,6 +86,28 @@ class SchedulerConfig:
 
     mamba_prefill_subblock_tokens: int | None = Field(default=None, ge=1)
     """Experimental decode-active Mamba prefill slice below one cache block."""
+
+    prefill_schedule_mode: PrefillScheduleMode = "overlap"
+    """Prefill scheduling policy while decodes are active:
+
+    - "overlap" (default, today's behavior): interleave bounded prefill
+      chunks on a fixed cadence while decodes run.
+    - "eb": defer all prefill while any decode is active (EB(0)-style
+      phase separation); a deferred prefill is force-served once its
+      wait reaches ``prefill_schedule_eb_age_seconds``. When no decode
+      is active, prefills get the full step token budget at the idle
+      Mamba sub-block."""
+
+    prefill_schedule_eb_age_seconds: float = Field(default=10.0, gt=0.0)
+    """Only used when ``prefill_schedule_mode`` is "eb": maximum seconds a
+    prefill may wait while decodes are active before it is force-served
+    (the EB aging exception)."""
+
+    prefill_schedule_eb_idle_subblock: int = Field(default=400, ge=1)
+    """Only used when ``prefill_schedule_mode`` is "eb": Mamba prefill
+    sub-block (tokens) while no decode is active; clamped to divide the
+    scheduler block size. Reverts to ``mamba_prefill_subblock_tokens``
+    when a decode becomes active."""
 
     max_num_partial_prefills: int = Field(default=1, ge=1)
     """For chunked prefill, the maximum number of sequences that can be

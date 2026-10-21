@@ -114,27 +114,31 @@ class LLMEngine:
             float, int, int, int, int, int, int, int, int
         ] | None = None
         self.last_prefill_control: tuple[
-            int | None,
-            int | None,
-            float | None,
-            float | None,
-            float | None,
-            float | None,
-            float | None,
-            int | None,
-            int | None,
-            bool | None,
-            bool | None,
-            int | None,
-            int | None,
-            float | None,
-            str | None,
-            int | None,
-            float | None,
-            float | None,
+            int | None,     # interval
+            int | None,     # token_budget
+            float | None,   # prefill p99 ms
+            float | None,   # decode p99 ms
+            float | None,   # penalty p99 ms
+            float | None,   # drain p99 ms
+            float | None,   # drain penalty p99 ms
+            float | None,   # slo p99 ms
+            float | None,   # oldest prefill wait s
+            int | None,     # deferred prefill count (eb mode)
+            int | None,     # aging interval
+            int | None,     # aging token budget
+            bool | None,    # high load
+            bool | None,    # cold start
+            int | None,     # observations
+            int | None,     # reset count
+            float | None,   # quiet seconds
+            str | None,     # tier
+            int | None,     # mamba subblock tokens
+            float | None,   # prefill ms/token
+            float | None,   # decode gap p99 ms
         ] = (
-            None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
+            None,
         )
         self.last_request_kv_tokens: dict[str, int] = {}
         self.last_spec_profitability: dict[str, Any] | None = None
@@ -374,6 +378,7 @@ class LLMEngine:
             outputs.prefill_control_drain_penalty_p99_ms,
             outputs.prefill_control_slo_p99_ms,
             outputs.prefill_control_oldest_wait_seconds,
+            outputs.prefill_control_deferred_count,
             outputs.prefill_control_aging_interval,
             outputs.prefill_control_aging_token_budget,
             outputs.prefill_control_high_load,

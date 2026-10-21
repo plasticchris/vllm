@@ -102,7 +102,7 @@ from vllm.config.parallel import (
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
 )
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import PrefillScheduleMode, SchedulerPolicy
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.logger import init_logger, suppress_logging
@@ -558,6 +558,15 @@ class EngineArgs:
     )
     mamba_prefill_subblock_tokens: int | None = (
         SchedulerConfig.mamba_prefill_subblock_tokens
+    )
+    prefill_schedule_mode: PrefillScheduleMode = (
+        SchedulerConfig.prefill_schedule_mode
+    )
+    prefill_schedule_eb_age_seconds: float = (
+        SchedulerConfig.prefill_schedule_eb_age_seconds
+    )
+    prefill_schedule_eb_idle_subblock: int = (
+        SchedulerConfig.prefill_schedule_eb_idle_subblock
     )
     max_num_seqs: int | None = None
     max_num_queued_reqs: int | None = None
@@ -1722,6 +1731,18 @@ class EngineArgs:
             **scheduler_kwargs["prefill_schedule_adaptive_reset_seconds"],
         )
         scheduler_group.add_argument(
+            "--prefill-schedule-mode",
+            **scheduler_kwargs["prefill_schedule_mode"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-eb-age-seconds",
+            **scheduler_kwargs["prefill_schedule_eb_age_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-eb-idle-subblock",
+            **scheduler_kwargs["prefill_schedule_eb_idle_subblock"],
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -2547,6 +2568,9 @@ class EngineArgs:
             prefill_schedule_adaptive_reset_seconds=(
                 self.prefill_schedule_adaptive_reset_seconds
             ),
+            prefill_schedule_mode=self.prefill_schedule_mode,
+            prefill_schedule_eb_age_seconds=self.prefill_schedule_eb_age_seconds,
+            prefill_schedule_eb_idle_subblock=self.prefill_schedule_eb_idle_subblock,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,

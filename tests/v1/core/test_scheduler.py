@@ -172,6 +172,7 @@ def _make_adaptive_core(request_counts, overlap=True):
     core._last_step_is_drain = False
     core._adaptive_control_p99_ms = None
     core._adaptive_oldest_prefill_wait_seconds = 0.0
+    core._adaptive_deferred_prefill_count = None
     core._adaptive_aging_interval = None
     core._adaptive_aging_token_budget = None
     core._adaptive_high_load = False
@@ -299,6 +300,303 @@ def test_engine_core_adaptive_prefill_target_floor():
         _observe_step(core, 2400.0, 816)
     assert core._adaptive_prefill_interval == before_interval
     assert core._adaptive_prefill_budget == before_budget
+
+
+def _make_eb_core(request_counts, active_decode=True, oldest_wait=0.0):
+    """EngineCore stub configured for eb (phase-separated) mode: the
+    controller fields above PLUS prefill_schedule_mode='eb' with aging k
+    = 5.0 s (PREFILL_MODE=eb, EB_AGE_SECONDS=5)."""
+    core = _make_adaptive_core(request_counts, overlap=active_decode)
+    core.scheduler.get_oldest_prefill_wait_seconds.return_value = oldest_wait
+    core.prefill_schedule_mode = "eb"
+    core.prefill_schedule_eb_age_seconds = 5.0
+    core.prefill_schedule_eb_idle_subblock = 400
+    return core
+
+
+def test_eb_prefill_always_defers_while_decode_active():
+    """eb: prefill must be deferred on EVERY step while any decode is
+    active — no interval cadence, and no force-serve while the oldest
+    wait is below k. The overlap aging-tier machinery stays dormant."""
+    core = _make_eb_core((3, 1), active_decode=True, oldest_wait=4.9)
+    for _ in range(16):
+        assert core._should_throttle_prefills() is True
+    assert core._adaptive_oldest_prefill_wait_seconds == 4.9
+    assert core._adaptive_aging_interval is None
+    assert core._adaptive_aging_token_budget is None
+    assert core._adaptive_control_tier is None
+
+
+def test_eb_prefill_never_defers_when_no_decode():
+    """eb: when no decode is active, prefills are never deferred — the
+    full step budget / roofline path, gated by nothing."""
+    core = _make_eb_core((3, 1), active_decode=False)
+    for _ in range(16):
+        assert core._should_throttle_prefills() is False
+    assert core._adaptive_oldest_prefill_wait_seconds == 0.0
+
+
+def test_eb_prefill_force_serves_at_age_k():
+    """eb: the EB(0) aging exception — the step the oldest deferred
+    prefill's wait reaches k (eb_age_seconds), prefill is force-served
+    mid-decode; below k it keeps deferring."""
+    core = _make_eb_core((3, 1), active_decode=True, oldest_wait=4.9)
+    assert core._should_throttle_prefills() is True  # below k: defer
+    core.scheduler.get_oldest_prefill_wait_seconds.return_value = 5.0
+    assert core._should_throttle_prefills() is False  # at k: force-serve
+    assert core._adaptive_oldest_prefill_wait_seconds == 5.0
+
+
+def test_eb_deferred_prefill_count_telemetry():
+    """The eb branch records what /status needs: how many prefills the
+    policy holds back (scheduler's waiting-with-no-output count) while
+    deferring, and 0 once the window is idle — live through an aging
+    force-serve. The attr is None until an eb step records a value."""
+    core = _make_eb_core((3, 1), active_decode=True, oldest_wait=1.0)
+    assert core._adaptive_deferred_prefill_count is None  # before any step
+    core.scheduler.get_deferred_prefill_count.return_value = 3
+    assert core._should_throttle_prefills() is True  # below k: defer
+    assert core._adaptive_deferred_prefill_count == 3
+
+    core.scheduler.get_deferred_prefill_count.return_value = 0
+    core.scheduler.get_oldest_prefill_wait_seconds.return_value = 5.0
+    assert core._should_throttle_prefills() is False  # force-serve
+    assert core._adaptive_deferred_prefill_count == 0
+
+    # Idle: the policy is active but defers nothing (full-budget window).
+    core2 = _make_eb_core((3, 1), active_decode=False)
+    core2.scheduler.get_deferred_prefill_count.return_value = 2
+    assert core2._should_throttle_prefills() is False
+    assert core2._adaptive_deferred_prefill_count == 0
+
+
+def test_eb_deferred_prefill_count():
+    """get_deferred_prefill_count = waiting prefills with zero output
+    tokens (the set eb holds back while decode is active, same population
+    as get_oldest_prefill_wait_seconds). A prefill that is RUNNING is
+    being served this step (throttling never preempts it), not deferred."""
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=4096,
+        long_prefill_token_threshold=4096,
+        block_size=800,
+    )
+    (decode_req,) = create_requests(num_requests=1, num_tokens=800, req_ids=["dec0"])
+    scheduler.add_request(decode_req)
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert decode_req in scheduler.running and not decode_req.is_prefill_chunk
+    assert scheduler.get_deferred_prefill_count() == 0
+
+    (p0,) = create_requests(num_requests=1, num_tokens=2400, req_ids=["p0"])
+    scheduler.add_request(p0)
+    assert scheduler.get_deferred_prefill_count() == 1  # held back
+
+    # Served: p0 admitted to the running batch (all 2400 tok fit the 3072
+    # decode-active budget) -> no longer waiting, so not deferred.
+    output = scheduler.schedule(
+        throttle_prefills=False,
+        decode_active_prefill_token_budget=3072,
+        mamba_prefill_subblock_tokens=100,
+    )
+    assert p0 in scheduler.running
+    assert output.num_scheduled_tokens["p0"] == 2400
+    assert scheduler.get_deferred_prefill_count() == 0
+
+
+def _eb_subblock(core):
+    """Drive _current_mamba_prefill_subblock the way EngineCore.step() does:
+    per-step overlap flag from the scheduler, high-load flag alongside."""
+    return core._current_mamba_prefill_subblock(
+        core.scheduler.has_decode_prefill_overlap(),
+        core._prefill_load_is_high(),
+    )
+
+
+def test_eb_idle_window_enlarged_subblock_full_budget():
+    """eb, no decode active: the mamba prefill sub-block enlarges to the
+    configured idle value (400, divides the 800-token K=2 block) for the
+    WHOLE idle window. Prefill tokens take the full step budget: the
+    engine still passes the decode-active budget (3072), but schedule()
+    nulls it out when no decode is active
+    (``prefill_token_budget = configured if active_decode else None``)
+    and drives round-robin idle_prefill_block_budgets instead."""
+    core = _make_eb_core((0, 3), active_decode=False)
+    core.mamba_prefill_subblock_tokens = 100  # base (launcher A/B'd)
+    for _ in range(16):
+        assert _eb_subblock(core) == 400
+    assert core._last_mamba_prefill_subblock_tokens == 400
+    # The engine's budget value is the decode-active one; schedule() ignores
+    # it in idle windows (see docstring) — no engine-side cap to assert on.
+    assert core._current_prefill_token_budget(False, False) == 3072
+
+
+def test_eb_subblock_reverts_one_step_after_decode_active():
+    """eb: the instant a decode is active the sub-block reverts to the
+    A/B-tuned base (100) and stays there — including while an aging
+    force-serve (oldest_wait >= k) is draining a prefill mid-decode; and
+    it re-enlarges on the next idle window."""
+    core = _make_eb_core((0, 1), active_decode=False)
+    core.mamba_prefill_subblock_tokens = 100
+    assert _eb_subblock(core) == 400  # idle window
+    # A decode becomes active: the NEXT step's flag flips and so does the
+    # sub-block — within one step.
+    core.scheduler.has_decode_prefill_overlap.return_value = True
+    core.scheduler.get_oldest_prefill_wait_seconds.return_value = 6.0
+    for _ in range(16):
+        assert _eb_subblock(core) == 100
+        assert core._should_throttle_prefills() is False  # aging force-serve
+    assert core._last_mamba_prefill_subblock_tokens == 100
+    # Decode drains away -> next idle window re-enlarges.
+    core.scheduler.has_decode_prefill_overlap.return_value = False
+    assert _eb_subblock(core) == 400
+
+
+def test_eb_subblock_clamps_to_divide_block():
+    """The eb idle sub-block is clamped (in EngineCore.__init__) to the
+    largest divisor of block/2 <= requested, mirroring the base clamp, so
+    schedule()'s divide-block invariant holds across spec depths."""
+    from vllm.v1.core.sched.scheduler import clamp_mamba_subblock_to_block
+
+    # K=2 box: 800-token block (816 at K=4). 400 divides 800 -> unchanged;
+    # a stale launcher value (300) clamps down to 200, not 300; a K=4-tuned
+    # 408 (the docstring case) clamps to 400 on the K=2 800-token block.
+    assert clamp_mamba_subblock_to_block(800, 400) == 400
+    assert clamp_mamba_subblock_to_block(800, 300) == 200
+    assert clamp_mamba_subblock_to_block(800, 408) == 400
+
+
+def test_eb_idle_full_budget_multi_prefill_batch():
+    """eb idle window, through schedule(): with no decode active the waiting
+    deltas run as ONE batch at the FULL step budget — the 3072 decode-active
+    budget the engine always passes is ignored in an idle window (schedule()
+    nulls it: ``prefill_token_budget = configured if active_decode else None``),
+    and every waiting prefill gets a share of ``max_num_scheduled_tokens``
+    (4096) via round-robin whole blocks (idle_prefill_block_budgets).
+    K=2 box params: 800-token cache block, 400 idle sub-block (a
+    decode-active-only knob, so ignored here)."""
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=4096,
+        long_prefill_token_threshold=4096,
+        block_size=800,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    for i in range(4):
+        (req,) = create_requests(num_requests=1, num_tokens=2400, req_ids=[f"p{i}"])
+        scheduler.add_request(req)
+    output = scheduler.schedule(
+        throttle_prefills=False,
+        decode_active_prefill_token_budget=3072,
+        mamba_prefill_subblock_tokens=400,
+    )
+    # 5 whole 800-token blocks across the 4 prefills (4000 <= 4096): ALL FOUR
+    # deltas are in the batch, and the total (4000) exceeds the 3072
+    # decode-active budget that overlap mode would have capped it to.
+    assert output.num_scheduled_tokens == {
+        "p0": 1600,
+        "p1": 800,
+        "p2": 800,
+        "p3": 800,
+    }
+    assert output.scheduled_prefill_tokens == 4000
+
+
+def test_eb_defer_then_force_serve_through_schedule():
+    """eb end-to-end through schedule(): with a decode active the engine
+    throttles (always, below k) and the step runs decode-only; once the
+    oldest wait reaches k the engine force-serves (throttle off) and the
+    deltas run mid-decode at the A/B-tuned base sub-block (100), inside the
+    3072 decode-active budget."""
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=4096,
+        long_prefill_token_threshold=4096,
+        block_size=800,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    (decode_req,) = create_requests(num_requests=1, num_tokens=800, req_ids=["dec0"])
+    scheduler.add_request(decode_req)
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert decode_req in scheduler.running and not decode_req.is_prefill_chunk
+    for i in range(2):
+        (req,) = create_requests(num_requests=1, num_tokens=2400, req_ids=[f"p{i}"])
+        scheduler.add_request(req)
+
+    # Below k: eb defers every step -> decode-only.
+    output = scheduler.schedule(
+        throttle_prefills=True,
+        decode_active_prefill_token_budget=3072,
+        mamba_prefill_subblock_tokens=100,
+    )
+    assert output.num_scheduled_tokens == {"dec0": 1}
+    assert output.scheduled_prefill_tokens == 0
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # At k: the engine's aging exception force-serves -> the deltas run
+    # mid-decode, one 100-token base sub-block each (not 400, and the total
+    # stays inside the 3072 decode-active budget).
+    output = scheduler.schedule(
+        throttle_prefills=False,
+        decode_active_prefill_token_budget=3072,
+        mamba_prefill_subblock_tokens=100,
+    )
+    assert output.num_scheduled_tokens["dec0"] == 1
+    assert output.num_scheduled_tokens["p0"] == 100
+    assert output.num_scheduled_tokens["p1"] == 100
+
+
+def test_overlap_mode_ignores_eb_fields():
+    """overlap (default) regression: with the eb fields configured and a
+    wait that PASTS eb's k (6.0 s >= 5.0 s), the pre-change overlap behavior
+    is intact — the interval cadence (1 in 4) still defers on steps 1-3 (eb
+    mode would force-serve them all), and the idle window does NOT enlarge
+    the sub-block (overlap returns None; eb would return 400)."""
+    core = _make_eb_core((3, 1), active_decode=True, oldest_wait=6.0)
+    core.prefill_schedule_mode = "overlap"
+    core.mamba_prefill_subblock_tokens = 100
+    assert core._should_throttle_prefills() is False  # step 0: cadence open
+    # The aged wait (6.0 s >= k=5.0) must NOT override the cadence — that
+    # exception is eb-only (overlap aging keys off max_wait=10.0 instead).
+    assert [core._should_throttle_prefills() for _ in range(3)] == [
+        True,
+        True,
+        True,
+    ]
+    # Decode-active sub-block: the A/B-tuned base (100), not the eb idle value.
+    assert core._current_mamba_prefill_subblock(True, False) == 100
+    # Idle window: no enlargement in overlap mode (eb would return 400).
+    core.scheduler.has_decode_prefill_overlap.return_value = False
+    assert core._current_mamba_prefill_subblock(False, False) is None
 
 
 def test_decode_prefill_arrival_gap():

@@ -3340,6 +3340,17 @@ class Scheduler(SchedulerInterface):
         )
         return max(time.time() - min(arrivals), 0.0) if arrivals else 0.0
 
+    def get_deferred_prefill_count(self) -> int:
+        """Prefills the prefill throttle is holding back (EB(0) deferral):
+        waiting with zero output tokens. A prefill that is RUNNING is being
+        served this step (throttling never preempts it), so it does not
+        count. Same population as ``get_oldest_prefill_wait_seconds``."""
+        return sum(
+            1
+            for request in (*self.waiting, *self.skipped_waiting)
+            if request.num_output_tokens == 0
+        )
+
     def get_spec_profitability_stats(self) -> dict[str, object] | None:
         if self.profitability_aware_min_batch_size is None:
             return None

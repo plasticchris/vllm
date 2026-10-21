@@ -287,6 +287,10 @@ class EngineCoreOutputs(
     prefill_control_drain_penalty_p99_ms: float | None = None
     prefill_control_slo_p99_ms: float | None = None
     prefill_control_oldest_wait_seconds: float | None = None
+    # EB(0) telemetry (PREFILL_MODE=eb): prefills the throttle is holding
+    # back right now (oldest one's wait = prefill_control_oldest_wait_seconds).
+    # None until an eb step records a value (overlap / DP override never set it).
+    prefill_control_deferred_count: int | None = None
     prefill_control_aging_interval: int | None = None
     prefill_control_aging_token_budget: int | None = None
     prefill_control_high_load: bool | None = None

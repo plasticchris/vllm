@@ -159,6 +159,17 @@ class EngineCore:
         self.prefill_schedule_adaptive_reset_seconds = (
             scheduler_config.prefill_schedule_adaptive_reset_seconds
         )
+        self.prefill_schedule_mode = scheduler_config.prefill_schedule_mode
+        self.prefill_schedule_eb_age_seconds = (
+            scheduler_config.prefill_schedule_eb_age_seconds
+        )
+        self.prefill_schedule_eb_idle_subblock = (
+            scheduler_config.prefill_schedule_eb_idle_subblock
+        )
+        # The eb idle-window sub-block keys off the per-rank overlap flag,
+        # which is NOT rank-aligned on the DP proc (MoE-only path); keep it
+        # inert there, matching that proc's rank-aligned throttle override.
+        self._eb_idle_subblock_enabled = self.prefill_schedule_mode == "eb"
         self._adaptive_prefill_interval = self.prefill_schedule_interval
         # Normal-overlap ceiling is the decode-active budget (e.g. 3072);
         # the high-load budget (e.g. 816) is the FLOOR under high load, not
@@ -205,6 +216,9 @@ class EngineCore:
         self._last_step_is_drain = False
         self._adaptive_control_p99_ms: float | None = None
         self._adaptive_oldest_prefill_wait_seconds = 0.0
+        # EB(0) telemetry: prefills the throttle is holding back. None until
+        # an eb step records a value (overlap mode / DP override never set it).
+        self._adaptive_deferred_prefill_count: int | None = None
         self._adaptive_aging_interval: int | None = None
         self._adaptive_aging_token_budget: int | None = None
         self._adaptive_high_load = False
@@ -279,6 +293,19 @@ class EngineCore:
 
             self.mamba_prefill_subblock_tokens = clamp_mamba_subblock_to_block(
                 scheduler_block_size, self.mamba_prefill_subblock_tokens
+            )
+        # The eb idle sub-block must satisfy the same invariant as the base:
+        # divide the cache block (it shifts with the speculative depth), or
+        # schedule() would reject it mid-run.
+        if (
+            self.prefill_schedule_mode == "eb"
+            and self.mamba_prefill_subblock_tokens is not None
+            and scheduler_block_size % self.prefill_schedule_eb_idle_subblock != 0
+        ):
+            from vllm.v1.core.sched.scheduler import clamp_mamba_subblock_to_block
+
+            self.prefill_schedule_eb_idle_subblock = clamp_mamba_subblock_to_block(
+                scheduler_block_size, self.prefill_schedule_eb_idle_subblock
             )
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
@@ -767,6 +794,9 @@ class EngineCore:
             output.prefill_control_oldest_wait_seconds = getattr(
                 self, "_adaptive_oldest_prefill_wait_seconds", None
             )
+            output.prefill_control_deferred_count = getattr(
+                self, "_adaptive_deferred_prefill_count", None
+            )
             output.prefill_control_aging_interval = getattr(
                 self, "_adaptive_aging_interval", None
             )
@@ -1118,6 +1148,25 @@ class EngineCore:
         self, overlap: bool, high_load: bool
     ) -> int | None:
         base = getattr(self, "mamba_prefill_subblock_tokens", None)
+        if (
+            getattr(self, "prefill_schedule_mode", "overlap") == "eb"
+            and getattr(self, "_eb_idle_subblock_enabled", True)
+            and base is not None
+        ):
+            # EB phase separation: keep the A/B-tuned base (100) whenever any
+            # decode is active (incl. an aging force-serve mid-decode); in an
+            # idle window (no decode overlap) run prefills at the roofline
+            # with the enlarged idle sub-block. `overlap` is re-read from the
+            # scheduler every step, so the base reverts within one step of a
+            # decode becoming active. (Inert on the DP proc; overlap mode
+            # below is unchanged.)
+            selected = (
+                base
+                if overlap
+                else getattr(self, "prefill_schedule_eb_idle_subblock", base)
+            )
+            self._last_mamba_prefill_subblock_tokens = selected
+            return selected
         if not overlap or base is None:
             return None
         target = getattr(self, "prefill_schedule_adaptive_target_ms", None)
@@ -1171,7 +1220,15 @@ class EngineCore:
     def _should_throttle_prefills(
         self, high_load: bool | None = None, overlap: bool | None = None
     ) -> bool:
-        """Whether this step should protect active decodes from prefill work."""
+        """Whether this step should protect active decodes from prefill work.
+
+        In "eb" mode this is strict phase separation: while any decode is
+        active, ALWAYS defer prefills, except that a deferred prefill is
+        force-served once its wait reaches
+        ``prefill_schedule_eb_age_seconds`` (the EB(0) aging exception, k).
+        When no decode is active, never defer. The "overlap" path (default)
+        below is unchanged.
+        """
         if high_load is None:
             high_load = self._prefill_load_is_high()
         if overlap is None:
@@ -1179,6 +1236,37 @@ class EngineCore:
             overlap = high_load or (
                 scheduler is not None and scheduler.has_decode_prefill_overlap()
             )
+        if getattr(self, "prefill_schedule_mode", "overlap") == "eb":
+            scheduler = getattr(self, "scheduler", None)
+            # EB keys off decode activity, not high load: even under low
+            # load a prefill dumped mid-decode drains onto the next decode
+            # step (the 28.6% drain tax), so "eb" = always-defer-while-decode.
+            active_decode = (
+                scheduler is not None and scheduler.has_decode_prefill_overlap()
+            )
+            oldest_wait = 0.0
+            force_prefill_service = False
+            deferred_prefills = 0
+            if active_decode:
+                oldest_wait = scheduler.get_oldest_prefill_wait_seconds()
+                age = getattr(self, "prefill_schedule_eb_age_seconds", None)
+                if age is not None and oldest_wait >= age:
+                    force_prefill_service = True
+                # Telemetry for /status: how many prefills this policy is
+                # holding back right now (waiting with no output tokens).
+                get_deferred = getattr(
+                    scheduler, "get_deferred_prefill_count", None
+                )
+                deferred_prefills = (
+                    get_deferred() if get_deferred is not None else 0
+                )
+            self._adaptive_high_load = high_load
+            self._adaptive_oldest_prefill_wait_seconds = oldest_wait
+            self._adaptive_deferred_prefill_count = deferred_prefills
+            self._adaptive_aging_interval = None
+            self._adaptive_aging_token_budget = None
+            self._prefill_schedule_step += 1
+            return active_decode and not force_prefill_service
         interval = self.prefill_schedule_interval
         force_prefill_service = False
         self._adaptive_aging_interval = None
@@ -2779,6 +2867,10 @@ class DPEngineCoreProc(EngineCoreProc):
             engine_index=dp_rank,
             tensor_queue=tensor_queue,
         )
+        # eb's idle-window sub-block keys off the per-rank overlap flag, and
+        # that flag is not rank-aligned across DP ranks (see the rank-aligned
+        # _should_throttle_prefills override below) — keep it inert here.
+        self._eb_idle_subblock_enabled = False
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
