@@ -219,6 +219,11 @@ class EngineCore:
         # EB(0) telemetry: prefills the throttle is holding back. None until
         # an eb step records a value (overlap mode / DP override never set it).
         self._adaptive_deferred_prefill_count: int | None = None
+        # EB(0) force-serve progress guarantee (P5-1): the aged prefill id
+        # that an eb force-serve step must schedule THIS step. Consumed by
+        # scheduler.schedule() on the very next call; cleared after (None
+        # until the next force-serve). None on the overlap path / DP override.
+        self._eb_forced_prefill_id: str | None = None
         self._adaptive_aging_interval: int | None = None
         self._adaptive_aging_token_budget: int | None = None
         self._adaptive_high_load = False
@@ -1247,11 +1252,28 @@ class EngineCore:
             oldest_wait = 0.0
             force_prefill_service = False
             deferred_prefills = 0
+            # P5-1 progress guarantee: reset every eb step (single-shot;
+            # only a force-serve step below re-sets it).
+            self._eb_forced_prefill_id = None
             if active_decode:
                 oldest_wait = scheduler.get_oldest_prefill_wait_seconds()
                 age = getattr(self, "prefill_schedule_eb_age_seconds", None)
                 if age is not None and oldest_wait >= age:
                     force_prefill_service = True
+                    # P5-1 progress guarantee: force-serving must actually
+                    # SCHEDULE the aged prefill this step. Under the P3-4
+                    # era-A load shape a force-serve step could schedule
+                    # nothing (head-of-line unselected cold prefill broke
+                    # the waiting phase), so the wait grew unbounded past
+                    # k. Hand schedule() the oldest deferred id: it is
+                    # selected unconditionally this step and the waiting
+                    # loop skips past unselected prefills ahead of it, so
+                    # every force-serve step makes at least one held
+                    # prefill progress and the oldest deferred wait stops
+                    # growing unboundedly.
+                    self._eb_forced_prefill_id = (
+                        scheduler.get_oldest_deferred_prefill_id()
+                    )
                 # Telemetry for /status: how many prefills this policy is
                 # holding back right now (waiting with no output tokens).
                 get_deferred = getattr(
@@ -1357,12 +1379,17 @@ class EngineCore:
             prefill_decode_overlap, high_prefill_load
         )
         schedule_started = time.monotonic()
+        # P5-1: pass through (and consume) the single-shot eb force-serve id
+        # decided by _should_throttle_prefills above; None on overlap steps.
+        eb_forced_prefill_id = self._eb_forced_prefill_id
+        self._eb_forced_prefill_id = None
         scheduler_output = self.scheduler.schedule(
             throttle_prefills,
             self._current_prefill_token_budget(
                 high_prefill_load, prefill_decode_overlap
             ),
             mamba_subblock,
+            eb_forced_prefill_id,
         )
         scheduler_output.scheduled_timestamp = schedule_started
         scheduler_output.high_prefill_load = high_prefill_load
@@ -1442,12 +1469,16 @@ class EngineCore:
                 prefill_decode_overlap, high_prefill_load
             )
             schedule_started = time.monotonic()
+            # P5-1: same single-shot force-serve hand-off as step().
+            eb_forced_prefill_id = self._eb_forced_prefill_id
+            self._eb_forced_prefill_id = None
             scheduler_output = self.scheduler.schedule(
                 throttle_prefills,
                 self._current_prefill_token_budget(
                     high_prefill_load, prefill_decode_overlap
                 ),
                 mamba_subblock,
+                eb_forced_prefill_id,
             )
             scheduler_output.scheduled_timestamp = schedule_started
             scheduler_output.high_prefill_load = high_prefill_load

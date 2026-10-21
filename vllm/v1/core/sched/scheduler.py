@@ -1087,6 +1087,7 @@ class Scheduler(SchedulerInterface):
         throttle_prefills: bool = False,
         decode_active_prefill_token_budget: int | None = None,
         mamba_prefill_subblock_tokens: int | None = None,
+        eb_forced_prefill_id: str | None = None,
     ) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1151,6 +1152,20 @@ class Scheduler(SchedulerInterface):
         priority_prefill_id = (
             None if defer_prefills else self._select_short_waiting_prefill()
         )
+        # P5-1 (eb force-serve progress guarantee): the engine passes the
+        # aged prefill id whose wait reached k on a force-serve step. It
+        # MUST be scheduled this step: it overrides the fairness priority
+        # (an unconditional contract, not a nudge) and the waiting loop
+        # skips past unselected prefills ahead of it instead of breaking
+        # the whole waiting phase (the P3-4 era-A stall: an unselected
+        # head-of-line cold prefill kept breaking the loop, so a
+        # force-serve step scheduled nothing and the wait grew unbounded
+        # past k). Only applies when prefills are admitted this step
+        # (never while deferring); overlap never passes one.
+        forced_prefill_pending = False
+        if eb_forced_prefill_id is not None and not defer_prefills:
+            priority_prefill_id = eb_forced_prefill_id
+            forced_prefill_pending = True
         configured_prefill_budget = (
             self.scheduler_config.decode_active_prefill_token_budget
             if decode_active_prefill_token_budget is None
@@ -1697,7 +1712,21 @@ class Scheduler(SchedulerInterface):
                         and request_id not in idle_prefill_budgets
                     )
                 ):
-                    break
+                    if defer_prefills or not forced_prefill_pending:
+                        # Everything deferred this step, or no forced
+                        # prefill to reach: pre-P5-1 head-of-line break
+                        # (unchanged overlap/eb-defer semantics).
+                        break
+                    # The forced (aged) prefill is behind this unselected
+                    # one in the queue: skip past it — re-queued at the
+                    # front for the next step — instead of stalling the
+                    # whole waiting phase on it (P3-4 era-A: 154-k cold
+                    # head-of-line held the forced waiter 117–140 s at
+                    # kvpct ~30% because every force-serve step broke
+                    # here and scheduled nothing).
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
                     # Number of tokens to be scheduled.
@@ -1956,6 +1985,11 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 if is_waiting_prefill:
                     scheduled_prefill_tokens += num_new_tokens
+                if forced_prefill_pending and request_id == eb_forced_prefill_id:
+                    # The aged prefill was scheduled this step: the
+                    # guarantee is met; resume the pre-P5-1 break
+                    # semantics for the (unselected) requests behind it.
+                    forced_prefill_pending = False
                 if is_waiting_prefill and prefill_token_budget is not None:
                     prefill_token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
@@ -3350,6 +3384,22 @@ class Scheduler(SchedulerInterface):
             for request in (*self.waiting, *self.skipped_waiting)
             if request.num_output_tokens == 0
         )
+
+    def get_oldest_deferred_prefill_id(self) -> str | None:
+        """The deferred prefill with the oldest arrival (P5-1): the waiting
+        request with zero output tokens and the minimum arrival_time — the
+        same deferred population as ``get_deferred_prefill_count`` (running
+        prefill chunks are already being served, so they are not
+        candidates). The eb force-serve step hands this id to
+        ``schedule(eb_forced_prefill_id=...)`` so it is guaranteed to be
+        scheduled that step. None when the deferred population is empty."""
+        oldest: Request | None = None
+        for request in (*self.waiting, *self.skipped_waiting):
+            if request.num_output_tokens != 0:
+                continue
+            if oldest is None or request.arrival_time < oldest.arrival_time:
+                oldest = request
+        return oldest.request_id if oldest is not None else None
 
     def get_spec_profitability_stats(self) -> dict[str, object] | None:
         if self.profitability_aware_min_batch_size is None:
