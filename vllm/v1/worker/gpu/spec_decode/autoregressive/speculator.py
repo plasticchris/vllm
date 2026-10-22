@@ -334,27 +334,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if runtime_steps <= 1:
             return self.draft_tokens[:num_reqs, :runtime_steps]
 
-        # Skip multi-step draft decode when every request in the batch is still
-        # on an incomplete prefill chunk (num_computed_prefill_tokens +
-        # num_scheduled_tokens < prefill_len): the scheduler discards draft
-        # tokens for incomplete prefill chunks anyway (`update_draft_token_ids`
-        # clears `spec_token_ids` while `request.is_prefill_chunk`), and running
-        # K-1 autoregressive draft decode steps on an unfinished prompt just
-        # enqueues wasted GPU work that drains onto the next step. (The draft
-        # model's single `_prefill` pass above MUST still run so its KV/Mamba
-        # cache stays aligned with the target model.)
-        if (
-            not dummy_run
-            and not is_profile
-            and (
-                input_batch.num_computed_prefill_tokens_np
-                + input_batch.num_scheduled_tokens
-                < input_batch.prefill_len_np
-            ).all()
-        ):
-            self.draft_tokens[:num_reqs, :runtime_steps] = 0
-            return self.draft_tokens[:num_reqs, :runtime_steps]
-
         # Prepare the inputs for the decode steps.
         prepare_decode_inputs(
             self.draft_tokens[:num_reqs, 0],
