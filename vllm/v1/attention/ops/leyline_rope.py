@@ -398,3 +398,76 @@ def apply_kv_cache_rope_rotations_inplace(
                     kv_cache_dtype=kv_cache_dtype,
                     k_scale=k_scale,
                 )
+
+
+def fuse_copy_rotate_key_value_block_range(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    src_block_id: int,
+    dst_block_id: int,
+    src_start: int,
+    src_end: int,
+    dst_start: int,
+    dst_end: int,
+    delta_pos: int,
+    inv_freq: torch.Tensor,
+    is_neox_style: bool = True,
+    kv_cache_dtype: str = "auto",
+    k_scale: torch.Tensor | None = None,
+) -> None:
+    """Offset-aware fused copy+rotate of a donor KV block range into a target
+    block (the single new op from design §2b).
+
+    The donor's already-RoPE'd cached keys for token slots ``[src_start,
+    src_end)`` are copied into the target's slots ``[dst_start, dst_end)``:
+    V is copied verbatim (RoPE never touches values), K is copied with the in
+    place RoPE delta rotation of ``delta_pos`` applied in the same pass
+    (R(dst_pos)k == R(delta)R(src_pos)k). This expresses a non-zero intra-block
+    shift (``dst_start - src_start == delta_pos``) that the whole-block
+    ``copy_kv_cache_blocks_inplace`` cannot (A1). The range is a token-aligned
+    sub-block: ``src_end - src_start == dst_end - dst_start``. ``delta_pos == 0``
+    is a pure verbatim copy. ``dst_block_id == src_block_id`` (in place) is a
+    rotation-only fast path.
+    """
+    if dst_start >= dst_end or src_start >= src_end:
+        return
+    assert src_end - src_start == dst_end - dst_start, (
+        f"splice range length mismatch: src ({src_start}, {src_end}) vs "
+        f"dst ({dst_start}, {dst_end})"
+    )
+
+    use_head_major = key_cache.ndim == 5
+
+    # --- V: verbatim copy. value_cache is [num_blocks, num_kv_heads, head_size,
+    # block_size] in both layouts; the slot index is always the last dim. ---
+    value_cache[dst_block_id, :, :, dst_start:dst_end] = value_cache[
+        src_block_id, :, :, src_start:src_end
+    ]
+
+    # --- K: copy (unless in place), then rotate the copied range in place. ---
+    if dst_block_id != src_block_id:
+        if use_head_major:
+            # key_cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
+            key_cache[dst_block_id, :, :, dst_start:dst_end, :] = key_cache[
+                src_block_id, :, :, src_start:src_end, :
+            ]
+        else:
+            # key_cache [num_blocks, block_size, num_kv_heads, head_size]
+            key_cache[dst_block_id, dst_start:dst_end, :, :] = key_cache[
+                src_block_id, src_start:src_end, :, :
+            ]
+
+    if delta_pos == 0:
+        return
+
+    rotate_key_cache_block_inplace(
+        key_cache=key_cache,
+        block_id=dst_block_id,
+        delta_pos=delta_pos,
+        inv_freq=inv_freq,
+        start_offset=dst_start,
+        end_offset=dst_end,
+        is_neox_style=is_neox_style,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=k_scale,
+    )

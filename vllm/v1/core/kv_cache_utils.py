@@ -235,6 +235,29 @@ class KVCacheBlockRoPERotation(NamedTuple):
     end_offset: int = 0
 
 
+class KVCacheBlockSplice(NamedTuple):
+    """Leyline-style offset-aware fused copy+rotate of a donor KV block range
+    into a target KV block (the single new op from design §2b).
+
+    The donor's already-RoPE'd cached keys for token slots ``[src_start,
+    src_end)`` are copied into the target's slots ``[dst_start, dst_end)``:
+    V is copied verbatim (RoPE never touches values), K is copied with an in
+    place RoPE delta rotation of ``delta_pos`` (R(dst_pos)k == R(delta)R(src_pos)k)
+    applied in the same pass. This is what the whole-block
+    ``copy_kv_cache_blocks_inplace`` cannot express: a non-zero intra-block
+    shift where ``dst_start - src_start == delta_pos`` (A1). The range must be
+    a token-aligned sub-block (both bounds inside [0, block_size)).
+    """
+
+    src_block_id: int
+    dst_block_id: int
+    src_start: int
+    src_end: int
+    dst_start: int
+    dst_end: int
+    delta_pos: int
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python

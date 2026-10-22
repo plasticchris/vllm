@@ -200,3 +200,138 @@ def test_rotate_key_cache_rocm_head_major_layout_and_runner_hook(dtype: torch.dt
     torch.testing.assert_close(
         key_cache[block_id], k_expected_packed, atol=atol, rtol=atol
     )
+
+
+# ---------------------------------------------------------------------------
+# Offset-aware fused copy+rotate op (design §2b "one new fused op").
+#
+# The whole-block ``copy_kv_cache_blocks_inplace`` cannot express a non-zero
+# intra-block shift (A1); §2b needs a donor range copied into a shifted target
+# range with the RoPE delta applied in the same pass. These tests verify the
+# op on CPU (GPT-J style forces the torch fallback, so no GPU process is
+# spawned) by checking the RoPE algebraic identity
+#     R(dst_pos) k == R(delta) R(src_pos) k
+# plus verbatim V and intactness of non-copied slots / the donor block.
+# ---------------------------------------------------------------------------
+
+
+def _make_inv_freq(head_size: int, base: float = 10_000_000.0) -> torch.Tensor:
+    return 1.0 / (base ** (torch.arange(0, head_size, 2).float() / head_size))
+
+
+def _rope_gptj(pos: int, x: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor:
+    """GPT-J (interleaved) rotate of x [..., head_size] by position pos (fp32)."""
+    rd = x.shape[-1]
+    cs = torch.tensor([float(pos)]).float() * inv_freq
+    cos = torch.cos(cs)
+    sin = torch.sin(cs)
+    out = x.to(torch.float32).clone()
+    out[..., 0::2] = x.to(torch.float32)[..., 0::2] * cos - x.to(torch.float32)[..., 1::2] * sin
+    out[..., 1::2] = x.to(torch.float32)[..., 1::2] * cos + x.to(torch.float32)[..., 0::2] * sin
+    return out
+
+
+def test_fuse_copy_rotate_gptj_cpu_verbatim_v_and_rotated_k():
+    from vllm.v1.attention.ops.leyline_rope import fuse_copy_rotate_key_value_block_range
+
+    head_size = 64
+    num_kv_heads = 2
+    block_size = 16
+    inv_freq = _make_inv_freq(head_size)
+
+    # Donor cached K = R(src_pos) raw; donor cached V = v (RoPE never touches it).
+    # The donor token is copied from slot src_slot to slot dst_slot; the absolute
+    # positional shift is delta = dst_slot - src_slot (negative: tokens spliced
+    # out, the realistic §2b case). R(dst_abs) raw == R(src_abs + delta) raw.
+    src_pos = 100
+    src_slot = 4
+    delta = -4  # dst_slot = src_slot + delta = 0 (non-zero intra-block shift)
+    dst_slot = src_slot + delta  # 0
+
+    raw = torch.randn(num_kv_heads, head_size)
+    donor_k = _rope_gptj(src_pos, raw, inv_freq)
+    donor_v = torch.randn(num_kv_heads, head_size)
+
+    # Key: 4-dim token-major [num_blocks, block_size, num_kv_heads, head_size]
+    # (op's 4-dim key branch). Value: the real split_kv_cache layout
+    # [num_blocks, num_kv_heads, head_size, block_size] (slot is the last dim).
+    key_cache = torch.zeros(2, block_size, num_kv_heads, head_size)
+    value_cache = torch.zeros(2, num_kv_heads, head_size, block_size)
+    key_cache[0, src_slot] = donor_k
+    value_cache[0, :, :, src_slot] = donor_v
+    # Sentinels that must remain untouched.
+    value_cache[0, :, :, 11] = torch.randn(num_kv_heads, head_size)
+    keep_v011 = value_cache[0, :, :, 11].clone()
+    donor_keep = key_cache[0].clone()
+
+    fuse_copy_rotate_key_value_block_range(
+        key_cache=key_cache,
+        value_cache=value_cache,
+        src_block_id=0,
+        dst_block_id=1,
+        src_start=src_slot,
+        src_end=src_slot + 1,
+        dst_start=dst_slot,
+        dst_end=dst_slot + 1,
+        delta_pos=delta,
+        inv_freq=inv_freq,
+        is_neox_style=False,  # GPT-J -> torch fallback (CPU)
+    )
+
+    # K: the target slot holds R(dst_pos) raw = R(src_pos + delta) raw (fp32).
+    expected_k = _rope_gptj(src_pos + delta, raw, inv_freq)
+    torch.testing.assert_close(key_cache[1, dst_slot], expected_k, atol=1e-5, rtol=1e-5)
+    # V: verbatim copy of the donor slot.
+    torch.testing.assert_close(value_cache[1, :, :, dst_slot], donor_v, atol=0, rtol=0)
+    # Integrity: donor block and non-copied target slots are untouched.
+    torch.testing.assert_close(key_cache[0], donor_keep, atol=0, rtol=0)
+    torch.testing.assert_close(value_cache[0, :, :, 11], keep_v011, atol=0, rtol=0)
+    torch.testing.assert_close(
+        key_cache[1, dst_slot + 1:],
+        torch.zeros(block_size - 1 - dst_slot, num_kv_heads, head_size),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_fuse_copy_rotate_head_major_cpu_verbatim_delta0():
+    """Head-major layout, delta_pos=0 (pure verbatim copy) — exercises the
+    head-major copy-index path on CPU with a multi-token intra-block range."""
+    from vllm.v1.attention.ops.leyline_rope import fuse_copy_rotate_key_value_block_range
+    from vllm.v1.attention.ops.paged_attn import PagedAttention
+
+    head_size = 256
+    num_kv_heads = 4
+    block_size = 16
+    x = 16 // 2  # fp16
+
+    packed = torch.randn(2, 2, num_kv_heads, head_size, block_size, dtype=torch.float16)
+    packed = packed.reshape(2, 2, num_kv_heads * head_size * block_size)
+    key_cache, value_cache = PagedAttention.split_kv_cache(packed, num_kv_heads, head_size)
+    assert key_cache.ndim == 5 and key_cache.shape[3] == block_size
+
+    # Copy donor block 0 slots [4:8] into target block 1 slots [0:4], no rotation.
+    donor_k = key_cache[0, :, :, 4:8, :].clone()
+    donor_v = value_cache[0, :, :, 4:8].clone()
+    # Sentinels.
+    target_keep = key_cache[1, :, :, 4:, :].clone()
+    donor_keep = key_cache[0].clone()
+
+    fuse_copy_rotate_key_value_block_range(
+        key_cache=key_cache,
+        value_cache=value_cache,
+        src_block_id=0,
+        dst_block_id=1,
+        src_start=4,
+        src_end=8,
+        dst_start=0,
+        dst_end=4,
+        delta_pos=0,
+        inv_freq=_make_inv_freq(head_size),
+        is_neox_style=True,
+    )
+
+    torch.testing.assert_close(key_cache[1, :, :, 0:4, :], donor_k, atol=0, rtol=0)
+    torch.testing.assert_close(value_cache[1, :, :, 0:4], donor_v, atol=0, rtol=0)
+    torch.testing.assert_close(key_cache[1, :, :, 4:, :], target_keep, atol=0, rtol=0)
+    torch.testing.assert_close(key_cache[0], donor_keep, atol=0, rtol=0)
