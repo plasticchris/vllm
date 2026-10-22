@@ -869,6 +869,28 @@ class EngineCore:
     def _current_prefill_token_budget(
         self, high_load: bool | None = None, overlap: bool | None = None
     ) -> int | None:
+        # P5-3 (2026-10-21): the adaptive/high-load budget controller is
+        # OVERLAP mode's — the launcher contract is "in eb mode
+        # cadence/budget control is out of scope; aging is the only
+        # cadence". Without this gate an adaptive pin of
+        # _adaptive_prefill_budget below one mamba block (era D 18:13:43:
+        # 408 < 800) reaches schedule() in eb mode too: the first
+        # block-aligned prefill split (subblock_tokens=None) floors the
+        # capped chunk at the current block boundary and returns 0, so a
+        # force-serve step schedules ZERO prefill tokens and the oldest
+        # deferred prefill ages unbounded until an idle window opens
+        # (44 live first-serve waits of 21-190 s). eb mode always uses
+        # the configured decode-active budget. (The DP proc is
+        # eb-inert: its rank-aligned throttle override never runs the eb
+        # branch (P1-2), and _eb_idle_subblock_enabled — forced False on
+        # DPEngineCoreProc — keeps the budget overlap-behaved there too,
+        # matching the P1-3 sub-block gate. The overlap path below is
+        # byte-identical.)
+        if (
+            getattr(self, "prefill_schedule_mode", "overlap") == "eb"
+            and getattr(self, "_eb_idle_subblock_enabled", True)
+        ):
+            return getattr(self, "decode_active_prefill_token_budget", None)
         if high_load is None:
             high_load = self._prefill_load_is_high()
         if overlap is None:
