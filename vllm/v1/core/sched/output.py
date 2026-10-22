@@ -19,12 +19,13 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, KVCacheBlockRoPERotation
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
+    KVCacheBlockRoPERotation = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
@@ -287,6 +288,9 @@ class SchedulerOutput:
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
+
+    # Leyline-style in-place RoPE delta rotations on cloned KV blocks.
+    kv_cache_rope_rotations: list[KVCacheBlockRoPERotation] | None = None
 
     # Engine-core-only timing metadata for adaptive prefill control.
     scheduled_timestamp: float = 0.0

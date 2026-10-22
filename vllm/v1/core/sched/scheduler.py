@@ -2000,6 +2000,18 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
+                spliced_advance = self.kv_cache_manager.maybe_apply_leyline_splice(
+                    request, num_computed_tokens
+                )
+                if spliced_advance > 0 and not pad_spec_decode:
+                    advance = min(spliced_advance, max(0, num_new_tokens - 1))
+                    if advance > 0:
+                        num_computed_tokens += advance
+                        num_new_tokens -= advance
+                        token_budget += advance
+                        input_budget += advance
+                        if is_waiting_prefill and prefill_token_budget is not None:
+                            prefill_token_budget += advance
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 if is_waiting_prefill:
@@ -2149,6 +2161,9 @@ class Scheduler(SchedulerInterface):
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        pending_kv_cache_rope_rotations = (
+            self.kv_cache_manager.take_kv_cache_rope_rotations() or None
+        )
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -2213,6 +2228,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            kv_cache_rope_rotations=pending_kv_cache_rope_rotations,
             scheduled_prefill_tokens=scheduled_prefill_tokens,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
@@ -2319,8 +2335,12 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        now_wall = time.time()
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            was_prefill = request.num_computed_tokens < (
+                request.num_tokens + request.num_output_placeholders
+            )
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
@@ -2329,6 +2349,8 @@ class Scheduler(SchedulerInterface):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            if was_prefill and num_scheduled_token > 0:
+                request._eb_last_prefill_service_time = now_wall
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
@@ -3393,6 +3415,33 @@ class Scheduler(SchedulerInterface):
         )
         return max(time.time() - min(arrivals), 0.0) if arrivals else 0.0
 
+    def get_oldest_eb_prefill_wait_seconds(
+        self, now: float | None = None
+    ) -> float:
+        """Oldest prefill wait for EB(0) phase separation:
+        - waiting/skipped_waiting requests with zero output tokens use
+          ``request.arrival_time``;
+        - running ``is_prefill_chunk`` requests use
+          ``max(arrival_time, _eb_last_prefill_service_time)`` so a running
+          chunk that was just force-served does not stay permanently >= k and
+          latch ``force_prefill_service=True`` into a 100-token trickle on
+          every subsequent decode step.
+        """
+        t = time.time() if now is None else now
+        waits: list[float] = []
+        for request in self.running:
+            if not request.is_prefill_chunk:
+                continue
+            ref = max(
+                request.arrival_time,
+                getattr(request, "_eb_last_prefill_service_time", 0.0),
+            )
+            waits.append(max(t - ref, 0.0))
+        for request in (*self.waiting, *self.skipped_waiting):
+            if request.num_output_tokens == 0:
+                waits.append(max(t - request.arrival_time, 0.0))
+        return max(waits) if waits else 0.0
+
     def get_deferred_prefill_count(self) -> int:
         """Prefills the prefill throttle is holding back (EB(0) deferral):
         waiting with zero output tokens. A prefill that is RUNNING is being
@@ -3418,7 +3467,25 @@ class Scheduler(SchedulerInterface):
                 continue
             if oldest is None or request.arrival_time < oldest.arrival_time:
                 oldest = request
-        return oldest.request_id if oldest is not None else None
+        if oldest is not None:
+            return oldest.request_id
+        # If no waiting request is deferred, fall back to the running prefill
+        # chunk whose effective EB wait (since arrival or last service) is
+        # oldest, so an aged running chunk is also guaranteed selection on its
+        # force-serve step.
+        oldest_running: Request | None = None
+        oldest_ref = float("inf")
+        for request in self.running:
+            if not request.is_prefill_chunk:
+                continue
+            ref = max(
+                request.arrival_time,
+                getattr(request, "_eb_last_prefill_service_time", 0.0),
+            )
+            if ref < oldest_ref:
+                oldest_ref = ref
+                oldest_running = request
+        return oldest_running.request_id if oldest_running is not None else None
 
     def get_spec_profitability_stats(self) -> dict[str, object] | None:
         if self.profitability_aware_min_batch_size is None:

@@ -14,11 +14,17 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    KVCacheBlockRoPERotation,
+    resolve_block_hashes,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
     get_kv_cache_spec_kind,
@@ -847,6 +853,169 @@ class KVCacheManager:
         ]
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
+
+    def take_kv_cache_rope_rotations(
+        self,
+    ) -> list[KVCacheBlockRoPERotation]:
+        """Drain pending Leyline RoPE delta rotations across all managers."""
+        rotations: list[KVCacheBlockRoPERotation] = []
+        seen: set[tuple[int, int, int, int]] = set()
+        for mgr in self.coordinator.single_type_managers:
+            for blk_id, delta_pos, s_off, e_off in mgr.take_pending_rope_rotations():
+                key = (blk_id, delta_pos, s_off, e_off)
+                if key not in seen:
+                    seen.add(key)
+                    rotations.append(
+                        KVCacheBlockRoPERotation(
+                            block_id=blk_id,
+                            delta_pos=delta_pos,
+                            start_offset=s_off,
+                            end_offset=e_off,
+                        )
+                    )
+        return rotations
+
+    def maybe_apply_leyline_splice(
+        self,
+        request: Request,
+        num_computed_tokens_before: int,
+    ) -> int:
+        """Apply Leyline KV-cache splice directives on newly allocated blocks.
+
+        When a request carries `kv_splice_directives` and `donor_block_hashes`,
+        any full-attention KV blocks in the post-edit suffix whose donor blocks
+        are resident in `block_pool` at block-aligned boundaries are scheduled
+        for copy-on-write (`_pending_cow_copies`) + in-place RoPE delta rotation
+        (`_pending_rope_rotations`).
+
+        On pure-attention models (no Mamba layers) where a single contiguous
+        block-aligned suffix is spliced right after a cached prefix (`r == 0`),
+        `num_computed_tokens` is also advanced so the engine skips re-prefilling
+        the spliced blocks. On hybrid Mamba+Attention models, Mamba recurrent
+        states still step through the tokens while full-attention blocks receive
+        the spliced KV + RoPE rotation.
+        """
+        directives = getattr(request, "kv_splice_directives", None)
+        donor_hashes = getattr(request, "donor_block_hashes", None)
+        if not directives or not donor_hashes or not self.enable_caching:
+            return 0
+
+        # Ensure we only process splice directives once per request
+        if getattr(request, "_leyline_splice_applied", False):
+            return 0
+        request._leyline_splice_applied = True
+
+        full_attn_managers = [
+            (gid, mgr)
+            for gid, (mgr, group) in enumerate(
+                zip(
+                    self.coordinator.single_type_managers,
+                    self.kv_cache_config.kv_cache_groups,
+                )
+            )
+            if isinstance(group.kv_cache_spec, FullAttentionSpec)
+        ]
+        if not full_attn_managers:
+            return 0
+
+        first_gid, first_mgr = full_attn_managers[0]
+        block_size = first_mgr.block_size
+        group_ids = [gid for gid, _ in full_attn_managers]
+        donor_resolved = resolve_block_hashes(
+            donor_hashes, self.block_pool.hash_block_size, block_size
+        )
+
+        # Normalize directives: list of dicts or 4-tuples (s, e, r, l)
+        # where [s, e) in donor was replaced by r tokens, followed by l suffix tokens.
+        cum_delta = 0
+        new_cursor = 0
+        total_spliced_tokens = 0
+        can_advance_computed = (
+            not self.kv_cache_config.has_mamba_layers
+            and len(directives) == 1
+        )
+
+        for item in directives:
+            if isinstance(item, dict):
+                s = int(item.get("span_start", item.get("s", 0)))
+                e = int(item.get("span_end", item.get("e", 0)))
+                r = int(item.get("replacement_len", item.get("r", 0)))
+                length = int(item.get("suffix_len", item.get("l", 0)))
+            elif isinstance(item, (list, tuple)) and len(item) >= 4:
+                s, e, r, length = int(item[0]), int(item[1]), int(item[2]), int(item[3])
+            else:
+                continue
+
+            unchanged_len = max(0, s - (e - cum_delta if cum_delta else 0))
+            if new_cursor == 0:
+                unchanged_len = s
+            new_cursor += unchanged_len + r
+            cum_delta += r - (e - s)
+
+            if length <= 0 or cum_delta == 0:
+                new_cursor += max(0, length)
+                continue
+
+            donor_start = e
+            target_start = new_cursor
+            if donor_start % block_size != 0 or target_start % block_size != 0:
+                can_advance_computed = False
+                new_cursor += length
+                continue
+
+            num_full_suffix_blocks = length // block_size
+            if num_full_suffix_blocks <= 0:
+                can_advance_computed = False
+                new_cursor += length
+                continue
+
+            spliced_here = 0
+            for b_off in range(num_full_suffix_blocks):
+                donor_blk_idx = (donor_start // block_size) + b_off
+                target_blk_idx = (target_start // block_size) + b_off
+                if donor_blk_idx >= len(donor_resolved):
+                    can_advance_computed = False
+                    break
+                cached_donor_blocks = self.block_pool.get_cached_block(
+                    donor_resolved[donor_blk_idx], group_ids
+                )
+                if not cached_donor_blocks:
+                    can_advance_computed = False
+                    break
+                # Check that target block exists in each full-attention manager
+                if any(
+                    target_blk_idx >= len(mgr.req_to_blocks.get(request.request_id, ()))
+                    for _, mgr in full_attn_managers
+                ):
+                    can_advance_computed = False
+                    break
+
+                for (_, mgr), src_blk in zip(full_attn_managers, cached_donor_blocks):
+                    dst_blk = mgr.req_to_blocks[request.request_id][target_blk_idx]
+                    if dst_blk.is_null or src_blk.is_null or dst_blk.block_id == src_blk.block_id:
+                        continue
+                    # Retain both endpoints for the step's CoW copy
+                    src_blk.ref_cnt += 1
+                    dst_blk.ref_cnt += 1
+                    mgr._pending_cow_copies.append((src_blk, dst_blk))
+                    mgr._pending_rope_rotations.append(
+                        (dst_blk.block_id, cum_delta, 0, block_size)
+                    )
+                spliced_here += block_size
+
+            total_spliced_tokens += spliced_here
+            new_cursor += length
+
+        if (
+            can_advance_computed
+            and total_spliced_tokens > 0
+            and num_computed_tokens_before == s
+            and r == 0
+        ):
+            # Keep at least 1 token uncomputed so logits are produced for sampling
+            max_advance = max(0, (request.num_tokens - 1) - num_computed_tokens_before)
+            return min(total_spliced_tokens, max_advance)
+        return 0
 
     def take_boundary_state_offloads(
         self,

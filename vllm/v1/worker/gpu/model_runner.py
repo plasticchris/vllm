@@ -1104,6 +1104,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+        # Apply Leyline-style in-place RoPE delta rotations on spliced KV blocks.
+        if getattr(scheduler_output, "kv_cache_rope_rotations", None):
+            inv_freq, is_neox = self._resolve_rope_inv_freq()
+            if inv_freq is not None:
+                from vllm.v1.attention.ops.leyline_rope import (
+                    apply_kv_cache_rope_rotations_inplace,
+                )
+
+                apply_kv_cache_rope_rotations_inplace(
+                    self.compilation_config.static_forward_context,
+                    self.kv_cache_config.num_blocks,
+                    scheduler_output.kv_cache_rope_rotations,
+                    inv_freq=inv_freq,
+                    is_neox_style=is_neox,
+                )
+
+    def _resolve_rope_inv_freq(self) -> tuple[torch.Tensor | None, bool]:
+        cached = getattr(self, "_cached_rope_inv_freq", None)
+        if cached is not None:
+            return cached
+        from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
+
+        for mod in self.model.modules():
+            if isinstance(mod, RotaryEmbeddingBase):
+                inv_freq = mod._compute_inv_freq(mod.base).to(
+                    device=self.device, dtype=torch.float32
+                )
+                is_neox = bool(getattr(mod, "is_neox_style", True))
+                self._cached_rope_inv_freq = (inv_freq, is_neox)
+                return self._cached_rope_inv_freq
+        return None, True
+
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
     ) -> tuple["BatchReqState | None", int | None]:

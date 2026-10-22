@@ -919,6 +919,88 @@ def test_eb_engine_selects_oldest_deferred_for_force_serve():
     assert core._eb_forced_prefill_id == "untouched"
 
 
+def test_eb_running_prefill_chunk_resets_wait_after_force_serve():
+    """Root-cause-A fix: once an aged waiting prefill is force-served into
+    ``self.running`` and executes a 100-token sub-block, its effective EB
+    wait resets via ``_eb_last_prefill_service_time`` so the next step
+    returns to pure decode instead of latching ``force_prefill_service=True``
+    into an unbroken 100-token trickle on every subsequent decode step."""
+    scheduler = create_scheduler(
+        max_num_seqs=8,
+        max_num_batched_tokens=4096,
+        long_prefill_token_threshold=4096,
+        block_size=800,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    (decode_req,) = create_requests(
+        num_requests=1, num_tokens=800, req_ids=["dec0"], max_tokens=64
+    )
+    scheduler.add_request(decode_req)
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=["dec0"],
+            req_id_to_index={"dec0": 0},
+            sampled_token_ids=[[0]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # Add a single prefill request that has already aged past k=5.0s.
+    (p0,) = create_requests(
+        num_requests=1, num_tokens=2400, req_ids=["p0"], max_tokens=8
+    )
+    p0.arrival_time = time.time() - 6.0
+    scheduler.add_request(p0)
+
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = scheduler
+    core.prefill_schedule_mode = "eb"
+    core.prefill_schedule_eb_age_seconds = 5.0
+    core.prefill_schedule_eb_idle_subblock = 400
+    core.prefill_schedule_high_load_interval = None
+    core.decode_active_prefill_high_load_token_budget = None
+    core._prefill_schedule_step = 0
+    core._eb_forced_prefill_id = None
+    core._adaptive_oldest_prefill_wait_seconds = 0.0
+    core._adaptive_deferred_prefill_count = None
+    core._adaptive_aging_interval = None
+    core._adaptive_aging_token_budget = None
+    core._adaptive_high_load = False
+    core._adaptive_control_tier = None
+
+    # Step 1: p0's wait is 6.0s >= k=5.0s -> force-served for 100 tokens.
+    assert core._should_throttle_prefills() is False
+    out1 = scheduler.schedule(
+        False, 3072, 100, core._eb_forced_prefill_id
+    )
+    assert out1.num_scheduled_tokens == {"dec0": 1, "p0": 100}
+    _p51_step_out(scheduler, out1)
+    assert p0 in scheduler.running and p0.is_prefill_chunk
+
+    # Step 2 (immediately after, < k seconds since service): p0 was just
+    # served, so EB throttles prefill again and dec0 gets a clean decode step!
+    assert scheduler.get_oldest_eb_prefill_wait_seconds() < 1.0
+    assert core._should_throttle_prefills() is True
+    out2 = scheduler.schedule(True, 3072, 100, core._eb_forced_prefill_id)
+    assert out2.num_scheduled_tokens == {"dec0": 1}
+    assert out2.scheduled_prefill_tokens == 0
+    _p51_step_out(scheduler, out2)
+
+    # Step 3: once k seconds elapse since p0's last service, p0 is force-served
+    # again even though no waiting requests exist.
+    p0._eb_last_prefill_service_time = time.time() - 5.5
+    assert scheduler.get_oldest_eb_prefill_wait_seconds() >= 5.0
+    assert core._should_throttle_prefills() is False
+    assert core._eb_forced_prefill_id == "p0"
+    out3 = scheduler.schedule(
+        False, 3072, 100, core._eb_forced_prefill_id
+    )
+    assert out3.num_scheduled_tokens == {"dec0": 1, "p0": 100}
+
+
 def test_decode_prefill_arrival_gap():
     scheduler = Scheduler.__new__(Scheduler)
     decode = Mock(is_prefill_chunk=False, arrival_time=10.0)
@@ -7676,3 +7758,107 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
     assert output.num_scheduled_tokens[req_id] > 0
     assert not output.scheduled_encoder_inputs.get(req_id)
+
+
+def test_leyline_kv_splice_schedules_cow_and_rope_rotations():
+    """Verify Leyline KV splice directives clone donor suffix blocks and emit
+    KVCacheBlockRoPERotation with delta_pos = r - (e - s)."""
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        enable_prefix_caching=True,
+        max_num_batched_tokens=1024,
+    )
+
+    # Donor prompt: 4 full blocks (64 tokens) + 4 tail tokens = 68 tokens.
+    # Block 0: [0..15] (prefix)
+    # Block 1: [16..31] (to be omitted: s=16, e=32, r=0)
+    # Block 2: [32..47] (suffix block 0 -> shifts to [16..31], delta_pos = -16)
+    # Block 3: [48..63] (suffix block 1 -> shifts to [32..47], delta_pos = -16)
+    donor_tokens = list(range(100, 168))
+    (donor_req,) = create_requests(
+        num_requests=1,
+        num_tokens=len(donor_tokens),
+        block_size=block_size,
+        req_ids=["donor"],
+    )
+    donor_req.prompt_token_ids = donor_tokens
+    donor_req._all_token_ids = donor_tokens.copy()
+    donor_req.num_prompt_tokens = len(donor_tokens)
+    donor_req.block_hashes.clear()
+    donor_req.update_block_hashes()
+
+    scheduler.add_request(donor_req)
+    out1 = scheduler.schedule()
+    assert out1.num_scheduled_tokens["donor"] == len(donor_tokens)
+    donor_blocks = scheduler.kv_cache_manager.get_block_ids("donor")[0]
+    assert len(donor_blocks) == 5
+
+    # Complete donor prefill so its full blocks [0..3] are cached in block_pool
+    scheduler.update_from_output(
+        out1,
+        ModelRunnerOutput(
+            req_ids=["donor"],
+            req_id_to_index={"donor": 0},
+            sampled_token_ids=[[999]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    # Spliced prompt omits tokens [16..32) -> 52 tokens total
+    spliced_tokens = donor_tokens[:16] + donor_tokens[32:]
+    spliced_sp = SamplingParams(
+        max_tokens=8,
+        extra_args={
+            "kv_splice_donor_tokens": donor_tokens,
+            "kv_splice_directives": [
+                {
+                    "span_start": 16,
+                    "span_end": 32,
+                    "replacement_len": 0,
+                    "suffix_len": 32,
+                }
+            ],
+        },
+    )
+    (spliced_req,) = create_requests(
+        num_requests=1,
+        num_tokens=len(spliced_tokens),
+        block_size=block_size,
+        req_ids=["spliced"],
+    )
+    spliced_req.sampling_params = spliced_sp
+    spliced_req.kv_splice_donor_tokens = donor_tokens
+    spliced_req.kv_splice_directives = spliced_sp.extra_args["kv_splice_directives"]
+    spliced_req.prompt_token_ids = spliced_tokens
+    spliced_req._all_token_ids = spliced_tokens.copy()
+    spliced_req.num_prompt_tokens = len(spliced_tokens)
+    spliced_req.block_hashes.clear()
+    spliced_req.update_block_hashes()
+    # Recompute donor_block_hashes with the same block_hasher
+    spliced_req.donor_block_hashes = donor_req.block_hashes.copy()
+
+    scheduler.add_request(spliced_req)
+    out2 = scheduler.schedule()
+
+    # Prefix block 0 (16 tokens) hit prefix cache; 2 suffix blocks (32 tokens)
+    # were spliced via CoW + RoPE rotation (-16), leaving only the 4 tail tokens!
+    assert out2.num_scheduled_tokens["spliced"] == 4
+    assert out2.kv_cache_block_copies is not None
+    assert len(out2.kv_cache_block_copies) == 2
+    assert out2.kv_cache_rope_rotations is not None
+    assert len(out2.kv_cache_rope_rotations) == 2
+    for copy_op, rot_op in zip(
+        out2.kv_cache_block_copies, out2.kv_cache_rope_rotations
+    ):
+        assert rot_op.block_id == copy_op.dst_block_id
+        assert rot_op.delta_pos == -16
+        assert rot_op.start_offset == 0
+        assert rot_op.end_offset == block_size
+    assert [c.src_block_id for c in out2.kv_cache_block_copies] == [
+        donor_blocks[2],
+        donor_blocks[3],
+    ]
+

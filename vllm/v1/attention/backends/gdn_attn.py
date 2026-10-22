@@ -48,6 +48,10 @@ class GDNAttentionMetadata:
     num_spec_decode_tokens: int
     num_actual_tokens: int
 
+    # True when every non-spec sequence (decodes and prefills) runs through
+    # one recurrent-kernel launch instead of the chunked prefill pipeline.
+    # Only set for batches with prefills, so FULL decode graphs never see it.
+    use_recurrent_prefill: bool = False
     has_initial_state: torch.Tensor | None = None
 
     spec_query_start_loc: torch.Tensor | None = None  # shape: [num_spec_decodes + 1,]
@@ -98,10 +102,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.kv_cache_spec = kv_cache_spec
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             _resolve_gdn_prefill_backend,
+            _resolve_recurrent_prefill_max_query_len,
         )
 
         self.gdn_prefill_backend: Literal["triton", "flashinfer", "cutedsl"]
         _, self.gdn_prefill_backend = _resolve_gdn_prefill_backend(vllm_config)
+        # Measured against the FLA (Triton) chunk pipeline only; the other
+        # prefill backends keep their chunk path.
+        self.recurrent_prefill_max_query_len = (
+            _resolve_recurrent_prefill_max_query_len(vllm_config)
+            if self.gdn_prefill_backend == "triton"
+            else 0
+        )
 
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
@@ -365,6 +377,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
+        use_recurrent_prefill = num_prefills > 0 and self._fits_recurrent_prefill(
+            non_spec_query_start_loc_cpu
+        )
+
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
         prefill_query_start_loc: torch.Tensor | None = None
@@ -502,6 +518,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decodes=num_spec_decodes,
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
+            use_recurrent_prefill=use_recurrent_prefill,
             has_initial_state=has_initial_state,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
@@ -521,6 +538,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
         return attn_metadata
+
+    def _fits_recurrent_prefill(
+        self, non_spec_query_start_loc_cpu: torch.Tensor | None
+    ) -> bool:
+        """Whether the longest non-spec query is short enough for the recurrent
+        kernel. The kernel walks each sequence token by token, so its run time
+        grows with the longest sequence, while the chunked pipeline has a fixed
+        cost per layer. Reads only host tensors: no device sync."""
+        if self.recurrent_prefill_max_query_len == 0:
+            return False
+        assert non_spec_query_start_loc_cpu is not None
+        max_query_len = int(non_spec_query_start_loc_cpu.diff().max())
+        return max_query_len <= self.recurrent_prefill_max_query_len
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata

@@ -226,6 +226,15 @@ class KVCacheBlockCopy(NamedTuple):
     dst_block_id: int
 
 
+class KVCacheBlockRoPERotation(NamedTuple):
+    """Leyline-style in-place RoPE delta rotation on a cloned KV cache block."""
+
+    block_id: int
+    delta_pos: int
+    start_offset: int = 0
+    end_offset: int = 0
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python

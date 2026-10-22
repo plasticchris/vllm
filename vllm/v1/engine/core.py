@@ -1278,7 +1278,13 @@ class EngineCore:
             # only a force-serve step below re-sets it).
             self._eb_forced_prefill_id = None
             if active_decode:
-                oldest_wait = scheduler.get_oldest_prefill_wait_seconds()
+                get_eb_wait = getattr(
+                    scheduler, "get_oldest_eb_prefill_wait_seconds", None
+                )
+                if callable(get_eb_wait) and type(get_eb_wait).__name__ == "method":
+                    oldest_wait = get_eb_wait()
+                else:
+                    oldest_wait = scheduler.get_oldest_prefill_wait_seconds()
                 age = getattr(self, "prefill_schedule_eb_age_seconds", None)
                 if age is not None and oldest_wait >= age:
                     force_prefill_service = True

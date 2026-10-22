@@ -115,6 +115,7 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        self._pending_rope_rotations: list[tuple[int, int, int, int]] = []
         # Boundary-state offload hand-off for external KV connectors. A mamba
         # "align" block table is not append-only (interior states are
         # nulled/freed and speculative blocks relocate in place), so a
@@ -388,6 +389,14 @@ class SingleTypeKVCacheManager(ABC):
         pending_copies = self._pending_cow_copies
         self._pending_cow_copies = []
         return pending_copies
+
+    def take_pending_rope_rotations(
+        self,
+    ) -> list[tuple[int, int, int, int]]:
+        """Drain pending Leyline RoPE delta rotations: (block_id, delta_pos, start_offset, end_offset)."""
+        rotations = self._pending_rope_rotations
+        self._pending_rope_rotations = []
+        return rotations
 
     def take_pending_boundary_state_offloads(
         self,

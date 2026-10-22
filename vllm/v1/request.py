@@ -124,9 +124,19 @@ class Request:
                 self.kv_cache_report_mode = sampling_params.extra_args.get(
                     "kv_cache_report_mode", "incremental"
                 )
+                self.kv_splice_directives = sampling_params.extra_args.get(
+                    "kv_splice_directives"
+                )
+                self.kv_splice_donor_tokens = sampling_params.extra_args.get(
+                    "kv_splice_donor_tokens"
+                )
             else:
                 self.kv_cache_report_mode = "incremental"
+                self.kv_splice_directives = None
+                self.kv_splice_donor_tokens = None
         else:
+            self.kv_splice_directives = None
+            self.kv_splice_donor_tokens = None
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
         self.prompt_token_ids = prompt_token_ids
@@ -217,11 +227,26 @@ class Request:
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
         self.block_hashes: list[BlockHash] = []
+        self.donor_block_hashes: list[BlockHash] | None = None
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
         self._block_hasher: Callable[[Request], list[BlockHash]] | None = block_hasher
         self.update_block_hashes()
+        if (
+            self._block_hasher is not None
+            and self.kv_splice_donor_tokens
+            and isinstance(self.kv_splice_donor_tokens, list)
+        ):
+            saved_all = self._all_token_ids
+            saved_hashes = self.block_hashes
+            try:
+                self._all_token_ids = list(self.kv_splice_donor_tokens)
+                self.block_hashes = []
+                self.donor_block_hashes = self._block_hasher(self)
+            finally:
+                self._all_token_ids = saved_all
+                self.block_hashes = saved_hashes
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
