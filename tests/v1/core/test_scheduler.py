@@ -7812,6 +7812,7 @@ def test_leyline_kv_splice_schedules_cow_and_rope_rotations():
     spliced_sp = SamplingParams(
         max_tokens=8,
         extra_args={
+            "kv_splice_mode": "amortize",
             "kv_splice_donor_tokens": donor_tokens,
             "kv_splice_directives": [
                 {
@@ -7862,3 +7863,186 @@ def test_leyline_kv_splice_schedules_cow_and_rope_rotations():
         donor_blocks[3],
     ]
 
+
+def _make_donor_spliced_hybrid_requests(block_size: int):
+    """Build a donor prompt and a spliced prompt sharing a prefix.
+    Donor = 4 full blocks (64 tok) + 4 tail = 68 tok; spliced omits donor
+    tokens [16,32) -> 52 tok."""
+    donor_tokens = list(range(100, 100 + 68))
+    (donor_req,) = create_requests(
+        num_requests=1,
+        num_tokens=len(donor_tokens),
+        block_size=block_size,
+        req_ids=["donor"],
+    )
+    donor_req.prompt_token_ids = donor_tokens
+    donor_req._all_token_ids = donor_tokens.copy()
+    donor_req.num_prompt_tokens = len(donor_tokens)
+    donor_req.block_hashes.clear()
+    donor_req.update_block_hashes()
+
+    spliced_tokens = donor_tokens[:16] + donor_tokens[32:]
+    (spliced_req,) = create_requests(
+        num_requests=1,
+        num_tokens=len(spliced_tokens),
+        block_size=block_size,
+        req_ids=["spliced"],
+    )
+    spliced_req.prompt_token_ids = spliced_tokens
+    spliced_req._all_token_ids = spliced_tokens.copy()
+    spliced_req.num_prompt_tokens = len(spliced_tokens)
+    spliced_req.block_hashes.clear()
+    spliced_req.update_block_hashes()
+    return donor_req, spliced_req, donor_tokens, spliced_tokens
+
+
+def _seed_hybrid_donor(scheduler, block_size, donor_req, donor_tokens):
+    """Run the donor prefill to completion so its blocks are in the cache."""
+    scheduler.add_request(donor_req)
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens["donor"] == len(donor_tokens)
+    donor_blocks = scheduler.kv_cache_manager.get_block_ids("donor")[0]
+    assert len(donor_blocks) == 5
+    scheduler.update_from_output(
+        out,
+        ModelRunnerOutput(
+            req_ids=["donor"],
+            req_id_to_index={"donor": 0},
+            sampled_token_ids=[[999]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    return donor_blocks
+
+
+def test_hybrid_splice_mode_off_leaves_ordinary_prefill_unchanged():
+    """Hybrid (FA+Mamba) fixture, kv_splice_mode OFF (default): a spliced
+    request carrying valid amortize directives must schedule exactly the same
+    as an identical control request with NO splice directives, and must emit
+    zero CoW copies / RoPE rotations and not mark the splice as applied.
+
+    This proves the mode gate keeps the ordinary scheduled-prefill path
+    byte-identical when the feature is off.
+    """
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
+    assert isinstance(scheduler.kv_cache_manager.coordinator, HybridKVCacheCoordinator)
+
+    donor_req, spliced_req, donor_tokens, spliced_tokens = (
+        _make_donor_spliced_hybrid_requests(block_size)
+    )
+    _seed_hybrid_donor(scheduler, block_size, donor_req, donor_tokens)
+
+    # Control: identical prompt, NO splice directives -> the ordinary path.
+    # In this hybrid (mamba "all") fixture the prefix cache resolves 48 tokens
+    # (FA blocks 1-3 survive via the pool + mamba states), so the remainder
+    # (52 - 48) is scheduled.
+    (control_req,) = create_requests(
+        num_requests=1,
+        num_tokens=len(spliced_tokens),
+        block_size=block_size,
+        req_ids=["control"],
+    )
+    control_req.prompt_token_ids = spliced_tokens
+    control_req._all_token_ids = spliced_tokens.copy()
+    control_req.num_prompt_tokens = len(spliced_tokens)
+    control_req.block_hashes.clear()
+    control_req.update_block_hashes()
+    scheduler.add_request(control_req)
+    out_control = scheduler.schedule()
+    control_sched = out_control.num_scheduled_tokens["control"]
+    assert control_sched == len(spliced_tokens) - 3 * block_size
+    assert not out_control.kv_cache_block_copies
+    assert not out_control.kv_cache_rope_rotations
+
+    # Spliced request: same prompt, valid amortize directives, mode OFF.
+    spliced_req.sampling_params = SamplingParams(
+        max_tokens=8,
+        extra_args={
+            "kv_splice_mode": "off",
+            "kv_splice_donor_tokens": donor_tokens,
+            "kv_splice_directives": [
+                {
+                    "span_start": 16,
+                    "span_end": 32,
+                    "replacement_len": 0,
+                    "suffix_len": 32,
+                }
+            ],
+        },
+    )
+    spliced_req.kv_splice_donor_tokens = donor_tokens
+    spliced_req.kv_splice_directives = spliced_req.sampling_params.extra_args[
+        "kv_splice_directives"
+    ]
+    spliced_req.donor_block_hashes = donor_req.block_hashes.copy()
+    scheduler.add_request(spliced_req)
+    out_spliced = scheduler.schedule()
+    spliced_sched = out_spliced.num_scheduled_tokens["spliced"]
+
+    # Mode OFF => scheduled identically to the ordinary request; no splice ops;
+    # the splice was not applied.
+    assert spliced_sched == control_sched
+    assert not out_spliced.kv_cache_block_copies
+    assert not out_spliced.kv_cache_rope_rotations
+    assert getattr(spliced_req, "_leyline_splice_applied", False) is False
+
+
+def test_hybrid_splice_mode_on_emits_cow_without_advancing():
+    """Hybrid (FA+Mamba) fixture, kv_splice_mode=amortize: the donor's
+    suffix blocks are scheduled for CoW + RoPE rotation (delta -16), but on a
+    hybrid model num_computed does NOT advance (the has_mamba gate) — so the
+    scheduled prefill is unchanged and the copies are wasted today. This
+    pins the current hybrid behavior that the avoidance work must turn into a
+    real num_computed advance."""
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
+    assert isinstance(scheduler.kv_cache_manager.coordinator, HybridKVCacheCoordinator)
+
+    donor_req, spliced_req, donor_tokens, spliced_tokens = (
+        _make_donor_spliced_hybrid_requests(block_size)
+    )
+    donor_blocks = _seed_hybrid_donor(scheduler, block_size, donor_req, donor_tokens)
+
+    spliced_req.sampling_params = SamplingParams(
+        max_tokens=8,
+        extra_args={
+            "kv_splice_mode": "amortize",
+            "kv_splice_donor_tokens": donor_tokens,
+            "kv_splice_directives": [
+                {
+                    "span_start": 16,
+                    "span_end": 32,
+                    "replacement_len": 0,
+                    "suffix_len": 32,
+                }
+            ],
+        },
+    )
+    spliced_req.kv_splice_donor_tokens = donor_tokens
+    spliced_req.kv_splice_directives = spliced_req.sampling_params.extra_args[
+        "kv_splice_directives"
+    ]
+    spliced_req.donor_block_hashes = donor_req.block_hashes.copy()
+    scheduler.add_request(spliced_req)
+    out = scheduler.schedule()
+
+    # Full suffix (2 blocks) spliced via CoW + rotation (delta -16) ...
+    assert out.kv_cache_block_copies is not None
+    assert len(out.kv_cache_block_copies) == 2
+    assert out.kv_cache_rope_rotations is not None
+    assert len(out.kv_cache_rope_rotations) == 2
+    for copy_op, rot_op in zip(out.kv_cache_block_copies, out.kv_cache_rope_rotations):
+        assert rot_op.block_id == copy_op.dst_block_id
+        assert rot_op.delta_pos == -16
+        assert rot_op.start_offset == 0
+        assert rot_op.end_offset == block_size
+    # ... sources are the donor's cached suffix blocks (pool-resolved ids).
+    assert sorted(c.src_block_id for c in out.kv_cache_block_copies) == sorted(
+        donor_blocks[2:4]
+    )
+    # ... but num_computed does NOT advance on the hybrid model, so the
+    # ordinary prefill (52 - 48 hit = 4 tokens) is still scheduled.
+    assert out.num_scheduled_tokens["spliced"] == len(spliced_tokens) - 3 * block_size

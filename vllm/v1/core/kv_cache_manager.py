@@ -897,6 +897,16 @@ class KVCacheManager:
         """
         directives = getattr(request, "kv_splice_directives", None)
         donor_hashes = getattr(request, "donor_block_hashes", None)
+        # Explicit opt-in: directives are ignored unless the request's sampling
+        # params set kv_splice_mode="amortize" (default off -> ordinary path
+        # stays untouched). Read from the live sampling_params so the mode
+        # tracks the params actually attached to the request.
+        _sp = getattr(request, "sampling_params", None)
+        _mode = "off"
+        if _sp is not None and getattr(_sp, "extra_args", None) is not None:
+            _mode = _sp.extra_args.get("kv_splice_mode", "off")
+        if _mode != "amortize":
+            return 0
         if not directives or not donor_hashes or not self.enable_caching:
             return 0
 
