@@ -753,7 +753,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # no cap (getattr -> None) so this is a no-op for the ordinary path.
         max_cacheable = getattr(request, "_leyline_max_cacheable_tokens", None)
         if max_cacheable is not None:
-            num_computed_tokens = min(num_computed_tokens, max_cacheable)
+            num_computed_tokens = min(
+                num_computed_tokens,
+                round_down(max_cacheable, self.scheduler_block_size),
+            )
         cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
         for manager in self.single_type_managers:
             num_tokens_to_cache = cached_num_computed_tokens
