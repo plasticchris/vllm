@@ -22,16 +22,20 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.core.kv_cache_utils import MambaStateTransplant
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
     _reinterpret_u64_as_i64,
+    apply_mamba_state_transplants,
     batch_memcpy,
     collect_mamba_copy_meta,
     do_mamba_copy_block,
     get_mamba_groups,
+    mamba_state_idx_guard_target,
     preprocess_mamba,
+    stage_mamba_state_idx_guard,
     stage_postprocess_inputs_to_gpu,
 )
 
@@ -2781,3 +2785,147 @@ class TestPostprocessMambaFusedKernel:
             atol=0,
             msg="DS num_accepted_tokens result is wrong",
         )
+
+
+# ---------------------------------------------------------------------------
+# GAP 3: worker Mamba transplant execution + _mamba_state_idx_gpu align guard.
+#
+# The CPU fixture uses mamba "all" so state_idx is not allocated and the
+# align-mode path is normally not exercised; this test covers the worker-side
+# execution (whole-block CoW of the donor GDN boundary state into the target's
+# splice-point slot) and the align-mode A6 clobber guard (staging
+# _mamba_state_idx_gpu to the transplant column) with a fake forward context,
+# so it is CPU-verifiable (no GPU, no live model).
+# ---------------------------------------------------------------------------
+
+
+def _make_hybrid_transplant_cfg(
+    *,
+    num_blocks: int = 32,
+    layers: tuple[str, ...] = ("l0", "l1"),
+    shapes=((4, 4), (2, 3, 3)),
+):
+    """A single GDN mamba group (align mode, block_size=16) over ``layers``."""
+    spec = MambaSpec(
+        block_size=16,
+        shapes=shapes,
+        dtypes=(torch.float16,) * len(shapes),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="align",
+    )
+    group = KVCacheGroupSpec(layer_names=list(layers), kv_cache_spec=spec)
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[group],
+    )
+
+
+def _make_fake_forward_context(
+    *,
+    cfg: KVCacheConfig,
+    num_blocks: int,
+    shapes,
+    sentinel: float = 0.0,
+    donor_block: int = 9,
+    donor_value: float = 7.5,
+):
+    """Fake forward_context: per-layer ``.kv_cache`` = list of state tensors,
+    each indexed by physical block id (the GDN convention, verified against
+    ``ssm_state[prefill_state_indices]``). The donor block is filled with a
+    distinct value; every other block (incl. the transplant target) with a
+    sentinel, so a correct transplant is detectable."""
+    import types
+
+    ctx: dict[str, Any] = {}
+    for layer_name in cfg.kv_cache_groups[0].layer_names:
+        states = [
+            torch.full((num_blocks, *shape), sentinel, dtype=torch.float16)
+            for shape in shapes
+        ]
+        for state in states:
+            state[donor_block].fill_(donor_value)
+        ctx[layer_name] = types.SimpleNamespace(kv_cache=states)
+    return ctx
+
+
+def test_mamba_transplant_executes_block_copy_per_layer():
+    cfg = _make_hybrid_transplant_cfg()
+    shapes = ((4, 4), (2, 3, 3))
+    # Fixture geometry: donor Mamba boundary block 9 (d_cached=64) transplanted
+    # into target Mamba block 15 at column 2 = (48-1)//16.
+    fwd_ctx = _make_fake_forward_context(cfg=cfg, num_blocks=32, shapes=shapes)
+    transplant = MambaStateTransplant(
+        req_id="tgt",
+        group_id=0,
+        src_block_id=9,
+        dst_block_id=15,
+        target_idx=2,
+    )
+
+    apply_mamba_state_transplants(cfg, fwd_ctx, [transplant])
+
+    # Every state tensor of every layer in the group now holds the donor's
+    # boundary state at the target block; donor + all other blocks untouched.
+    for layer_name in ("l0", "l1"):
+        for i, state in enumerate(fwd_ctx[layer_name].kv_cache):
+            assert torch.allclose(
+                state[15], torch.full_like(state[15], 7.5)
+            ), f"layer {layer_name} state {i}: target block not transplanted"
+            # Donor block preserved (CoW, not move).
+            assert torch.allclose(
+                state[9], torch.full_like(state[9], 7.5)
+            ), f"layer {layer_name} state {i}: donor block clobbered"
+            # An unrelated block stays at the sentinel (no spurious writes).
+            assert torch.allclose(
+                state[3], torch.full_like(state[3], 0.0)
+            ), f"layer {layer_name} state {i}: unrelated block modified"
+            assert state.shape[0] == 32  # block-count dim intact
+
+
+def test_mamba_transplant_is_noop_when_empty_and_self():
+    cfg = _make_hybrid_transplant_cfg()
+    shapes = ((4, 4), (2, 3, 3))
+    fwd_ctx = _make_fake_forward_context(cfg=cfg, num_blocks=32, shapes=shapes)
+
+    # Empty list: no-op (the common mode-off path).
+    apply_mamba_state_transplants(cfg, fwd_ctx, [])
+    assert (fwd_ctx["l0"].kv_cache[0][15] == 0.0).all()
+
+    # src == dst: must not self-overwrite / raise (defensive).
+    self_t = MambaStateTransplant("tgt", 0, 9, 9, 2)
+    apply_mamba_state_transplants(cfg, fwd_ctx, [self_t])
+    assert (fwd_ctx["l0"].kv_cache[0][9] == 7.5).all()
+
+
+def test_mamba_state_idx_guard_stages_transplant_column():
+    cfg = _make_hybrid_transplant_cfg()
+    t = MambaStateTransplant("tgt", 0, 9, 15, 2)
+    other = MambaStateTransplant("oth", 0, 1, 7, 5)
+
+    # Align-mode state index: one row per request slot (fake _mamba_state_idx_gpu).
+    state_idx = torch.zeros(8, dtype=torch.int32)
+    # req "tgt" is slot 3, req "oth" is slot 0; slot 2 is an unrelated req.
+    req_index = {"tgt": 3, "oth": 0}
+
+    staged = stage_mamba_state_idx_guard(state_idx, req_index, [t, other])
+
+    assert staged == 2
+    assert state_idx[3].item() == 2  # tgt -> transplant column 2
+    assert state_idx[0].item() == 5  # oth -> transplant column 5
+    assert state_idx[2].item() == 0  # unrelated slot untouched
+
+    # Per-request helper: returns the column for a planted req, None otherwise.
+    assert mamba_state_idx_guard_target([t, other], "tgt") == 2
+    assert mamba_state_idx_guard_target([t, other], "oth") == 5
+    assert mamba_state_idx_guard_target([t, other], "ghost") is None
+    assert mamba_state_idx_guard_target([], "tgt") is None
+
+
+def test_mamba_state_idx_guard_ignores_unknown_reqs():
+    t = MambaStateTransplant("ghost", 0, 9, 15, 2)
+    state_idx = torch.zeros(4, dtype=torch.int32)
+    # "ghost" has no slot in this step (preempted / not in persistent batch):
+    # nothing is staged, no out-of-bounds write.
+    assert stage_mamba_state_idx_guard(state_idx, {}, [t]) == 0
+    assert (state_idx == 0).all()

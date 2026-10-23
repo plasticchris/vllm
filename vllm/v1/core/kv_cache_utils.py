@@ -258,6 +258,27 @@ class KVCacheBlockSplice(NamedTuple):
     delta_pos: int
 
 
+class MambaStateTransplant(NamedTuple):
+    """Leyline hybrid splice (design §2b/§2d): a CoW of the donor's Mamba (GDN)
+    boundary-state block into the target's state slot at the splice point, so
+    the tail-prefill forward continues from the donor's recurrent state.
+
+    ``src_block_id`` is the donor Mamba block holding the boundary state at
+    ``d_cached`` (``d_cached >= target_end``); ``dst_block_id`` is the target
+    Mamba block for the transplant column; ``target_idx`` is the state column
+    (== ``(target_end - 1) // mamba_block_size``) where the boundary state is
+    planted. The worker executes the whole-block state copy AND stages
+    ``_mamba_state_idx_gpu[req] = target_idx`` (align mode) so the phase-3
+    boundary-migration kernel does not clobber the planted state (A6 trap).
+    """
+
+    req_id: str
+    group_id: int
+    src_block_id: int
+    dst_block_id: int
+    target_idx: int
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python

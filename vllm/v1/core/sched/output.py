@@ -19,13 +19,18 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy, KVCacheBlockRoPERotation
+    from vllm.v1.core.kv_cache_utils import (
+        KVCacheBlockCopy,
+        KVCacheBlockRoPERotation,
+        MambaStateTransplant,
+    )
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
     KVCacheBlockRoPERotation = object
+    MambaStateTransplant = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
@@ -291,6 +296,13 @@ class SchedulerOutput:
 
     # Leyline-style in-place RoPE delta rotations on cloned KV blocks.
     kv_cache_rope_rotations: list[KVCacheBlockRoPERotation] | None = None
+
+    # Leyline hybrid splice (design §2b/§2d): CoW of the donor Mamba (GDN)
+    # boundary-state block into the target's splice-point state slot. Applied on
+    # the worker before the phase-3 Mamba boundary migration so the tail
+    # prefill continues from the donor's recurrent state (and the align-mode
+    # state index is staged so the migration kernel does not clobber it, A6).
+    mamba_state_transplants: list[MambaStateTransplant] | None = None
 
     # Engine-core-only timing metadata for adaptive prefill control.
     scheduled_timestamp: float = 0.0

@@ -1120,6 +1120,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     is_neox_style=is_neox,
                 )
 
+        # Apply Leyline hybrid-splice Mamba boundary-state transplants: whole-block
+        # CoW of the donor GDN state into the target's splice-point slot, run
+        # after zeroing + CoW copies and BEFORE the phase-3 Mamba boundary
+        # migration (preprocess_state) so the migration kernel never sees an
+        # empty destination. No-op when the step has no transplants (the common
+        # case: mode off / no Mamba model / no splice).
+        mamba_state_transplants = getattr(
+            scheduler_output, "mamba_state_transplants", None
+        )
+        if mamba_state_transplants:
+            from vllm.v1.worker.mamba_utils import (
+                apply_mamba_state_transplants,
+                stage_mamba_state_idx_guard,
+            )
+
+            apply_mamba_state_transplants(
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
+                mamba_state_transplants,
+            )
+            # Align-mode A6 clobber guard: stage _mamba_state_idx_gpu[req] to the
+            # transplant column so the phase-3 migration kernel's per-request
+            # pre-copy fast-exits (src_col == new_state_idx == target_idx) instead
+            # of copying a stale/null state over the freshly transplanted one.
+            # Non-align modes have no _mamba_state_idx_gpu tensor (CPU-only dict),
+            # so this is a no-op there and the request's state column (the
+            # manager's) is unchanged by the transplant.
+            state_idx = getattr(self.model_state, "_mamba_state_idx_gpu", None)
+            req_index = getattr(self.req_states, "req_id_to_index", None)
+            if state_idx is not None and req_index is not None:
+                stage_mamba_state_idx_guard(
+                    state_idx, req_index, mamba_state_transplants
+                )
+
     def _resolve_rope_inv_freq(self) -> tuple[torch.Tensor | None, bool]:
         cached = getattr(self, "_cached_rope_inv_freq", None)
         if cached is not None:

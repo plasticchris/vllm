@@ -19,6 +19,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.kv_cache_utils import MambaStateTransplant
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -1380,6 +1381,96 @@ def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
         copy_bufs.dst_ptrs.copy_to_gpu(n),
         copy_bufs.sizes.copy_to_gpu(n),
     )
+
+
+def apply_mamba_state_transplants(
+    kv_cache_config: KVCacheConfig,
+    forward_context: dict[str, Any],
+    transplants: list[MambaStateTransplant],
+) -> None:
+    """Execute Leyline hybrid-splice Mamba boundary-state transplants (design
+    §2b/§2d).
+
+    For each transplant, whole-block-copy the donor's Mamba (GDN) state block
+    ``src_block_id`` into the target's state block ``dst_block_id`` for every
+    state tensor of the group's layers. The state tensors are indexed by
+    physical block id (``forward_context[layer].kv_cache[i][block_id]``), so
+    this is a plain per-tensor ``dst.copy_(src)`` across the group's layers —
+    the same addressing the per-step ``collect_mamba_copy_meta`` / fused
+    kernels use, but a full-block CoW (the donor boundary state at ``d_cached``
+    must survive into the target's splice-point slot so the tail prefill
+    continues from the donor's recurrent state).
+
+    Runs on the worker, after zeroing + CoW block copies and BEFORE the
+    phase-3 Mamba boundary migration (``preprocess_mamba`` /
+    ``MambaHybridModelState.preprocess_state``) so the migration kernel never
+    sees an empty destination.
+    """
+    if not transplants:
+        return
+    for t in transplants:
+        if t.dst_block_id == t.src_block_id:
+            continue
+        layer_names = kv_cache_config.kv_cache_groups[t.group_id].layer_names
+        for layer_name in layer_names:
+            kv_caches: list[torch.Tensor] = forward_context[layer_name].kv_cache
+            for state in kv_caches:
+                state[t.dst_block_id].copy_(state[t.src_block_id], non_blocking=True)
+
+
+def mamba_state_idx_guard_target(
+    transplants: list[MambaStateTransplant],
+    req_id: str,
+) -> int | None:
+    """Return the transplant state column to stage in ``_mamba_state_idx_gpu``
+    for ``req_id`` (the align-mode A6 clobber guard), or None if the request
+    has no Mamba transplant this step.
+
+    In ``mamba_cache_mode == "align"`` the phase-3 migration kernel
+    (``preprocess_mamba_align_fused_kernel``) reads the request's
+    pre-advance state index as the pre-copy ``src_col`` and advances the index
+    to ``(num_computed_after + bs - 1) // bs - 1``. If the transplanted
+    boundary state is planted in column ``C`` but the index is NOT staged to
+    ``C``, the kernel computes ``src_col != new_state_idx`` and copies the old
+    (stale/null) state over the freshly transplanted one (A6 trap). Staging the
+    index to the transplant column makes ``src_col == new_state_idx == C``
+    (num_computed after the jump lands on the boundary just before C+1), so the
+    per-request pre-copy fast-exits and leaves the planted state intact.
+
+    The column is the scheduler's ``(target_end - 1) // mamba_block_size``
+    (P0-2: the WIP convention is correct for the fixture; do not change it).
+    """
+    for t in transplants:
+        if t.req_id == req_id:
+            return t.target_idx
+    return None
+
+
+def stage_mamba_state_idx_guard(
+    state_idx: torch.Tensor,
+    req_index: dict[str, int],
+    transplants: list[MambaStateTransplant],
+) -> int:
+    """Stage ``state_idx[req_slot] = target_idx`` for each transplant whose
+    request is present in ``req_index``. Returns the number of rows staged.
+
+    ``state_idx`` is the align-mode ``_mamba_state_idx_gpu`` tensor (one row per
+    request slot); ``req_index`` maps ``req_id -> slot``. This is the A6 clobber
+    guard: staging the transplant column makes the phase-3 migration kernel's
+    per-request pre-copy fast-exit (``src_col == new_state_idx == target_idx``)
+    so it does not copy a stale/null state over the transplanted one.
+
+    Kept as a pure function (no runner/model_state dependency) so the staging
+    logic is CPU-verifiable (GPU tensor writes are trivially the same op).
+    """
+    staged = 0
+    for t in transplants:
+        slot = req_index.get(t.req_id)
+        if slot is None:
+            continue
+        state_idx[slot].fill_(t.target_idx)
+        staged += 1
+    return staged
 
 
 def cleanup_mamba_state_idx(

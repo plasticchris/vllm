@@ -1237,6 +1237,25 @@ class GPUModelRunner(
                 scheduler_output.kv_cache_block_copies,
             )
 
+        # Leyline hybrid-splice Mamba boundary-state transplants: whole-block CoW
+        # of the donor GDN state into the target's splice-point slot, run after
+        # zeroing + CoW copies and BEFORE the phase-3 Mamba preprocess so the
+        # tail prefill continues from the donor's recurrent state. No-op when
+        # the step has no transplants (mode off / no Mamba model / no splice).
+        # The _mamba_state_idx_gpu align-mode A6 guard is v2-only (that tensor
+        # lives in MambaHybridModelState); v1's state index is the CPU dict.
+        mamba_state_transplants = getattr(
+            scheduler_output, "mamba_state_transplants", None
+        )
+        if mamba_state_transplants:
+            from vllm.v1.worker.mamba_utils import apply_mamba_state_transplants
+
+            apply_mamba_state_transplants(
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
+                mamba_state_transplants,
+            )
+
         # Free the cached encoder outputs.
         self._process_encoder_cache_scheduler_output(scheduler_output)
 
