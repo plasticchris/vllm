@@ -7968,6 +7968,150 @@ def test_leyline_kv_splice_amortize_cache_cap_pure_attention():
     ) is not None
 
 
+def test_leyline_kv_splice_amortize_no_refcnt_leak_pure_attention():
+    """GAP 2 / parent finding #2: the splice pins (src + dst block ref_cnts
+    incremented in maybe_apply_leyline_splice) must be RELEASED once the
+    spliced request is freed, returning every pinned donor (src) and target
+    (dst) block to ref_cnt == 0.
+
+    The splice reuses the standard CoW ``_pending_cow_copies`` path, so its
+    release rides the shared retained-block drain: ``take_kv_cache_block_copies``
+    returns BOTH copy endpoints as retained blocks and the scheduler frees them
+    via ``_free_cow_retained_blocks`` -> ``free_blocks``. This test proves that
+    path leaves no donor block pinned (no leak) and drives no block negative
+    (no double-free), so a later free of the request's own blocks is safe.
+
+    Geometry (block_size=16) is the SAME valid 16-hit layout as
+    test_leyline_kv_splice_amortize_cache_cap_pure_attention: donor = 68 tok
+    (4 full + 4 tail); spliced omits donor [16,32) -> 52 tok; the splice CoW
+    copies the donor's middle blocks into two fresh target blocks.
+    """
+    block_size = 16
+
+    def _mro(out):
+        return ModelRunnerOutput(
+            req_ids=list(out.num_scheduled_tokens),
+            req_id_to_index={
+                r: i for i, r in enumerate(out.num_scheduled_tokens)
+            },
+            sampled_token_ids=[[999]] * len(out.num_scheduled_tokens),
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
+    scheduler = create_scheduler(
+        block_size=block_size,
+        enable_prefix_caching=True,
+        max_num_batched_tokens=1024,
+    )
+    pool = scheduler.kv_cache_manager.block_pool
+
+    # --- donor: full 68-token prompt, prefill + cache (block 0 in APC) ---
+    donor_tokens = list(range(100, 168))
+    (donor_req,) = create_requests(
+        num_requests=1, num_tokens=len(donor_tokens), block_size=block_size,
+        req_ids=["donor"],
+    )
+    donor_req.prompt_token_ids = donor_tokens
+    donor_req._all_token_ids = donor_tokens.copy()
+    donor_req.all_token_ids = ConstantList(donor_req._all_token_ids)
+    donor_req.num_prompt_tokens = len(donor_tokens)
+    donor_req.block_hashes.clear()
+    donor_req.update_block_hashes()
+    scheduler.add_request(donor_req)
+    out1 = scheduler.schedule()
+    assert out1.num_scheduled_tokens["donor"] == len(donor_tokens)
+    donor_blocks = scheduler.kv_cache_manager.get_block_ids("donor")[0]
+    scheduler.update_from_output(out1, _mro(out1))
+
+    # --- spliced: shares block 0, splices donor's middle via CoW+rotate ---
+    spliced_tokens = donor_tokens[:16] + donor_tokens[32:]
+    spliced_sp = SamplingParams(
+        max_tokens=8,
+        extra_args={
+            "kv_splice_mode": "amortize",
+            "kv_splice_donor_tokens": donor_tokens,
+            "kv_splice_directives": [
+                {
+                    "span_start": 16,
+                    "span_end": 32,
+                    "replacement_len": 0,
+                    "suffix_len": 32,
+                }
+            ],
+        },
+    )
+    (spliced_req,) = create_requests(
+        num_requests=1, num_tokens=len(spliced_tokens), block_size=block_size,
+        req_ids=["spliced"],
+    )
+    spliced_req.sampling_params = spliced_sp
+    spliced_req.kv_splice_donor_tokens = donor_tokens
+    spliced_req.kv_splice_directives = spliced_sp.extra_args[
+        "kv_splice_directives"
+    ]
+    spliced_req.prompt_token_ids = spliced_tokens
+    spliced_req._all_token_ids = spliced_tokens.copy()
+    spliced_req.all_token_ids = ConstantList(spliced_req._all_token_ids)
+    spliced_req.num_prompt_tokens = len(spliced_tokens)
+    spliced_req.block_hashes.clear()
+    spliced_req.update_block_hashes()
+    spliced_req.donor_block_hashes = donor_req.block_hashes.copy()
+    scheduler.add_request(spliced_req)
+    out2 = scheduler.schedule()
+    assert out2.num_scheduled_tokens["spliced"] == 4
+    assert spliced_req.num_computed_tokens == len(spliced_tokens)
+    spliced_blocks = scheduler.kv_cache_manager.get_block_ids("spliced")[0]
+
+    # The splice actually ran: two CoW copies (donor middle -> fresh targets)
+    # plus a matching RoPE rotation on each target. These are the pinned src
+    # and dst blocks under test.
+    assert out2.kv_cache_block_copies is not None
+    assert len(out2.kv_cache_block_copies) == 2
+    assert out2.kv_cache_rope_rotations is not None
+    assert len(out2.kv_cache_rope_rotations) == 2
+    src_ids = {c.src_block_id for c in out2.kv_cache_block_copies}
+    dst_ids = {c.dst_block_id for c in out2.kv_cache_block_copies}
+    # Sources are donor-owned full blocks; targets are the spliced request's.
+    assert src_ids <= set(donor_blocks)
+    assert dst_ids <= set(spliced_blocks)
+    # The pins are live right after the splice schedule.
+    for bid in src_ids | dst_ids:
+        assert pool.blocks[bid].ref_cnt > 0
+
+    # --- complete both requests (drives the retained-block drain + free) ---
+    scheduler.update_from_output(out2, _mro(out2))
+    for req in (donor_req, spliced_req):
+        for _ in range(64):
+            if req.is_finished():
+                break
+            o = scheduler.schedule()
+            if req.request_id not in o.num_scheduled_tokens:
+                break
+            scheduler.update_from_output(o, _mro(o))
+    assert donor_req.is_finished()
+    assert spliced_req.is_finished()
+
+    # --- GAP 2 assertion: no pin survives the free ---
+    # Every pinned donor (src) and target (dst) block is back to ref_cnt == 0.
+    for bid in src_ids | dst_ids:
+        assert pool.blocks[bid].ref_cnt == 0, (
+            f"splice pin not released: block {bid} ref_cnt = "
+            f"{pool.blocks[bid].ref_cnt}"
+        )
+    # And the whole pool is clean: no block left pinned (leak) and none driven
+    # negative (a double-free would later corrupt free-list invariants).
+    for blk in pool.blocks:
+        assert blk.ref_cnt >= 0, (
+            f"double-free: block {blk.block_id} ref_cnt = {blk.ref_cnt}"
+        )
+        if not blk.is_null:
+            assert blk.ref_cnt == 0, (
+                f"leaked pinned block {blk.block_id} ref_cnt = {blk.ref_cnt}"
+            )
+
+
 def _make_donor_spliced_hybrid_requests(block_size: int):
     """Build a donor prompt and a spliced prompt sharing a prefix.
     Donor = 4 full blocks (64 tok) + 4 tail = 68 tok; spliced omits donor
