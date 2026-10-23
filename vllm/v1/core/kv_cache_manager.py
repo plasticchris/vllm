@@ -759,6 +759,12 @@ class KVCacheManager:
             request: The request to cache the blocks.
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
+
+        The Leyline splice cap (2c) is enforced in the coordinator's
+        ``cache_blocks`` (the single choke point shared with the local-prefill
+        ``allocate_slots`` path), which clamps registration to
+        ``request._leyline_max_cacheable_tokens`` when a spliced request has
+        been flagged. Mode-off requests carry no cap, so this is a no-op.
         """
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)

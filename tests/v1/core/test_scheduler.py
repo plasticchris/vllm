@@ -7863,6 +7863,109 @@ def test_leyline_kv_splice_schedules_cow_and_rope_rotations():
         donor_blocks[2],
         donor_blocks[3],
     ]
+    # NOTE (2c): this legacy pure-attention splice test does NOT rebind
+    # all_token_ids to a ConstantList, so the spliced request's block hashes
+    # are computed from the create_requests placeholder ([0]*n) and end up
+    # IDENTICAL to the donor's (a stale 3-block / 48-token APC hit). The
+    # valid-geometry pure-attention cache-registration cap is covered by
+    # test_leyline_kv_splice_amortize_cache_cap_pure_attention instead.
+
+
+def test_leyline_kv_splice_amortize_cache_cap_pure_attention():
+    """2c (design §2c): on a PURE-ATTENTION model, the §2c cache-registration
+    cap is consumed by the BASE KVCacheCoordinator.cache_blocks (not the
+    HybridKVCacheCoordinator override). This test uses a VALID (ConstantList-
+    rebound) 16-hit geometry so the spliced suffix blocks are genuinely
+    donor-contaminated, and proves the cap keeps them out of the APC while the
+    clean prefix still registers.
+
+    Geometry (block_size=16): donor = 68 tok (4 full + 4 tail); spliced omits
+    donor tokens [16,32) (s=16, r=0) -> 52 tok. The spliced target's block-1
+    (target tokens [16,32)) is a CoW+rotated copy of the donor's middle block
+    (donor tokens [32,48)); its KV is a function of the DONOR's middle, so it
+    must NOT register under the target tokens' chained APC hash. The clean
+    prefix block-0 (target [0,16) == donor [0,16)) legitimately registers.
+    """
+    block_size = 16
+    scheduler = create_scheduler(
+        block_size=block_size,
+        enable_prefix_caching=True,
+        max_num_batched_tokens=1024,
+    )
+    donor_tokens = list(range(100, 168))
+    (donor_req,) = create_requests(
+        num_requests=1, num_tokens=len(donor_tokens), block_size=block_size,
+        req_ids=["donor"],
+    )
+    donor_req.prompt_token_ids = donor_tokens
+    donor_req._all_token_ids = donor_tokens.copy()
+    donor_req.all_token_ids = ConstantList(donor_req._all_token_ids)
+    donor_req.num_prompt_tokens = len(donor_tokens)
+    donor_req.block_hashes.clear()
+    donor_req.update_block_hashes()
+    scheduler.add_request(donor_req)
+    out1 = scheduler.schedule()
+    donor_blocks = scheduler.kv_cache_manager.get_block_ids("donor")[0]
+    scheduler.update_from_output(
+        out1,
+        ModelRunnerOutput(
+            req_ids=["donor"], req_id_to_index={"donor": 0},
+            sampled_token_ids=[[999]], logprobs=None,
+            prompt_logprobs_dict={}, pooler_output=[],
+        ),
+    )
+    spliced_tokens = donor_tokens[:16] + donor_tokens[32:]
+    spliced_sp = SamplingParams(
+        max_tokens=8,
+        extra_args={
+            "kv_splice_mode": "amortize",
+            "kv_splice_donor_tokens": donor_tokens,
+            "kv_splice_directives": [
+                {
+                    "span_start": 16,
+                    "span_end": 32,
+                    "replacement_len": 0,
+                    "suffix_len": 32,
+                }
+            ],
+        },
+    )
+    (spliced_req,) = create_requests(
+        num_requests=1, num_tokens=len(spliced_tokens), block_size=block_size,
+        req_ids=["spliced"],
+    )
+    spliced_req.sampling_params = spliced_sp
+    spliced_req.kv_splice_donor_tokens = donor_tokens
+    spliced_req.kv_splice_directives = spliced_sp.extra_args[
+        "kv_splice_directives"
+    ]
+    spliced_req.prompt_token_ids = spliced_tokens
+    spliced_req._all_token_ids = spliced_tokens.copy()
+    spliced_req.all_token_ids = ConstantList(spliced_req._all_token_ids)
+    spliced_req.num_prompt_tokens = len(spliced_tokens)
+    spliced_req.block_hashes.clear()
+    spliced_req.update_block_hashes()
+    spliced_req.donor_block_hashes = donor_req.block_hashes.copy()
+
+    scheduler.add_request(spliced_req)
+    out2 = scheduler.schedule()
+
+    # Valid 16-hit geometry: only block-0 is a real APC hit.
+    assert out2.num_scheduled_tokens["spliced"] == 4
+    assert spliced_req.num_computed_tokens == len(spliced_tokens)
+    # Cap (s + r = 16) set at admission.
+    assert getattr(spliced_req, "_leyline_max_cacheable_tokens", None) == 16
+    mgr = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    assert mgr.num_cached_block.get("spliced") == (16 + 0) // block_size == 1
+    # The contaminated spliced FA block-1 must NOT be in the APC under the
+    # target tokens' chained hash...
+    assert scheduler.kv_cache_manager.block_pool.get_cached_block(
+        spliced_req.block_hashes[1], [0]
+    ) is None
+    # ...while the clean prefix block-0 legitimately registers.
+    assert scheduler.kv_cache_manager.block_pool.get_cached_block(
+        spliced_req.block_hashes[0], [0]
+    ) is not None
 
 
 def _make_donor_spliced_hybrid_requests(block_size: int):
@@ -7995,6 +8098,11 @@ def test_hybrid_splice_mode_off_leaves_ordinary_prefill_unchanged():
     assert not out.kv_cache_block_copies
     assert not out.kv_cache_rope_rotations
     assert getattr(spliced_req, "_leyline_splice_applied", False) is False
+    # Mode OFF => no 2c cap is set, so APC registration proceeds normally
+    # (the ordinary full prefill caches all 3 full blocks, no clamping).
+    assert getattr(spliced_req, "_leyline_max_cacheable_tokens", None) is None
+    _mgr = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    assert _mgr.num_cached_block.get("spliced") == 3
 
 
 def test_hybrid_splice_mode_on_emits_cow_without_advancing():
@@ -8054,3 +8162,20 @@ def test_hybrid_splice_mode_on_emits_cow_without_advancing():
     # ... but num_computed does NOT advance on the hybrid model, so the
     # ordinary prefill (52 - 16 hit = 36 tokens) is still scheduled.
     assert out.num_scheduled_tokens["spliced"] == len(spliced_tokens) - 1 * block_size
+    # 2c: the cap (s + r = 16 + 0) is set at admission, and APC registration
+    # is clamped to it -- only block 0 (the clean prefix) registers, not the
+    # donor-contaminated spliced suffix.
+    assert getattr(spliced_req, "_leyline_max_cacheable_tokens", None) == 16
+    _mgr = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
+    assert _mgr.num_cached_block.get("spliced") == (16 + 0) // block_size == 1
+    # The spliced FA block-1 (target tokens [16,32)) holds a CoW+rotated copy
+    # of the donor's middle block; it must NOT be in the APC under the target
+    # tokens' chained hash.
+    assert scheduler.kv_cache_manager.block_pool.get_cached_block(
+        spliced_req.block_hashes[1], [0]
+    ) is None
+    # ... while the clean prefix block-0 (target tokens [0,16) == donor [0,16))
+    # legitimately registers and is reusable.
+    assert scheduler.kv_cache_manager.block_pool.get_cached_block(
+        spliced_req.block_hashes[0], [0]
+    ) is not None

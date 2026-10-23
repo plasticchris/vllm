@@ -3542,6 +3542,59 @@ class Scheduler(SchedulerInterface):
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return self.kv_cache_manager.usage
 
+    def _apply_leyline_splice_cache_cap(self, request: Request) -> None:
+        """Set ``request._leyline_max_cacheable_tokens`` (design §2c) at
+        admission, BEFORE any ``allocate_slots`` runs.
+
+        A spliced request's target-suffix KV blocks are a function of the
+        DONOR's context (they are CoW-copied + RoPE-rotated from the donor),
+        so caching them under the TARGET tokens' chained APC hashes would let
+        a later, unrelated request sharing the target suffix falsely hit
+        donor-contaminated KV (wrong output + cross-session pollution). The
+        cap clamps APC registration to ``s + r`` (the clean target prefix plus
+        any freshly-decoded replacement middle); every full block at or past
+        that boundary is donor-contaminated and must stay un-registered.
+
+        This must run at admission (not in ``maybe_apply_leyline_splice``,
+        which fires after ``allocate_slots`` has already cached the suffix).
+        No-op unless the request carries amortize-mode splice directives and
+        the model has a full-attention group (a pure-Mamba model's splice is a
+        no-op, so its Mamba checkpoints stay uncapped).
+        """
+        sp = getattr(request, "sampling_params", None)
+        if sp is None or getattr(sp, "extra_args", None) is None:
+            return
+        if sp.extra_args.get("kv_splice_mode", "off") != "amortize":
+            return
+        directives = getattr(request, "kv_splice_directives", None)
+        if not directives:
+            return
+        # Only full-attention blocks are CoW-copied/rotated from the donor; a
+        # model without a full-attention group applies no splice, so leave its
+        # (Mamba) cache registration uncapped.
+        if not any(
+            not isinstance(g.kv_cache_spec, MambaSpec)
+            for g in self.kv_cache_config.kv_cache_groups
+        ):
+            return
+        max_cacheable = None
+        for item in directives:
+            if isinstance(item, dict):
+                s = int(item.get("span_start", item.get("s", 0)))
+                r = int(item.get("replacement_len", item.get("r", 0)))
+            elif isinstance(item, (list, tuple)) and len(item) >= 4:
+                s, r = int(item[0]), int(item[2])
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                s, r = int(item[0]), int(item[1])
+            else:
+                continue
+            boundary = s + r
+            max_cacheable = boundary if max_cacheable is None else min(
+                max_cacheable, boundary
+            )
+        if max_cacheable is not None:
+            request._leyline_max_cacheable_tokens = max_cacheable
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -3559,6 +3612,11 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            # §2c: clamp APC cache registration for amortize-mode splice
+            # requests BEFORE the request is admitted to the waiting queue (and
+            # therefore before any allocate_slots caches its suffix). No-op for
+            # non-splice / mode-off requests.
+            self._apply_leyline_splice_cache_cap(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
