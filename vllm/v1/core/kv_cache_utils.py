@@ -1833,13 +1833,13 @@ def _uses_last_layer_eagle_fallback(vllm_config: VllmConfig) -> bool:
     if spec_config is None or not spec_config.use_eagle():
         return False
     model_config = vllm_config.model_config
-    return model_config is not None and model_config.hf_config.model_type in (
-        "deepseek_v4",
-        "qwen4_exp",
-        "qwen3_5",
-        "qwen3_5_text",
-        "qwen3_5_moe",
-        "qwen3_5_moe_text",
+    if model_config is None:
+        return False
+    model_Types = ("deepseek_v4", "qwen4_exp", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text")
+    text_cfg = getattr(model_config.hf_config, "text_config", None)
+    return (
+        getattr(model_config.hf_config, "model_type", None) in model_Types
+        or getattr(text_cfg, "model_type", None) in model_Types
     )
 
 

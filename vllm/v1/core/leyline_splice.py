@@ -139,22 +139,50 @@ def prepare_splice(
         hashes, manager.block_pool.hash_block_size, block_size
     )
     # Full boundaries only: partial-tail entries can still be a producer's
-    # writable running state. Sparse retention means k_tail may exceed a block.
+    # writable running state. Sparse retention (retention_interval=0) only
+    # caches the donor's reachable replay boundary at (donor_end - 1) // bs * bs,
+    # while eagle groups drop one block during prefill and only cache the last
+    # block on decode; step down by block_size so we find the highest boundary
+    # where BOTH Mamba and all FA groups are resident.
     states = []
     boundary = (donor_end - 1) // block_size * block_size
     while boundary > e:
         states = []
+        bidx = boundary // block_size - 1
+        if bidx < 0 or bidx >= len(resolved):
+            boundary -= block_size
+            continue
         for gid, mgr in mamba:
-            found = manager.block_pool.get_cached_block(
-                resolved[boundary // block_size - 1], [gid]
-            )
+            found = manager.block_pool.get_cached_block(resolved[bidx], [gid])
             if not found or found[0].block_hash in mgr.cached_blocks_this_step:
                 break
             states.append((gid, found[0], block_size))
-        if len(states) == len(mamba):
+        if len(states) == len(mamba) and all(
+            manager.block_pool.get_cached_block(resolved[bidx], [gid])
+            for gid, _ in fa
+        ):
             break
         boundary -= block_size
     if boundary <= e or len(states) != len(mamba):
+        mamba_cached = [
+            (i + 1) * block_size
+            for i in range(min(len(resolved), donor_end // block_size))
+            if manager.block_pool.get_cached_block(resolved[i], [mamba[0][0]])
+        ]
+        fa_cached = [
+            (i + 1) * block_size
+            for i in range(min(len(resolved), donor_end // block_size))
+            if manager.block_pool.get_cached_block(resolved[i], [fa[0][0]])
+        ]
+        logger.info(
+            "[leyline] req=%s no_donor_boundary e=%d donor_end=%d bs=%d mamba_cached=%s fa_cached=%s",
+            request.request_id,
+            e,
+            donor_end,
+            block_size,
+            mamba_cached,
+            fa_cached,
+        )
         _fallback(request, "no_donor_boundary")
         return None
     delta = middle_end - e

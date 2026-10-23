@@ -461,8 +461,18 @@ class SingleTypeKVCacheManager(ABC):
 
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
-        # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        # ``get_computed_blocks``), the Eagle-dropped pre-tail boundary
+        # (``num_prompt - 1 - scheduler_block_size``), the last block-aligned
+        # boundary inside the prompt (``num_prompt_tokens``), and any detected
+        # shared-prefix junction.
+        reachable_boundaries = [
+            request.num_prompt_tokens - 1,
+            request.num_prompt_tokens,
+        ]
+        if self.scheduler_block_size and request.num_prompt_tokens > self.scheduler_block_size:
+            reachable_boundaries.append(
+                request.num_prompt_tokens - 1 - self.scheduler_block_size
+            )
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 

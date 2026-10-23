@@ -594,8 +594,11 @@ class Scheduler(SchedulerInterface):
             )
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
-        # block to avoid a Mamba cache miss.
-        last_cache_position = request.num_tokens - request.num_tokens % block_size
+        # block to avoid a Mamba cache miss — AND also stop at the final
+        # block-aligned boundary inside the prompt so that boundary's Mamba
+        # state is materialized in the cache for multi-turn / Leyline reuse.
+        prompt_last_boundary = request.num_tokens - request.num_tokens % block_size
+        last_cache_position = prompt_last_boundary
         if self.use_eagle:
             last_cache_position = max(last_cache_position - block_size, 0)
 
@@ -634,6 +637,7 @@ class Scheduler(SchedulerInterface):
             next_block_boundary if start % block_size != 0 else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
+            prompt_last_boundary,
             # Fine-grained hits: the prompt's partial-tail entry can only be
             # registered by a chunk ending exactly at its last hash boundary.
             tail_boundary
