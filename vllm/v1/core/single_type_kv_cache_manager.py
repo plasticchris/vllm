@@ -1545,6 +1545,23 @@ class MambaManager(SingleTypeKVCacheManager):
         num_prompt_tokens: int | None = None,
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        # In align mode, the tail `num_speculative_blocks` entries of an
+        # already-allocated request are scratch slots that `allocate_new_blocks`
+        # relocates in place across block boundaries. Never null them out here,
+        # even when `processed_computed_tokens` jumps (e.g., a Leyline splice).
+        blocks = self.req_to_blocks.get(request_id)
+        if (
+            self.mamba_cache_mode == "align"
+            and self.num_speculative_blocks > 0
+            and request_id in self._allocated_block_reqs
+            and blocks
+        ):
+            max_freeable_blocks = max(
+                0, len(blocks) - self.num_speculative_blocks - 1
+            )
+            processed_computed_tokens = min(
+                processed_computed_tokens, max_freeable_blocks * self.block_size
+            )
 
         super().remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens

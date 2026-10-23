@@ -8465,6 +8465,16 @@ def test_hybrid_splice_unaligned_replacement_and_multi_block_skip():
     """
     block_size = 16
     scheduler = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
+    # Exercise Mamba align mode + speculative scratch blocks on the multi-step
+    # jump: remove_skipped_blocks must not null the trailing speculative block
+    # before allocate_new_blocks relocates it across the jump.
+    mamba_mgr = scheduler.kv_cache_manager.coordinator.single_type_managers[1]
+    mamba_mgr.mamba_cache_mode = "align"
+    mamba_mgr.num_speculative_blocks = 2
+    mamba_mgr.last_state_block_idx = {}
+    mamba_mgr._allocated_block_reqs = set()
+    mamba_mgr._num_checkpoint_blocks = {}
+    mamba_mgr._producer_partial_tail_reqs = {}
     scheduler.scheduler_config.long_prefill_token_threshold = 16
     donor_tokens = list(range(500, 632))
     (donor_req,) = create_requests(
