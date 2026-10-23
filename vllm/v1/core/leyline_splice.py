@@ -9,6 +9,7 @@ are atomic, after allocation; failure leaves no worker operations behind.
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     KVCacheBlockSplice,
@@ -20,6 +21,8 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -35,6 +38,13 @@ class LeylineSplicePlan:
 
 def _fallback(request: "Request", reason: str) -> None:
     request.kv_splice_stats = {"fallback": reason, "skipped_tokens": 0}
+    logger.info(
+        "[leyline] req=%s fallback=%s nc=%s prompt=%s",
+        request.request_id,
+        reason,
+        getattr(request, "num_computed_tokens", None),
+        getattr(request, "num_prompt_tokens", None),
+    )
 
 
 def cancel_splice(manager: "KVCacheManager", request: "Request") -> None:
@@ -167,6 +177,18 @@ def prepare_splice(
     manager.block_pool.touch(pins)
     plan = LeylineSplicePlan(middle_end, boundary + delta, delta, ranges, states, pins)
     request.leyline_splice_plan = plan
+    logger.info(
+        "[leyline] req=%s planned s=%d e=%d r=%d l=%d middle_end=%d target_end=%d delta=%d pins=%d",
+        request.request_id,
+        s,
+        e,
+        r,
+        length,
+        middle_end,
+        boundary + delta,
+        delta,
+        len(pins),
+    )
     return plan
 
 
@@ -229,6 +251,14 @@ def commit_splice(
         "copied_ranges": len(splices),
         "state_transplants": len(transplants),
     }
+    logger.info(
+        "[leyline] req=%s committed skipped=%d splices=%d transplants=%d tail=%d",
+        request.request_id,
+        plan.target_end - plan.middle_end,
+        len(splices),
+        len(transplants),
+        num_tail_tokens,
+    )
     plan.pins = []
     request.leyline_splice_plan = None
     request._leyline_splice_applied = True

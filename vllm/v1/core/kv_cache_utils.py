@@ -1836,6 +1836,10 @@ def _uses_last_layer_eagle_fallback(vllm_config: VllmConfig) -> bool:
     return model_config is not None and model_config.hf_config.model_type in (
         "deepseek_v4",
         "qwen4_exp",
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
     )
 
 
@@ -2024,7 +2028,12 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
-    _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
+    _annotate_eagle_groups(
+        vllm_config,
+        kv_cache_spec,
+        groups,
+        use_last_layer_fallback=_uses_last_layer_eagle_fallback(vllm_config),
+    )
     _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
