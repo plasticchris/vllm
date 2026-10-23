@@ -234,8 +234,8 @@ def rotate_key_cache_block_inplace(
     if num_slots <= 0:
         return
 
-    # Use Triton fast path when NeoX split-half and half_rd is a power of 2
-    if is_neox_style and (half_rd & (half_rd - 1)) == 0:
+    # Use Triton fast path when on GPU, NeoX split-half, and half_rd is a power of 2
+    if key_cache.is_cuda and is_neox_style and (half_rd & (half_rd - 1)) == 0:
         grid = (num_slots, num_kv_heads)
         if use_head_major:
             _rotate_key_cache_neox_head_major_kernel[grid](
@@ -330,6 +330,72 @@ def rotate_key_cache_block_inplace(
         key_cache[block_id, s_off:e_off, :, :] = out_tensor
 
 
+def _resolve_layer_kv_caches(
+    layer: object,
+) -> tuple[torch.Tensor, torch.Tensor | None, str, torch.Tensor | None, int] | None:
+    """Resolve ``(key_cache, value_cache, kv_cache_dtype, k_scale, compress_ratio)``
+    for an attention or compressed-key side-cache layer.
+    """
+    kv_cache = getattr(layer, "kv_cache", None)
+    if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
+        return None
+    if kv_cache.ndim < 4:
+        return None
+
+    impl = getattr(layer, "impl", None)
+    kv_cache_dtype = getattr(
+        impl, "kv_cache_dtype", getattr(layer, "kv_cache_dtype", "auto")
+    )
+    k_scale = getattr(layer, "_k_scale", None)
+
+    head_size = getattr(layer, "head_size", getattr(layer, "head_dim", None))
+    num_kv_heads = getattr(layer, "num_kv_heads", None)
+    has_qsa_indexer = hasattr(layer, "indexer") or not hasattr(layer, "head_size")
+    if (
+        has_qsa_indexer
+        and head_size is not None
+        and num_kv_heads is not None
+        and kv_cache.shape[1] == int(num_kv_heads)
+        and kv_cache.shape[3] == 2 * int(head_size)
+    ):
+        hs = int(head_size)
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(hs, dim=-1)
+        return key_cache, value_cache, kv_cache_dtype, k_scale, 1
+
+    if (
+        head_size is not None
+        and num_kv_heads is not None
+        and kv_cache.shape[1] == 2
+        and kv_cache.shape[3] == int(num_kv_heads) * int(head_size)
+    ):
+        key_cache, value_cache = PagedAttention.split_kv_cache(
+            kv_cache.transpose(0, 1), int(num_kv_heads), int(head_size)
+        )
+        return key_cache, value_cache, kv_cache_dtype, k_scale, 1
+
+    if (
+        head_size is not None
+        and num_kv_heads is not None
+        and kv_cache.shape[1] == int(num_kv_heads)
+        and kv_cache.shape[3] == 2 * int(head_size)
+    ):
+        hs = int(head_size)
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(hs, dim=-1)
+        return key_cache, value_cache, kv_cache_dtype, k_scale, 1
+
+    compress_ratio = getattr(layer, "compress_ratio", None)
+    if (
+        isinstance(compress_ratio, int)
+        and compress_ratio > 1
+        and head_size is not None
+        and kv_cache.shape[2] == 1
+        and kv_cache.shape[3] == int(head_size)
+    ):
+        return kv_cache, None, "auto", None, compress_ratio
+
+    return None
+
+
 def apply_kv_cache_rope_rotations_inplace(
     static_forward_context: dict[str, object],
     num_blocks: int,
@@ -343,43 +409,31 @@ def apply_kv_cache_rope_rotations_inplace(
 
     seen_ptrs: set[tuple[torch.device, int]] = set()
     for layer in static_forward_context.values():
-        kv_cache = getattr(layer, "kv_cache", None)
-        impl = getattr(layer, "impl", None)
-        if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
+        resolved = _resolve_layer_kv_caches(layer)
+        if resolved is None:
             continue
-        if not hasattr(layer, "num_kv_heads") or not hasattr(layer, "head_size"):
-            continue
-        # Only full/sliding-window attention layers with 2 head slots (K and V)
-        # store RoPE keys; Mamba state tensors are skipped.
-        if kv_cache.ndim < 4 or kv_cache.shape[1] != 2:
-            continue
-        ptr_key = (kv_cache.device, kv_cache.data_ptr())
+        key_cache, _, kv_cache_dtype, k_scale, compress_ratio = resolved
+        ptr_key = (key_cache.device, key_cache.data_ptr())
         if ptr_key in seen_ptrs:
             continue
         seen_ptrs.add(ptr_key)
 
-        num_kv_heads = int(layer.num_kv_heads)
-        head_size = int(layer.head_size)
-        kv_cache_dtype = getattr(impl, "kv_cache_dtype", "auto")
-        k_scale = getattr(layer, "_k_scale", None)
-
-        # Split [B, 2, N, H*hs] -> key_cache [K_blocks, num_kv_heads, hs//x, kernel_block_size, x]
-        key_cache, _ = PagedAttention.split_kv_cache(
-            kv_cache.transpose(0, 1), num_kv_heads, head_size
-        )
         total_kernel_blocks = int(key_cache.shape[0])
-        kernel_block_size = int(key_cache.shape[3])
+        kernel_block_size = int(
+            key_cache.shape[3] if key_cache.ndim == 5 else key_cache.shape[1]
+        )
         kernel_blocks_per_sched_block = max(1, total_kernel_blocks // max(1, num_blocks))
         sched_block_tokens = kernel_blocks_per_sched_block * kernel_block_size
 
         for rot in rotations:
             if rot.delta_pos == 0:
                 continue
-            s_tok = max(0, int(rot.start_offset))
+            s_tok = max(0, int(rot.start_offset) // compress_ratio)
+            e_raw = int(rot.end_offset)
             e_tok = (
                 sched_block_tokens
-                if int(rot.end_offset) <= 0
-                else min(sched_block_tokens, int(rot.end_offset))
+                if e_raw <= 0
+                else min(sched_block_tokens, e_raw // compress_ratio)
             )
             if s_tok >= e_tok:
                 continue
@@ -405,7 +459,7 @@ def apply_kv_cache_rope_rotations_inplace(
 
 def fuse_copy_rotate_key_value_block_range(
     key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
+    value_cache: torch.Tensor | None,
     src_block_id: int,
     dst_block_id: int,
     src_start: int,
@@ -442,13 +496,23 @@ def fuse_copy_rotate_key_value_block_range(
     use_head_major = key_cache.ndim == 5
 
     # --- V: verbatim copy. value_cache is [num_blocks, num_kv_heads, head_size,
-    # block_size] in both layouts; the slot index is always the last dim. ---
-    value_cache[dst_block_id, :, :, dst_start:dst_end] = value_cache[
-        src_block_id, :, :, src_start:src_end
-    ]
+    # block_size] in 5D head-major layout or [num_blocks, block_size,
+    # num_kv_heads, head_size] in 4D token-major layout; None for key-only
+    # compressed side caches. ---
+    if value_cache is not None and (
+        dst_block_id != src_block_id or dst_start != src_start
+    ):
+        if use_head_major:
+            value_cache[dst_block_id, :, :, dst_start:dst_end] = value_cache[
+                src_block_id, :, :, src_start:src_end
+            ]
+        else:
+            value_cache[dst_block_id, dst_start:dst_end, :, :] = value_cache[
+                src_block_id, src_start:src_end, :, :
+            ]
 
-    # --- K: copy (unless in place), then rotate the copied range in place. ---
-    if dst_block_id != src_block_id:
+    # --- K: copy (unless in place at identical offset), then rotate in place. ---
+    if dst_block_id != src_block_id or dst_start != src_start:
         if use_head_major:
             # key_cache [num_blocks, num_kv_heads, head_size // x, block_size, x]
             key_cache[dst_block_id, :, :, dst_start:dst_end, :] = key_cache[
@@ -499,47 +563,43 @@ def apply_kv_cache_block_splices_inplace(
 
     seen_ptrs: set[tuple[torch.device, int]] = set()
     for layer in static_forward_context.values():
-        kv_cache = getattr(layer, "kv_cache", None)
-        impl = getattr(layer, "impl", None)
-        if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
+        resolved = _resolve_layer_kv_caches(layer)
+        if resolved is None:
             continue
-        if not hasattr(layer, "num_kv_heads") or not hasattr(layer, "head_size"):
-            continue
-        # Only full/sliding-window attention layers with 2 head slots (K and V)
-        # store RoPE keys; Mamba state tensors are skipped.
-        if kv_cache.ndim < 4 or kv_cache.shape[1] != 2:
-            continue
-        ptr_key = (kv_cache.device, kv_cache.data_ptr())
+        key_cache, value_cache, kv_cache_dtype, k_scale, compress_ratio = resolved
+        ptr_key = (key_cache.device, key_cache.data_ptr())
         if ptr_key in seen_ptrs:
             continue
         seen_ptrs.add(ptr_key)
 
-        num_kv_heads = int(layer.num_kv_heads)
-        head_size = int(layer.head_size)
-        kv_cache_dtype = getattr(impl, "kv_cache_dtype", "auto")
-        k_scale = getattr(layer, "_k_scale", None)
-
-        # Split [B, 2, N, H*hs] -> key_cache/value_cache in kernel layout.
-        key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache.transpose(0, 1), num_kv_heads, head_size
-        )
         total_kernel_blocks = int(key_cache.shape[0])
-        kernel_block_size = int(key_cache.shape[3])
+        kernel_block_size = int(
+            key_cache.shape[3] if key_cache.ndim == 5 else key_cache.shape[1]
+        )
         kernel_blocks_per_sched_block = max(1, total_kernel_blocks // max(1, num_blocks))
         sched_block_tokens = kernel_blocks_per_sched_block * kernel_block_size
 
         for sp in splices:
-            s_tok = max(0, int(sp.src_start))
+            if compress_ratio > 1 and (
+                int(sp.src_start) % compress_ratio != 0
+                or int(sp.src_end) % compress_ratio != 0
+                or int(sp.dst_start) % compress_ratio != 0
+                or int(sp.dst_end) % compress_ratio != 0
+            ):
+                continue
+            s_tok = max(0, int(sp.src_start) // compress_ratio)
+            e_raw = int(sp.src_end)
             e_tok = (
                 sched_block_tokens
-                if int(sp.src_end) <= 0
-                else min(sched_block_tokens, int(sp.src_end))
+                if e_raw <= 0
+                else min(sched_block_tokens, e_raw // compress_ratio)
             )
-            d_tok = max(0, int(sp.dst_start))
+            d_tok = max(0, int(sp.dst_start) // compress_ratio)
+            f_raw = int(sp.dst_end)
             f_tok = (
                 sched_block_tokens
-                if int(sp.dst_end) <= 0
-                else min(sched_block_tokens, int(sp.dst_end))
+                if f_raw <= 0
+                else min(sched_block_tokens, f_raw // compress_ratio)
             )
             if s_tok >= e_tok or d_tok >= f_tok:
                 continue

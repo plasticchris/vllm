@@ -8586,3 +8586,278 @@ def test_hybrid_splice_unaligned_replacement_and_multi_block_skip():
     assert s2.kv_splice_stats["fallback"] == "donor_kv_missing"
     assert out_fb.num_scheduled_tokens["spliced"] == 36
 
+
+def test_hybrid_splice_qsa_flash_next_topology_and_rope_splices():
+    """Flash-Next QSA topology (FullAttention + MLAAttentionSpec + CircularBufferSpec + MambaSpec)
+    plans splices across both main KV and compressed QSA key caches, auto-aligns
+    to compression groups, and applies 4D token-major + compressed key splices.
+    """
+    from vllm.v1.attention.ops.leyline_rope import (
+        apply_kv_cache_block_splices_inplace,
+        compute_delta_cos_sin,
+    )
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
+
+    block_size = 16
+    num_blocks = 120
+    model_config = ModelConfig(
+        model="facebook/opt-125m",
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+        skip_tokenizer_init=True,
+    )
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=8192,
+            max_model_len=8192,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            watermark=0.0,
+        ),
+        model_config=model_config,
+        cache_config=CacheConfig(
+            block_size=block_size,
+            enable_prefix_caching=True,
+            mamba_cache_mode="all",
+        ),
+    )
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["qsa_main"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=2,
+                    head_size=8,
+                    dtype=torch.bfloat16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["qsa_compressed"],
+                MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=8,
+                    dtype=torch.bfloat16,
+                    tokens_per_state=4,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["qsa_ring"],
+                CircularBufferSpec(
+                    block_size=4,
+                    num_kv_heads=1,
+                    head_size=8,
+                    head_size_v=0,
+                    dtype=torch.bfloat16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1, 4),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="all",
+                ),
+            ),
+        ],
+    )
+    register_all_kvcache_specs(vllm_config)
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=block_size,
+        hash_block_size=block_size,
+        log_stats=True,
+    )
+
+    donor_tokens = list(range(100, 168))  # 68 tokens
+    # Replace [16, 33) (17 tokens) with [999] (1 token): delta = -16 (multiple of 4),
+    # e=33 and middle_end=17 are 1 mod 4 -> auto-aligned by advancing +3 into suffix!
+    spliced_tokens = donor_tokens[:16] + [999] + donor_tokens[33:]
+    (donor_req,) = create_requests(
+        num_requests=1,
+        num_tokens=len(donor_tokens),
+        max_tokens=1,
+        block_size=block_size,
+        req_ids=["qsa-donor"],
+    )
+    donor_req.prompt_token_ids = donor_tokens
+    donor_req._all_token_ids[:] = donor_tokens
+    donor_req.all_token_ids = ConstantList(donor_req._all_token_ids)
+    donor_req.num_prompt_tokens = len(donor_tokens)
+    donor_req.block_hashes.clear()
+    donor_req.update_block_hashes()
+    scheduler.add_request(donor_req)
+    d_out = scheduler.schedule()
+    scheduler.update_from_output(
+        d_out,
+        ModelRunnerOutput(
+            req_ids=["qsa-donor"],
+            req_id_to_index={"qsa-donor": 0},
+            sampled_token_ids=[[777]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    (spliced_req,) = create_requests(
+        num_requests=1,
+        num_tokens=len(spliced_tokens),
+        block_size=block_size,
+        req_ids=["qsa-spliced"],
+    )
+    spliced_req.prompt_token_ids = spliced_tokens
+    spliced_req._all_token_ids[:] = spliced_tokens
+    spliced_req.all_token_ids = ConstantList(spliced_req._all_token_ids)
+    spliced_req.num_prompt_tokens = len(spliced_tokens)
+    spliced_req.block_hashes.clear()
+    spliced_req.update_block_hashes()
+    spliced_req.sampling_params = SamplingParams(
+        max_tokens=1,
+        extra_args={
+            "kv_splice_mode": "amortize",
+            "kv_splice_donor_tokens": donor_tokens,
+            "kv_splice_directives": [(16, 33, 1, 35)],
+        },
+    )
+    spliced_req.kv_splice_donor_tokens = donor_tokens
+    spliced_req.kv_splice_directives = [(16, 33, 1, 35)]
+    spliced_req.donor_block_hashes = donor_req.block_hashes.copy()
+
+    scheduler.add_request(spliced_req)
+    out1 = scheduler.schedule()
+    # Advanced middle_end from 17 to 20 (next multiple of 4), so Phase 1 forwards 20 - 16 = 4 tokens
+    assert out1.num_scheduled_tokens["qsa-spliced"] == 4
+    scheduler.update_from_output(
+        out1,
+        ModelRunnerOutput(
+            req_ids=["qsa-spliced"],
+            req_id_to_index={"qsa-spliced": 0},
+            sampled_token_ids=[[]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    out2 = scheduler.schedule()
+    assert out2.scheduled_cached_reqs.num_computed_tokens == [48]
+    assert out2.num_scheduled_tokens["qsa-spliced"] == 4
+    assert spliced_req.kv_splice_stats["skipped_tokens"] == 28
+    # Both qsa_main and qsa_compressed groups emit splices
+    assert len(out2.kv_cache_block_splices) == 4
+    assert len(out2.mamba_state_transplants) == 1
+
+    # Verify apply_kv_cache_block_splices_inplace on 4D token-major QSA main KV
+    # and 4D compressed QSA key cache
+    class _DummyQSAOwner:
+        def __init__(self):
+            self.num_kv_heads = 2
+            self.head_dim = 8
+            self.kv_cache_dtype = "auto"
+            self.kv_cache = torch.randn(
+                (num_blocks, 2, block_size, 16), dtype=torch.bfloat16
+            )
+
+    class _DummyQSACompressed:
+        def __init__(self):
+            self.head_size = 8
+            self.compress_ratio = 4
+            # Bound transposed view: [num_blocks, block_size // 4, 1, head_size]
+            self.kv_cache = torch.randn(
+                (num_blocks, block_size // 4, 1, 8), dtype=torch.bfloat16
+            )
+
+    qsa_main_layer = _DummyQSAOwner()
+    qsa_comp_layer = _DummyQSACompressed()
+    inv_freq = torch.tensor([1.0, 0.5], dtype=torch.float32)
+    static_ctx = {"qsa_main": qsa_main_layer, "qsa_compressed": qsa_comp_layer}
+
+    sp_comp = next(
+        sp
+        for sp in out2.kv_cache_block_splices
+        if sp.dst_block_id
+        in [
+            b.block_id
+            for b in scheduler.kv_cache_manager.coordinator.single_type_managers[
+                1
+            ].req_to_blocks["qsa-spliced"]
+        ]
+    )
+    src_blk, dst_blk = sp_comp.src_block_id, sp_comp.dst_block_id
+    src_comp_before = qsa_comp_layer.kv_cache[
+        src_blk, sp_comp.src_start // 4 : sp_comp.src_end // 4
+    ].clone()
+
+    apply_kv_cache_block_splices_inplace(
+        static_ctx,
+        num_blocks,
+        out2.kv_cache_block_splices,
+        inv_freq=inv_freq,
+        is_neox_style=True,
+    )
+    # Check compressed key cache slot was copied & rotated at 1/4th index
+    dst_comp_after = qsa_comp_layer.kv_cache[
+        dst_blk, sp_comp.dst_start // 4 : sp_comp.dst_end // 4
+    ]
+    cos_d, sin_d = compute_delta_cos_sin(
+        inv_freq, sp_comp.delta_pos, torch.device("cpu")
+    )
+    k_f32 = src_comp_before.to(torch.float32)
+    k1, k2 = k_f32[..., :2], k_f32[..., 2:4]
+    expected = k_f32.clone()
+    expected[..., :2] = k1 * cos_d - k2 * sin_d
+    expected[..., 2:4] = k2 * cos_d + k1 * sin_d
+    torch.testing.assert_close(dst_comp_after, expected.to(torch.bfloat16))
+
+    # Also verify FP8-E4M3 4D QSA main KV cache copy + rotation
+    class _DummyQSAOwnerFP8:
+        def __init__(self):
+            self.num_kv_heads = 2
+            self.head_dim = 8
+            self.kv_cache_dtype = "fp8_e4m3"
+            self._k_scale = torch.tensor([0.5], dtype=torch.float32)
+            # Core allocates FP8 KV cache as uint8
+            self.kv_cache = torch.randint(
+                0, 64, (num_blocks, 2, block_size, 16), dtype=torch.uint8
+            )
+
+    fp8_layer = _DummyQSAOwnerFP8()
+    sp_main = next(
+        sp
+        for sp in out2.kv_cache_block_splices
+        if sp.dst_block_id
+        in [
+            b.block_id
+            for b in scheduler.kv_cache_manager.coordinator.single_type_managers[
+                0
+            ].req_to_blocks["qsa-spliced"]
+        ]
+    )
+    src_v_before = (
+        fp8_layer.kv_cache.transpose(1, 2)
+        .split(8, dim=-1)[1][sp_main.src_block_id, sp_main.src_start : sp_main.src_end]
+        .clone()
+    )
+    apply_kv_cache_block_splices_inplace(
+        {"qsa_fp8": fp8_layer},
+        num_blocks,
+        [sp_main],
+        inv_freq=inv_freq,
+        is_neox_style=True,
+    )
+    dst_v_after = fp8_layer.kv_cache.transpose(1, 2).split(8, dim=-1)[1][
+        sp_main.dst_block_id, sp_main.dst_start : sp_main.dst_end
+    ]
+    assert torch.equal(dst_v_after, src_v_before)
+
+
+

@@ -7,6 +7,7 @@ are atomic, after allocation; failure leaves no worker operations behind.
 """
 
 from dataclasses import dataclass
+import math
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -16,7 +17,11 @@ from vllm.v1.core.kv_cache_utils import (
     MambaStateTransplant,
     resolve_block_hashes,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    MambaSpec,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -120,8 +125,11 @@ def prepare_splice(
     managers = manager.coordinator.single_type_managers
     fa = []
     mamba = []
+    circular = []
     for gid, (group, mgr) in enumerate(zip(groups, managers)):
-        if isinstance(group.kv_cache_spec, FullAttentionSpec):
+        if isinstance(group.kv_cache_spec, CircularBufferSpec):
+            circular.append((gid, mgr))
+        elif isinstance(group.kv_cache_spec, FullAttentionSpec):
             fa.append((gid, mgr))
         elif isinstance(group.kv_cache_spec, MambaSpec):
             mamba.append((gid, mgr))
@@ -135,6 +143,39 @@ def prepare_splice(
     if any(mgr.block_size != block_size for _, mgr in fa + mamba):
         _fallback(request, "block_size_mismatch")
         return None
+    delta = middle_end - e
+    compress_ratios = [
+        int(group.kv_cache_spec.tokens_per_state)
+        for gid, _ in fa
+        for group in (groups[gid],)
+        if isinstance(group.kv_cache_spec.tokens_per_state, int)
+        and group.kv_cache_spec.tokens_per_state > 1
+    ]
+    if compress_ratios:
+        cr_lcm = 1
+        for cr in compress_ratios:
+            if block_size % cr != 0:
+                _fallback(request, "compressed_group_unaligned")
+                return None
+            cr_lcm = math.lcm(cr_lcm, cr)
+        # If the suffix match starts inside a compression group, advance
+        # both donor `e` and target `middle_end` into the matching suffix
+        # until `middle_end` is group-aligned (the prefix before the new
+        # `middle_end` is simply forwarded in Phase 1). Both `e` and
+        # `middle_end` must share the same modulo `cr_lcm` so `delta` is a
+        # multiple of `cr_lcm`.
+        if (e - middle_end) % cr_lcm != 0:
+            _fallback(request, "compressed_group_unaligned")
+            return None
+        align_adv = (-middle_end) % cr_lcm
+        if align_adv:
+            if length <= align_adv:
+                _fallback(request, "compressed_group_unaligned")
+                return None
+            e += align_adv
+            r += align_adv
+            middle_end += align_adv
+            length -= align_adv
     resolved = resolve_block_hashes(
         hashes, manager.block_pool.hash_block_size, block_size
     )
@@ -185,7 +226,6 @@ def prepare_splice(
         )
         _fallback(request, "no_donor_boundary")
         return None
-    delta = middle_end - e
     ranges = []
     for gid, _ in fa:
         pos = e
