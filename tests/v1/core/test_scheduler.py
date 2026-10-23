@@ -29,6 +29,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+from vllm.v1.utils import ConstantList
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -7877,6 +7878,7 @@ def _make_donor_spliced_hybrid_requests(block_size: int):
     )
     donor_req.prompt_token_ids = donor_tokens
     donor_req._all_token_ids = donor_tokens.copy()
+    donor_req.all_token_ids = ConstantList(donor_req._all_token_ids)
     donor_req.num_prompt_tokens = len(donor_tokens)
     donor_req.block_hashes.clear()
     donor_req.update_block_hashes()
@@ -7890,6 +7892,7 @@ def _make_donor_spliced_hybrid_requests(block_size: int):
     )
     spliced_req.prompt_token_ids = spliced_tokens
     spliced_req._all_token_ids = spliced_tokens.copy()
+    spliced_req.all_token_ids = ConstantList(spliced_req._all_token_ids)
     spliced_req.num_prompt_tokens = len(spliced_tokens)
     spliced_req.block_hashes.clear()
     spliced_req.update_block_hashes()
@@ -7917,47 +7920,50 @@ def _seed_hybrid_donor(scheduler, block_size, donor_req, donor_tokens):
     return donor_blocks
 
 
+def _ordinary_hybrid_spliced_prefill(block_size: int) -> int:
+    """Schedule the spliced prompt with NO splice directives against the
+    donor-only cache and return the scheduled-token count (the ordinary
+    16-hit prefill = 52 - 16 = 36). Measured on its own scheduler so a
+    same-prompt request can never pollute the prefix cache of the other."""
+    scheduler = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
+    donor_req, spliced_req, donor_tokens, spliced_tokens = (
+        _make_donor_spliced_hybrid_requests(block_size)
+    )
+    _seed_hybrid_donor(scheduler, block_size, donor_req, donor_tokens)
+    # Strip any splice affordances -> the pure ordinary path.
+    spliced_req.kv_splice_directives = None
+    spliced_req.kv_splice_donor_tokens = None
+    spliced_req.donor_block_hashes = None
+    scheduler.add_request(spliced_req)
+    out = scheduler.schedule()
+    return out.num_scheduled_tokens["spliced"]
+
+
 def test_hybrid_splice_mode_off_leaves_ordinary_prefill_unchanged():
     """Hybrid (FA+Mamba) fixture, kv_splice_mode OFF (default): a spliced
-    request carrying valid amortize directives must schedule exactly the same
-    as an identical control request with NO splice directives, and must emit
-    zero CoW copies / RoPE rotations and not mark the splice as applied.
+    request carrying valid amortize directives + donor_block_hashes must
+    schedule exactly the ordinary prefill -- in this hybrid (mamba "all")
+    fixture the prefix cache resolves only the shared prefix (16 tokens =
+    1 FA + 1 mamba block; the blocks past the splice point diverge, so
+    nothing further matches) -- i.e. 52 - 16 = 36 -- and must emit zero CoW
+    copies / RoPE rotations and not mark the splice as applied.
 
     This proves the mode gate keeps the ordinary scheduled-prefill path
     byte-identical when the feature is off.
     """
     block_size = 16
+
+    # Baseline: the same prompt with NO splice directives at all, against the
+    # donor-only cache -> the ordinary 16-hit prefill.
+    baseline_sched = _ordinary_hybrid_spliced_prefill(block_size)
+
+    # Spliced request, mode OFF: same prompt + valid directives + donor hashes.
     scheduler = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
     assert isinstance(scheduler.kv_cache_manager.coordinator, HybridKVCacheCoordinator)
-
     donor_req, spliced_req, donor_tokens, spliced_tokens = (
         _make_donor_spliced_hybrid_requests(block_size)
     )
     _seed_hybrid_donor(scheduler, block_size, donor_req, donor_tokens)
-
-    # Control: identical prompt, NO splice directives -> the ordinary path.
-    # In this hybrid (mamba "all") fixture the prefix cache resolves 48 tokens
-    # (FA blocks 1-3 survive via the pool + mamba states), so the remainder
-    # (52 - 48) is scheduled.
-    (control_req,) = create_requests(
-        num_requests=1,
-        num_tokens=len(spliced_tokens),
-        block_size=block_size,
-        req_ids=["control"],
-    )
-    control_req.prompt_token_ids = spliced_tokens
-    control_req._all_token_ids = spliced_tokens.copy()
-    control_req.num_prompt_tokens = len(spliced_tokens)
-    control_req.block_hashes.clear()
-    control_req.update_block_hashes()
-    scheduler.add_request(control_req)
-    out_control = scheduler.schedule()
-    control_sched = out_control.num_scheduled_tokens["control"]
-    assert control_sched == len(spliced_tokens) - 3 * block_size
-    assert not out_control.kv_cache_block_copies
-    assert not out_control.kv_cache_rope_rotations
-
-    # Spliced request: same prompt, valid amortize directives, mode OFF.
     spliced_req.sampling_params = SamplingParams(
         max_tokens=8,
         extra_args={
@@ -7979,14 +7985,15 @@ def test_hybrid_splice_mode_off_leaves_ordinary_prefill_unchanged():
     ]
     spliced_req.donor_block_hashes = donor_req.block_hashes.copy()
     scheduler.add_request(spliced_req)
-    out_spliced = scheduler.schedule()
-    spliced_sched = out_spliced.num_scheduled_tokens["spliced"]
+    out = scheduler.schedule()
+    spliced_sched = out.num_scheduled_tokens["spliced"]
 
-    # Mode OFF => scheduled identically to the ordinary request; no splice ops;
-    # the splice was not applied.
-    assert spliced_sched == control_sched
-    assert not out_spliced.kv_cache_block_copies
-    assert not out_spliced.kv_cache_rope_rotations
+    # Mode OFF => the ordinary 16-hit prefill (36), no splice ops, and the
+    # splice was not applied.
+    assert baseline_sched == len(spliced_tokens) - 1 * block_size == 36
+    assert spliced_sched == baseline_sched
+    assert not out.kv_cache_block_copies
+    assert not out.kv_cache_rope_rotations
     assert getattr(spliced_req, "_leyline_splice_applied", False) is False
 
 
@@ -7994,9 +8001,10 @@ def test_hybrid_splice_mode_on_emits_cow_without_advancing():
     """Hybrid (FA+Mamba) fixture, kv_splice_mode=amortize: the donor's
     suffix blocks are scheduled for CoW + RoPE rotation (delta -16), but on a
     hybrid model num_computed does NOT advance (the has_mamba gate) — so the
-    scheduled prefill is unchanged and the copies are wasted today. This
-    pins the current hybrid behavior that the avoidance work must turn into a
-    real num_computed advance."""
+    scheduled prefill is unchanged (the ordinary 16-hit prefill, 52 - 16 = 36)
+    and the copies are wasted today. This pins the current hybrid behavior
+    that the avoidance work must turn into a real num_computed advance (the
+    §2b 3-phase schedule that schedules only the 4-token tail)."""
     block_size = 16
     scheduler = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
     assert isinstance(scheduler.kv_cache_manager.coordinator, HybridKVCacheCoordinator)
@@ -8044,5 +8052,5 @@ def test_hybrid_splice_mode_on_emits_cow_without_advancing():
         donor_blocks[2:4]
     )
     # ... but num_computed does NOT advance on the hybrid model, so the
-    # ordinary prefill (52 - 48 hit = 4 tokens) is still scheduled.
-    assert out.num_scheduled_tokens["spliced"] == len(spliced_tokens) - 3 * block_size
+    # ordinary prefill (52 - 16 hit = 36 tokens) is still scheduled.
+    assert out.num_scheduled_tokens["spliced"] == len(spliced_tokens) - 1 * block_size
