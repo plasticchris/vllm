@@ -3681,7 +3681,8 @@ class Scheduler(SchedulerInterface):
                 max_cacheable, boundary
             )
         if max_cacheable is not None:
-            request._leyline_max_cacheable_tokens = max_cacheable
+            if not self.kv_cache_config.has_mamba_layers:
+                request._leyline_max_cacheable_tokens = max_cacheable
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)

@@ -42,6 +42,7 @@ class LeylineSplicePlan:
 
 
 def _fallback(request: "Request", reason: str) -> None:
+    request._leyline_max_cacheable_tokens = None
     request.kv_splice_stats = {"fallback": reason, "skipped_tokens": 0}
     logger.info(
         "[leyline] req=%s fallback=%s nc=%s prompt=%s",
@@ -57,6 +58,8 @@ def cancel_splice(manager: "KVCacheManager", request: "Request") -> None:
     if plan is not None:
         manager.block_pool.free_blocks(plan.pins)
         request.leyline_splice_plan = None
+    if not getattr(request, "_leyline_splice_applied", False):
+        request._leyline_max_cacheable_tokens = None
 
 
 def prepare_splice(
@@ -143,7 +146,6 @@ def prepare_splice(
     if any(mgr.block_size != block_size for _, mgr in fa + mamba):
         _fallback(request, "block_size_mismatch")
         return None
-    delta = middle_end - e
     compress_ratios = [
         int(group.kv_cache_spec.tokens_per_state)
         for gid, _ in fa
@@ -176,6 +178,7 @@ def prepare_splice(
             r += align_adv
             middle_end += align_adv
             length -= align_adv
+    delta = middle_end - e
     resolved = resolve_block_hashes(
         hashes, manager.block_pool.hash_block_size, block_size
     )
@@ -244,6 +247,7 @@ def prepare_splice(
     pins = list({block.block_id: block for _, block, *_ in ranges + states}.values())
     manager.block_pool.touch(pins)
     plan = LeylineSplicePlan(middle_end, boundary + delta, delta, ranges, states, pins)
+    request._leyline_max_cacheable_tokens = middle_end
     request.leyline_splice_plan = plan
     logger.info(
         "[leyline] req=%s planned s=%d e=%d r=%d l=%d middle_end=%d target_end=%d delta=%d pins=%d",

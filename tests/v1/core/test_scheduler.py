@@ -8585,6 +8585,17 @@ def test_hybrid_splice_unaligned_replacement_and_multi_block_skip():
     assert not out_fb.mamba_state_transplants
     assert s2.kv_splice_stats["fallback"] == "donor_kv_missing"
     assert out_fb.num_scheduled_tokens["spliced"] == 36
+    # Because prepare_splice fell back to ordinary prefill, the APC cap must be
+    # cleared so all 3 full blocks of the fallback request are cached normally
+    # for subsequent turns!
+    assert getattr(s2, "_leyline_max_cacheable_tokens", None) is None
+    for gid in (0, 1):
+        assert (
+            scheduler2.kv_cache_manager.block_pool.get_cached_block(
+                s2.block_hashes[2], [gid]
+            )
+            is not None
+        )
 
 
 def test_hybrid_splice_qsa_flash_next_topology_and_rope_splices():
