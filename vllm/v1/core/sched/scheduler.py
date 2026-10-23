@@ -3043,9 +3043,12 @@ class Scheduler(SchedulerInterface):
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
                 if prefill_stats is not None:
+                    skipped = int(request.kv_splice_stats.get("skipped_tokens", 0) or 0)
                     prefill_stats.finalize(
-                        self.kv_cache_manager.estimate_cached_tokens(request)
+                        self.kv_cache_manager.estimate_cached_tokens(request) + skipped
                     )
+                    if skipped:
+                        prefill_stats.num_local_cached_tokens += skipped
 
             finish_reason = None
             if stopped:
