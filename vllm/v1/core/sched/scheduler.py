@@ -582,16 +582,16 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        block_size = self.block_size
         plan = getattr(request, "leyline_splice_plan", None)
         if plan is not None and start < plan.middle_end:
-            # A replacement (or Eagle prefix replay) must finish before the
-            # jump. Keep partial private state instead of rounding to zero.
-            return min(
-                num_new_tokens,
-                plan.middle_end - start,
-                (start // block_size + 1) * block_size - start,
-            )
+            # Advance up to middle_end in normal chunks while still stopping at
+            # any full Mamba block boundary inside [start, middle_end) so APC
+            # prefix states are cached on the way to the splice point.
+            next_b = (start // block_size + 1) * block_size
+            if start < next_b < plan.middle_end:
+                return min(num_new_tokens, next_b - start)
+            return min(num_new_tokens, plan.middle_end - start)
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
