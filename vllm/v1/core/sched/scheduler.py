@@ -41,6 +41,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.leyline_splice import cancel_splice, commit_splice, prepare_splice
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -582,6 +583,15 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
+        plan = getattr(request, "leyline_splice_plan", None)
+        if plan is not None and start < plan.middle_end:
+            # A replacement (or Eagle prefix replay) must finish before the
+            # jump. Keep partial private state instead of rounding to zero.
+            return min(
+                num_new_tokens,
+                plan.middle_end - start,
+                (start // block_size + 1) * block_size - start,
+            )
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
@@ -1326,6 +1336,14 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            splice_plan = getattr(request, "leyline_splice_plan", None)
+            splice_jump = (
+                splice_plan is not None
+                and request.num_computed_tokens == splice_plan.middle_end
+            )
+            if splice_jump:
+                request.num_computed_tokens = splice_plan.target_end
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -1394,7 +1412,14 @@ class Scheduler(SchedulerInterface):
                     ),
                 )
 
+            if splice_plan is not None and not splice_jump:
+                num_new_tokens = min(
+                    num_new_tokens,
+                    max(0, splice_plan.middle_end - request.num_computed_tokens),
+                )
             if num_new_tokens == 0:
+                if splice_jump:
+                    request.num_computed_tokens = splice_plan.middle_end
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -1485,6 +1510,14 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                break
+
+            if splice_jump and not commit_splice(
+                self.kv_cache_manager, request, num_new_tokens
+            ):
+                self.running.remove(request)
+                self._preempt_request(request, scheduled_timestamp)
+                preempted_reqs.append(request)
                 break
 
             # Schedule the request.
@@ -1747,6 +1780,21 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
                 else:
+                    hybrid_advance = 0
+                    if (
+                        self.use_v2_model_runner
+                        and not self.use_pp
+                        and self.dcp_world_size == self.pcp_world_size == 1
+                        and not load_kv_async
+                        and num_external_computed_tokens == 0
+                    ):
+                        plan = prepare_splice(self.kv_cache_manager, request)
+                        if plan is not None and num_computed_tokens > plan.middle_end:
+                            cancel_splice(self.kv_cache_manager, request)
+                            plan = None
+                        if plan is not None and num_computed_tokens == plan.middle_end:
+                            hybrid_advance = plan.target_end - num_computed_tokens
+                            num_computed_tokens = plan.target_end
                     request_token_budget = min(token_budget, input_budget - draft_slots)
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
@@ -1811,7 +1859,7 @@ class Scheduler(SchedulerInterface):
                             request,
                             num_new_tokens,
                             num_new_local_computed_tokens,
-                            num_external_computed_tokens,
+                            num_external_computed_tokens + hybrid_advance,
                         )
                         if num_new_tokens == 0:
                             break
@@ -1853,16 +1901,24 @@ class Scheduler(SchedulerInterface):
                             request,
                             num_new_tokens,
                             num_new_local_computed_tokens,
-                            num_external_computed_tokens,
+                            num_external_computed_tokens + hybrid_advance,
                             subblock_tokens=(
                                 active_mamba_subblock if active_decode else None
                             ),
                         )
 
+                    plan = getattr(request, "leyline_splice_plan", None)
+                    if plan is not None and not hybrid_advance:
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            max(0, plan.middle_end - num_computed_tokens),
+                        )
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
                         break
 
+                if load_kv_async:
+                    hybrid_advance = 0
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
@@ -1897,7 +1953,9 @@ class Scheduler(SchedulerInterface):
                     num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
+                    num_external_computed_tokens=(
+                        num_external_computed_tokens + hybrid_advance
+                    ),
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
@@ -1912,6 +1970,12 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    break
+
+                if hybrid_advance and not commit_splice(
+                    self.kv_cache_manager, request, num_new_tokens
+                ):
+                    self.kv_cache_manager.free(request)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -2008,10 +2072,8 @@ class Scheduler(SchedulerInterface):
                     if advance > 0:
                         num_computed_tokens += advance
                         num_new_tokens -= advance
-                        token_budget += advance
-                        input_budget += advance
-                        if is_waiting_prefill and prefill_token_budget is not None:
-                            prefill_token_budget += advance
+                        # Budgets have not been charged yet: charge only the
+                        # actual forwarded tail below, with no double refund.
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 if is_waiting_prefill:
@@ -2164,6 +2226,27 @@ class Scheduler(SchedulerInterface):
         pending_kv_cache_rope_rotations = (
             self.kv_cache_manager.take_kv_cache_rope_rotations() or None
         )
+        # Leyline hybrid §2b: fused copy+rotate splices and Mamba boundary-state
+        # transplants. The splice ops run with this step's execution and touch
+        # donor blocks retained for the step (see _apply_leyline_hybrid_splice);
+        # their correctness is guaranteed once the step's forward has read them.
+        # The donor (src) and target (dst) FA blocks and the donor Mamba block
+        # are pinned for the step and released at step completion (mirrors the
+        # pure-attention CoW pin/release), so no splice pin leaks (GAP 2).
+        pending_kv_cache_block_splices, splice_retained = (
+            self.kv_cache_manager.take_kv_cache_block_splices()
+        )
+        if splice_retained:
+            self._free_cow_retained_blocks(splice_retained, self.sched_step_seq + 1)
+        pending_mamba_state_transplants, transplant_retained = (
+            self.kv_cache_manager.take_mamba_state_transplants()
+        )
+        if transplant_retained:
+            self._free_cow_retained_blocks(
+                transplant_retained, self.sched_step_seq + 1
+            )
+        pending_kv_cache_block_splices = pending_kv_cache_block_splices or None
+        pending_mamba_state_transplants = pending_mamba_state_transplants or None
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -2229,6 +2312,8 @@ class Scheduler(SchedulerInterface):
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
             kv_cache_rope_rotations=pending_kv_cache_rope_rotations,
+            kv_cache_block_splices=pending_kv_cache_block_splices,
+            mamba_state_transplants=pending_mamba_state_transplants,
             scheduled_prefill_tokens=scheduled_prefill_tokens,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,

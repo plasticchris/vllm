@@ -8148,6 +8148,8 @@ def _make_donor_spliced_hybrid_requests(block_size: int):
 
 def _seed_hybrid_donor(scheduler, block_size, donor_req, donor_tokens):
     """Run the donor prefill to completion so its blocks are in the cache."""
+    scheduler.connector = None
+    donor_req.max_tokens = 1
     scheduler.add_request(donor_req)
     out = scheduler.schedule()
     assert out.num_scheduled_tokens["donor"] == len(donor_tokens)
@@ -8164,6 +8166,7 @@ def _seed_hybrid_donor(scheduler, block_size, donor_req, donor_tokens):
             pooler_output=[],
         ),
     )
+    assert donor_req.is_finished()
     return donor_blocks
 
 
@@ -8249,14 +8252,22 @@ def test_hybrid_splice_mode_off_leaves_ordinary_prefill_unchanged():
     assert _mgr.num_cached_block.get("spliced") == 3
 
 
-def test_hybrid_splice_mode_on_emits_cow_without_advancing():
-    """Hybrid (FA+Mamba) fixture, kv_splice_mode=amortize: the donor's
-    suffix blocks are scheduled for CoW + RoPE rotation (delta -16), but on a
-    hybrid model num_computed does NOT advance (the has_mamba gate) — so the
-    scheduled prefill is unchanged (the ordinary 16-hit prefill, 52 - 16 = 36)
-    and the copies are wasted today. This pins the current hybrid behavior
-    that the avoidance work must turn into a real num_computed advance (the
-    §2b 3-phase schedule that schedules only the 4-token tail)."""
+def test_hybrid_splice_mode_on_emits_splices_and_transplant():
+    """Hybrid (FA+Mamba) fixture, kv_splice_mode=amortize: the §2b no-forward
+    splice jump. The scheduler emits (a) fused offset-aware copy+rotate FA KV
+    splices of the donor suffix into the target blocks and (b) a Mamba
+    boundary-state transplant, and advances num_computed so only the r tail
+    (phase 1) + k_tail (phase 3) still forward.
+
+    Geometry (16-hit fixture, bs=16): donor 68 tok, spliced omits [16,32) ->
+    52 tok. d_cached = 64 (largest cached donor Mamba+FA boundary >= e=32),
+    k_tail = d_end - d_cached = 4, target_end = T - k_tail = 48, start_new =
+    s = 16, so the splice jumps 16 -> 48 (advance 32) and only the k_tail=4
+    tail is scheduled. FA splices cover donor [32,64) -> target [16,48): donor
+    FA blocks 3,4 -> target FA blocks 11,12 (delta -16). The Mamba boundary
+    state at d_cached=64 (donor mamba logical block 3, phys 9) is transplanted
+    into the target's state slot for token target_end-1=47 (target mamba
+    logical block 2, phys 15), target_idx=2."""
     block_size = 16
     scheduler = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
     assert isinstance(scheduler.kv_cache_manager.coordinator, HybridKVCacheCoordinator)
@@ -8276,7 +8287,7 @@ def test_hybrid_splice_mode_on_emits_cow_without_advancing():
                     "span_start": 16,
                     "span_end": 32,
                     "replacement_len": 0,
-                    "suffix_len": 32,
+                    "suffix_len": 36,
                 }
             ],
         },
@@ -8289,31 +8300,62 @@ def test_hybrid_splice_mode_on_emits_cow_without_advancing():
     scheduler.add_request(spliced_req)
     out = scheduler.schedule()
 
-    # Full suffix (2 blocks) spliced via CoW + rotation (delta -16) ...
-    assert out.kv_cache_block_copies is not None
-    assert len(out.kv_cache_block_copies) == 2
-    assert out.kv_cache_rope_rotations is not None
-    assert len(out.kv_cache_rope_rotations) == 2
-    for copy_op, rot_op in zip(out.kv_cache_block_copies, out.kv_cache_rope_rotations):
-        assert rot_op.block_id == copy_op.dst_block_id
-        assert rot_op.delta_pos == -16
-        assert rot_op.start_offset == 0
-        assert rot_op.end_offset == block_size
-    # ... sources are the donor's cached suffix blocks (pool-resolved ids).
-    assert sorted(c.src_block_id for c in out.kv_cache_block_copies) == sorted(
-        donor_blocks[2:4]
-    )
-    # ... but num_computed does NOT advance on the hybrid model, so the
-    # ordinary prefill (52 - 16 hit = 36 tokens) is still scheduled.
-    assert out.num_scheduled_tokens["spliced"] == len(spliced_tokens) - 1 * block_size
+    # --- (a) two fused FA KV splices, donor [32,48) -> target [16,32) ---
+    assert out.kv_cache_block_splices is not None
+    assert len(out.kv_cache_block_splices) == 2
+    splices = out.kv_cache_block_splices
+    # Sources are the donor's cached suffix FA blocks 2,3 (donor [32,64)).
+    assert sorted(sp.src_block_id for sp in splices) == sorted(donor_blocks[2:4])
+    # Targets are the spliced request's FA blocks holding target [16,32).
+    spliced_blocks = scheduler.kv_cache_manager.get_block_ids("spliced")[0]
+    assert sorted(sp.dst_block_id for sp in splices) == sorted(spliced_blocks[1:3])
+    for sp in splices:
+        # Full-block offset-aware copy with the absolute RoPE delta (s - e = -16).
+        assert sp.src_start == 0
+        assert sp.src_end == block_size
+        assert sp.dst_start == 0
+        assert sp.dst_end == block_size
+        assert sp.delta_pos == -16
+    # The §2b jump replaces the old wasted CoW+rotation path: no plain CoW
+    # copies and no separate RoPE rotations are emitted (rotation is fused into
+    # the splice op).
+    assert not out.kv_cache_block_copies
+    assert not out.kv_cache_rope_rotations
+
+    # --- (b) one Mamba boundary-state transplant ---
+    assert out.mamba_state_transplants is not None
+    assert len(out.mamba_state_transplants) == 1
+    tp = out.mamba_state_transplants[0]
+    assert tp.req_id == "spliced"
+    # Donor Mamba logical block 3 (phys 9, boundary state at d_cached=64)
+    # -> target mamba logical block holding token target_end-1=47 (phys 15),
+    # state idx (target_end-1)//bs = 2.
+    donor_mamba_blocks = [
+        scheduler.kv_cache_manager.block_pool.get_cached_block(h, [1])[0].block_id
+        for h in donor_req.block_hashes
+    ]
+    assert tp.src_block_id == donor_mamba_blocks[3]
+    assert tp.target_idx == 3
+    assert tp.dst_block_id == scheduler.kv_cache_manager.get_block_ids("spliced")[1][
+        tp.target_idx
+    ]
+
+    # --- the §2b jump: num_computed 16 -> target_end 48 (advance 32), so only
+    # the k_tail=4 tail is scheduled (36 ordinary prefill - 32 advance).
+    # NewRequestData carries the pre-tail jump position 48, while
+    # _update_after_schedule advances request.num_computed_tokens to 52. ---
+    assert out.scheduled_new_reqs[0].num_computed_tokens == 48
+    assert spliced_req.num_computed_tokens == 52
+    assert out.num_scheduled_tokens["spliced"] == 4
+
     # 2c: the cap (s + r = 16 + 0) is set at admission, and APC registration
     # is clamped to it -- only block 0 (the clean prefix) registers, not the
     # donor-contaminated spliced suffix.
     assert getattr(spliced_req, "_leyline_max_cacheable_tokens", None) == 16
     _mgr = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
     assert _mgr.num_cached_block.get("spliced") == (16 + 0) // block_size == 1
-    # The spliced FA block-1 (target tokens [16,32)) holds a CoW+rotated copy
-    # of the donor's middle block; it must NOT be in the APC under the target
+    # The spliced FA block-1 (target tokens [16,32)) holds a spliced copy of
+    # the donor's middle block; it must NOT be in the APC under the target
     # tokens' chained hash.
     assert scheduler.kv_cache_manager.block_pool.get_cached_block(
         spliced_req.block_hashes[1], [0]
@@ -8323,3 +8365,214 @@ def test_hybrid_splice_mode_on_emits_cow_without_advancing():
     assert scheduler.kv_cache_manager.block_pool.get_cached_block(
         spliced_req.block_hashes[0], [0]
     ) is not None
+
+
+def test_hybrid_splice_mode_on_no_pin_leak():
+    """GAP 2 for the §2b hybrid splice: the donor (src) and target (dst) FA
+    blocks and the donor Mamba block are pinned for the step while the worker
+    splice/transplant reads them, and every pin is released at step completion
+    (mirrors the pure-attention CoW pin/release). After both requests finish,
+    each splice-involved block's ref_cnt returns exactly to its pre-splice
+    baseline -- no splice pin leaks, and no splice block is double-freed."""
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
+    donor_req, spliced_req, donor_tokens, spliced_tokens = (
+        _make_donor_spliced_hybrid_requests(block_size)
+    )
+    _seed_hybrid_donor(scheduler, block_size, donor_req, donor_tokens)
+
+    spliced_req.sampling_params = SamplingParams(
+        max_tokens=8,
+        extra_args={
+            "kv_splice_mode": "amortize",
+            "kv_splice_donor_tokens": donor_tokens,
+            "kv_splice_directives": [
+                {
+                    "span_start": 16,
+                    "span_end": 32,
+                    "replacement_len": 0,
+                    "suffix_len": 36,
+                }
+            ],
+        },
+    )
+    spliced_req.kv_splice_donor_tokens = donor_tokens
+    spliced_req.kv_splice_directives = spliced_req.sampling_params.extra_args[
+        "kv_splice_directives"
+    ]
+    spliced_req.donor_block_hashes = donor_req.block_hashes.copy()
+
+    pool = scheduler.kv_cache_manager.block_pool
+
+    def _mro(o):
+        return ModelRunnerOutput(
+            req_ids=list(o.num_scheduled_tokens),
+            req_id_to_index={r: i for i, r in enumerate(o.num_scheduled_tokens)},
+            sampled_token_ids=[[999]] * len(o.num_scheduled_tokens),
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
+    def _baseline(ids):
+        return {b: pool.blocks[b].ref_cnt for b in set(ids)}
+
+    # Baseline (donor + prefix blocks) before the splice is scheduled.
+    baseline = {blk.block_id: blk.ref_cnt for blk in pool.blocks}
+
+    scheduler.add_request(spliced_req)
+    out = scheduler.schedule()
+    assert out.kv_cache_block_splices and len(out.kv_cache_block_splices) == 2
+    assert out.mamba_state_transplants and len(out.mamba_state_transplants) == 1
+
+    # Donor endpoints gain +1 retention pin; private destination blocks have
+    # 1 request ref + 1 retention pin = 2.
+    sources = {sp.src_block_id for sp in out.kv_cache_block_splices} | {
+        tp.src_block_id for tp in out.mamba_state_transplants
+    }
+    destinations = {sp.dst_block_id for sp in out.kv_cache_block_splices} | {
+        tp.dst_block_id for tp in out.mamba_state_transplants
+    }
+    for b in sources:
+        assert pool.blocks[b].ref_cnt == baseline[b] + 1
+    for b in destinations:
+        assert pool.blocks[b].ref_cnt == baseline[b] + 2
+
+    scheduler.update_from_output(out, _mro(out))
+    for _ in range(64):
+        if spliced_req.is_finished():
+            break
+        o = scheduler.schedule()
+        if spliced_req.request_id not in o.num_scheduled_tokens:
+            break
+        scheduler.update_from_output(o, _mro(o))
+    assert spliced_req.is_finished()
+
+    for blk in pool.blocks:
+        if not blk.is_null:
+            assert blk.ref_cnt == baseline[blk.block_id]
+            assert blk.ref_cnt >= 0
+
+
+def test_hybrid_splice_unaligned_replacement_and_multi_block_skip():
+    """Unaligned replacement (r > 0) and chunked prefill still skip the suffix.
+
+    Donor: 132 tokens (8 full blocks + 4 tail). Edit replaces [16, 40) with 4
+    fresh tokens (r=4, delta=-20) and retains suffix [40, 132) (92 tokens).
+    Step 1 forwards only the 4 replacement tokens ([16, 20)), while pinning the
+    donor; Step 2 jumps 20 -> 108 (skipping 88 tokens across 5+ blocks even with
+    long_prefill_token_threshold=16) and forwards the 4-token tail [108, 112).
+    """
+    block_size = 16
+    scheduler = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
+    scheduler.scheduler_config.long_prefill_token_threshold = 16
+    donor_tokens = list(range(500, 632))
+    (donor_req,) = create_requests(
+        num_requests=1,
+        num_tokens=len(donor_tokens),
+        block_size=block_size,
+        req_ids=["donor-long"],
+    )
+    donor_req.prompt_token_ids = donor_tokens
+    donor_req._all_token_ids[:] = donor_tokens
+    donor_req.all_token_ids = ConstantList(donor_req._all_token_ids)
+    donor_req.num_prompt_tokens = len(donor_tokens)
+    donor_req.block_hashes.clear()
+    donor_req.update_block_hashes()
+    scheduler.add_request(donor_req)
+    while donor_req.num_computed_tokens < len(donor_tokens):
+        step = scheduler.schedule()
+        scheduler.update_from_output(
+            step,
+            ModelRunnerOutput(
+                req_ids=["donor-long"],
+                req_id_to_index={"donor-long": 0},
+                sampled_token_ids=[[999]]
+                if donor_req.num_computed_tokens + step.num_scheduled_tokens["donor-long"]
+                >= len(donor_tokens)
+                else [[]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    replacement = [9001, 9002, 9003, 9004]
+    spliced_tokens = donor_tokens[:16] + replacement + donor_tokens[40:]
+    (spliced_req,) = create_requests(
+        num_requests=1,
+        num_tokens=len(spliced_tokens),
+        block_size=block_size,
+        req_ids=["spliced-unaligned"],
+    )
+    spliced_req.prompt_token_ids = spliced_tokens
+    spliced_req._all_token_ids[:] = spliced_tokens
+    spliced_req.all_token_ids = ConstantList(spliced_req._all_token_ids)
+    spliced_req.num_prompt_tokens = len(spliced_tokens)
+    spliced_req.block_hashes.clear()
+    spliced_req.update_block_hashes()
+    spliced_req.sampling_params = SamplingParams(
+        max_tokens=1,
+        extra_args={
+            "kv_splice_mode": "amortize",
+            "kv_splice_donor_tokens": donor_tokens,
+            "kv_splice_directives": [(16, 40, 4, 92)],
+        },
+    )
+    spliced_req.kv_splice_donor_tokens = donor_tokens
+    spliced_req.kv_splice_directives = [(16, 40, 4, 92)]
+    spliced_req.donor_block_hashes = donor_req.block_hashes.copy()
+
+    scheduler.add_request(spliced_req)
+    out1 = scheduler.schedule()
+    assert out1.num_scheduled_tokens["spliced-unaligned"] == 4
+    assert not out1.kv_cache_block_splices
+    scheduler.update_from_output(
+        out1,
+        ModelRunnerOutput(
+            req_ids=list(out1.num_scheduled_tokens),
+            req_id_to_index={r: i for i, r in enumerate(out1.num_scheduled_tokens)},
+            sampled_token_ids=[[]] * len(out1.num_scheduled_tokens),
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    out2 = scheduler.schedule()
+    # _update_after_schedule advances num_computed_tokens past the scheduled
+    # tail (108 + 4 = 112), while CachedRequestData sent to the worker carries
+    # the pre-tail jump position 108.
+    assert out2.scheduled_cached_reqs.num_computed_tokens == [108]
+    assert spliced_req.num_computed_tokens == 112
+    assert out2.num_scheduled_tokens["spliced-unaligned"] == 4
+    assert spliced_req.kv_splice_stats["skipped_tokens"] == 88
+    assert sum(sp.src_end - sp.src_start for sp in out2.kv_cache_block_splices) == 88
+    assert all(sp.delta_pos == -20 for sp in out2.kv_cache_block_splices)
+    assert len(out2.mamba_state_transplants) == 1
+    assert out2.mamba_state_transplants[0].target_idx == 111 // block_size
+
+    # Verify atomic fallback: if a donor FA block is evicted, prepare_splice
+    # records donor_kv_missing and leaves no pending splices or pin leaks.
+    scheduler2 = _create_hybrid_mamba_connector_scheduler(0, block_size=block_size)
+    d2, s2, dt2, _ = _make_donor_spliced_hybrid_requests(block_size)
+    db2 = _seed_hybrid_donor(scheduler2, block_size, d2, dt2)
+    scheduler2.kv_cache_manager.block_pool.evict_blocks({db2[2]})
+    s2.sampling_params = SamplingParams(
+        max_tokens=1,
+        extra_args={
+            "kv_splice_mode": "amortize",
+            "kv_splice_donor_tokens": dt2,
+            "kv_splice_directives": [(16, 32, 0, 36)],
+        },
+    )
+    s2.kv_splice_donor_tokens = dt2
+    s2.kv_splice_directives = [(16, 32, 0, 36)]
+    s2.donor_block_hashes = d2.block_hashes.copy()
+    scheduler2.add_request(s2)
+    out_fb = scheduler2.schedule()
+    assert not out_fb.kv_cache_block_splices
+    assert not out_fb.mamba_state_transplants
+    assert s2.kv_splice_stats["fallback"] == "donor_kv_missing"
+    assert out_fb.num_scheduled_tokens["spliced"] == 36
+

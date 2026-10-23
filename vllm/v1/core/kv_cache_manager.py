@@ -14,10 +14,14 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.leyline_splice import cancel_splice
 from vllm.v1.core.kv_cache_utils import (
+    BlockHashList,
     KVCacheBlock,
     KVCacheBlockCopy,
     KVCacheBlockRoPERotation,
+    KVCacheBlockSplice,
+    MambaStateTransplant,
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -173,6 +177,20 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+
+        # Leyline hybrid splice (design §2b) pending drains, populated by
+        # maybe_apply_leyline_splice for mamba-hybrid models. Drained once per
+        # schedule() into SchedulerOutput and applied on the worker before the
+        # tail prefill forward.
+        self._pending_kv_cache_block_splices: list[KVCacheBlockSplice] = []
+        self._pending_mamba_state_transplants: list[MambaStateTransplant] = []
+        # Retained endpoints (donor src + target dst FA blocks, and the donor
+        # Mamba boundary block) for the pending hybrid splice ops. Pinned by
+        # _apply_leyline_hybrid_splice so the worker copy/transplant reads live
+        # blocks; released by the scheduler via _free_cow_retained_blocks at
+        # step completion (mirrors the pure-attention CoW pin/release).
+        self._pending_kv_cache_block_splice_retained: list[KVCacheBlock] = []
+        self._pending_mamba_transplant_retained: list[KVCacheBlock] = []
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -577,6 +595,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        cancel_splice(self, request)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -609,6 +628,7 @@ class KVCacheManager:
         Returns:
             The request's blocks in allocation order.
         """
+        cancel_splice(self, request)
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
@@ -881,6 +901,43 @@ class KVCacheManager:
                     )
         return rotations
 
+    def take_kv_cache_block_splices(
+        self,
+    ) -> tuple[list[KVCacheBlockSplice], list[KVCacheBlock]]:
+        """Drain pending Leyline hybrid fused copy+rotate splices (design §2b)
+        and return their retained endpoints.
+
+        Populated for mamba-hybrid models by ``maybe_apply_leyline_splice``; the
+        worker applies each op to every full-attention layer before the tail
+        prefill forward. The donor (src) and target (dst) FA blocks are pinned
+        for the step and returned so the scheduler can release them at step
+        completion (mirrors ``take_kv_cache_block_copies``). Off by default
+        (``kv_splice_mode != "amortize"``), so this stays empty for the
+        ordinary path.
+        """
+        splices = self._pending_kv_cache_block_splices
+        retained = self._pending_kv_cache_block_splice_retained
+        self._pending_kv_cache_block_splices = []
+        self._pending_kv_cache_block_splice_retained = []
+        return splices, retained
+
+    def take_mamba_state_transplants(
+        self,
+    ) -> tuple[list[MambaStateTransplant], list[KVCacheBlock]]:
+        """Drain pending Leyline hybrid Mamba (GDN) boundary-state transplants.
+
+        The worker CoWs each donor boundary-state block into the target's state
+        slot before the tail prefill so the GDN continuation starts from the
+        donor's recurrent state. In ``mamba_cache_mode="align"`` the worker also
+        sets ``_mamba_state_idx_gpu[req] = target_idx`` so the align preprocess
+        kernel does not clobber the transplant (design A6).
+        """
+        transplants = self._pending_mamba_state_transplants
+        retained = self._pending_mamba_transplant_retained
+        self._pending_mamba_state_transplants = []
+        self._pending_mamba_transplant_retained = []
+        return transplants, retained
+
     def maybe_apply_leyline_splice(
         self,
         request: Request,
@@ -914,6 +971,10 @@ class KVCacheManager:
         if _mode != "amortize":
             return 0
         if not directives or not donor_hashes or not self.enable_caching:
+            return 0
+        if self.kv_cache_config.has_mamba_layers:
+            # Hybrid jumps are planned BEFORE allocation and committed atomically.
+            # Never enter the legacy post-allocation copy/advance path.
             return 0
 
         # Ensure we only process splice directives once per request

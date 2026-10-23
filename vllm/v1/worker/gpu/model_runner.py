@@ -1072,15 +1072,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        jump_requests = {
+            op.req_id for op in (scheduler_output.mamba_state_transplants or ())
+        }
+        staged_jump = False
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
+            if req_id in jump_requests:
+                # Only an explicit splice jump may override the GPU counter;
+                # ordinary async decode/rejection updates remain GPU-owned.
+                self.req_states.num_computed_tokens.stage_write_elem(
+                    req_index, num_computed_tokens
+                )
+                staged_jump = True
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+
+        if staged_jump:
+            self.req_states.num_computed_tokens.apply_write()
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -1116,6 +1130,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.compilation_config.static_forward_context,
                     self.kv_cache_config.num_blocks,
                     scheduler_output.kv_cache_rope_rotations,
+                    inv_freq=inv_freq,
+                    is_neox_style=is_neox,
+                )
+
+        # Leyline hybrid §2b: fused copy+rotate splices of donor full-attention
+        # KV into the target suffix slots, run with this step's execution so the
+        # tail-prefill forward reads the spliced KV. Runs AFTER the plain CoW
+        # block copies and BEFORE the Mamba boundary-state transplant and the
+        # phase-3 Mamba preprocess, so the continuation sees both the spliced
+        # KV and the transplanted recurrent state. Only set when
+        # kv_splice_mode == "amortize"; off by default.
+        if getattr(scheduler_output, "kv_cache_block_splices", None):
+            inv_freq, is_neox = self._resolve_rope_inv_freq()
+            if inv_freq is None:
+                raise RuntimeError("Hybrid splice requires resolvable RoPE frequencies")
+            if inv_freq is not None:
+                from vllm.v1.attention.ops.leyline_rope import (
+                    apply_kv_cache_block_splices_inplace,
+                )
+
+                apply_kv_cache_block_splices_inplace(
+                    self.compilation_config.static_forward_context,
+                    self.kv_cache_config.num_blocks,
+                    scheduler_output.kv_cache_block_splices,
                     inv_freq=inv_freq,
                     is_neox_style=is_neox,
                 )

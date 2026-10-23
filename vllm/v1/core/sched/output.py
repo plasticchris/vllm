@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import (
         KVCacheBlockCopy,
         KVCacheBlockRoPERotation,
+        KVCacheBlockSplice,
         MambaStateTransplant,
     )
     from vllm.v1.request import Request
@@ -30,6 +31,7 @@ else:
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
     KVCacheBlockRoPERotation = object
+    KVCacheBlockSplice = object
     MambaStateTransplant = object
     LoRARequest = object
     MultiModalFeatureSpec = object
@@ -296,6 +298,12 @@ class SchedulerOutput:
 
     # Leyline-style in-place RoPE delta rotations on cloned KV blocks.
     kv_cache_rope_rotations: list[KVCacheBlockRoPERotation] | None = None
+
+    # Leyline hybrid splice (design §2b/§2d): offset-aware fused copy+rotate of
+    # donor full-attention KV ranges into the target's suffix blocks. Applied on
+    # the worker after the plain block copies and BEFORE the Mamba transplant /
+    # phase-3 preprocess, so the tail prefill forward reads the spliced KV.
+    kv_cache_block_splices: list[KVCacheBlockSplice] | None = None
 
     # Leyline hybrid splice (design §2b/§2d): CoW of the donor Mamba (GDN)
     # boundary-state block into the target's splice-point state slot. Applied on

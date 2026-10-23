@@ -1237,6 +1237,21 @@ class GPUModelRunner(
                 scheduler_output.kv_cache_block_copies,
             )
 
+        # The v1 runner does not resolve RoPE inv_freq, so it cannot apply the
+        # Leyline hybrid fused copy+rotate KV splices (design §2b) that the
+        # shared scheduler emits for a mamba-hybrid model in
+        # kv_splice_mode="amortize". Fail loudly rather than silently skipping
+        # them (which would leave the target FA slots stale/empty and corrupt
+        # the tail-prefill attention). The v2 model runner is the production
+        # path and applies these splices in place.
+        if getattr(scheduler_output, "kv_cache_block_splices", None):
+            raise NotImplementedError(
+                "kv_cache_block_splices require the v2 model runner "
+                "(RoPE inv_freq resolution); this v1 runner cannot apply "
+                "them. Run with VLLM_USE_V2_MODEL_RUNNER=1 for mamba-hybrid "
+                "kv_splice_mode=amortize."
+            )
+
         # Leyline hybrid-splice Mamba boundary-state transplants: whole-block CoW
         # of the donor GDN state into the target's splice-point slot, run after
         # zeroing + CoW copies and BEFORE the phase-3 Mamba preprocess so the

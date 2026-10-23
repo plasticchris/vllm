@@ -228,6 +228,9 @@ class Request:
 
         self.block_hashes: list[BlockHash] = []
         self.donor_block_hashes: list[BlockHash] | None = None
+        self.leyline_splice_checked = False
+        self.leyline_splice_plan = None
+        self.kv_splice_stats: dict[str, int | str] = {}
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
@@ -239,13 +242,16 @@ class Request:
             and isinstance(self.kv_splice_donor_tokens, list)
         ):
             saved_all = self._all_token_ids
+            saved_view = self.all_token_ids
             saved_hashes = self.block_hashes
             try:
                 self._all_token_ids = list(self.kv_splice_donor_tokens)
+                self.all_token_ids = ConstantList(self._all_token_ids)
                 self.block_hashes = []
                 self.donor_block_hashes = self._block_hasher(self)
             finally:
                 self._all_token_ids = saved_all
+                self.all_token_ids = saved_view
                 self.block_hashes = saved_hashes
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()

@@ -22,7 +22,10 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.ops.paged_attn import PagedAttention
-from vllm.v1.core.kv_cache_utils import KVCacheBlockRoPERotation
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlockRoPERotation,
+    KVCacheBlockSplice,
+)
 
 FP8_MIN, FP8_MAX = get_fp8_min_max()
 
@@ -471,3 +474,114 @@ def fuse_copy_rotate_key_value_block_range(
         kv_cache_dtype=kv_cache_dtype,
         k_scale=k_scale,
     )
+
+
+def apply_kv_cache_block_splices_inplace(
+    static_forward_context: dict[str, object],
+    num_blocks: int,
+    splices: Sequence[KVCacheBlockSplice],
+    inv_freq: torch.Tensor,
+    is_neox_style: bool = True,
+) -> None:
+    """Apply scheduled fused copy+rotate splices across all full-attention
+    layers (the §2b phase-2 worker op).
+
+    Each ``KVCacheBlockSplice`` copies the donor's already-RoPE'd cached KV for
+    token slots ``[src_start, src_end)`` of ``src_block_id`` into the target's
+    slots ``[dst_start, dst_end)`` of ``dst_block_id``, rotating K by the
+    absolute RoPE delta ``delta_pos`` in the same pass. Slot offsets are
+    expressed in scheduler-block token units, so the mapping to the
+    kernel's sub-blocks (``kernel_blocks_per_sched_block``) mirrors
+    ``apply_kv_cache_rope_rotations_inplace``.
+    """
+    if not splices:
+        return
+
+    seen_ptrs: set[tuple[torch.device, int]] = set()
+    for layer in static_forward_context.values():
+        kv_cache = getattr(layer, "kv_cache", None)
+        impl = getattr(layer, "impl", None)
+        if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
+            continue
+        if not hasattr(layer, "num_kv_heads") or not hasattr(layer, "head_size"):
+            continue
+        # Only full/sliding-window attention layers with 2 head slots (K and V)
+        # store RoPE keys; Mamba state tensors are skipped.
+        if kv_cache.ndim < 4 or kv_cache.shape[1] != 2:
+            continue
+        ptr_key = (kv_cache.device, kv_cache.data_ptr())
+        if ptr_key in seen_ptrs:
+            continue
+        seen_ptrs.add(ptr_key)
+
+        num_kv_heads = int(layer.num_kv_heads)
+        head_size = int(layer.head_size)
+        kv_cache_dtype = getattr(impl, "kv_cache_dtype", "auto")
+        k_scale = getattr(layer, "_k_scale", None)
+
+        # Split [B, 2, N, H*hs] -> key_cache/value_cache in kernel layout.
+        key_cache, value_cache = PagedAttention.split_kv_cache(
+            kv_cache.transpose(0, 1), num_kv_heads, head_size
+        )
+        total_kernel_blocks = int(key_cache.shape[0])
+        kernel_block_size = int(key_cache.shape[3])
+        kernel_blocks_per_sched_block = max(1, total_kernel_blocks // max(1, num_blocks))
+        sched_block_tokens = kernel_blocks_per_sched_block * kernel_block_size
+
+        for sp in splices:
+            s_tok = max(0, int(sp.src_start))
+            e_tok = (
+                sched_block_tokens
+                if int(sp.src_end) <= 0
+                else min(sched_block_tokens, int(sp.src_end))
+            )
+            d_tok = max(0, int(sp.dst_start))
+            f_tok = (
+                sched_block_tokens
+                if int(sp.dst_end) <= 0
+                else min(sched_block_tokens, int(sp.dst_end))
+            )
+            if s_tok >= e_tok or d_tok >= f_tok:
+                continue
+            assert e_tok - s_tok == f_tok - d_tok, (
+                f"splice range length mismatch: src ({s_tok}, {e_tok}) vs "
+                f"dst ({d_tok}, {f_tok})"
+            )
+            src_base = int(sp.src_block_id) * kernel_blocks_per_sched_block
+            dst_base = int(sp.dst_block_id) * kernel_blocks_per_sched_block
+            # The [src_start, src_end) and [dst_start, dst_end) ranges are in
+            # scheduler-block token units and may (a) straddle several kernel
+            # sub-blocks when a scheduler block maps to multiple kernel blocks
+            # and (b) have a non-zero intra-block shift (dst_start - src_start).
+            # Decompose the logical range [0, L) (L = range length) at every
+            # point where the src local position OR the dst local position
+            # crosses a kernel sub-block boundary, so each fragment lies wholly
+            # inside one src sub-block and one dst sub-block.
+            L = e_tok - s_tok
+            cuts = {0, L}
+            b = kernel_block_size
+            while b < sched_block_tokens:
+                for origin in (s_tok, d_tok):
+                    t = b - origin  # logical offset where origin + t == b
+                    if 0 < t < L:
+                        cuts.add(t)
+                b += kernel_block_size
+            cuts = sorted(cuts)
+            for t0, t1 in zip(cuts, cuts[1:]):
+                src_sub = (s_tok + t0) // kernel_block_size
+                dst_sub = (d_tok + t0) // kernel_block_size
+                fuse_copy_rotate_key_value_block_range(
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    src_block_id=src_base + src_sub,
+                    dst_block_id=dst_base + dst_sub,
+                    src_start=(s_tok + t0) - src_sub * kernel_block_size,
+                    src_end=(s_tok + t1) - src_sub * kernel_block_size,
+                    dst_start=(d_tok + t0) - dst_sub * kernel_block_size,
+                    dst_end=(d_tok + t1) - dst_sub * kernel_block_size,
+                    delta_pos=int(sp.delta_pos),
+                    inv_freq=inv_freq,
+                    is_neox_style=is_neox_style,
+                    kv_cache_dtype=kv_cache_dtype,
+                    k_scale=k_scale,
+                )

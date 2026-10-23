@@ -1664,6 +1664,18 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             return num_new_blocks + num_evictable_computed_blocks
 
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        if self.mamba_cache_mode == "align":
+            return
+        super().allocate_external_computed_blocks(
+            request_id, num_local_computed_tokens, num_external_computed_tokens
+        )
+
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
