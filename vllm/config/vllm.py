@@ -1939,7 +1939,14 @@ class VllmConfig:
                     " to accommodate the additional draft token slots, or decrease"
                     " num_speculative_tokens."
                 )
-            if self.scheduler_config.max_num_scheduled_tokens < 8192:
+            # Only warn when the spec method actually consumes extra drafting
+            # slots per request (parallel EAGLE/DFlash, draft models). MTP-style
+            # methods add zero slots, so a small max_num_batched_tokens (e.g. the
+            # tuned 6144 prefill budget) is not starving anything.
+            if (
+                self.scheduler_config.max_num_scheduled_tokens < 8192
+                and scheduled_token_delta > 0
+            ):
                 logger.warning_once(
                     "max_num_scheduled_tokens is set to"
                     f" {self.scheduler_config.max_num_scheduled_tokens} based on"
