@@ -336,14 +336,18 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
       V0 += (s.x + s.y);                                             \
     }
 #elif defined(__HIP__GFX1X__)
-  // gfx1x: v_dot2_f32_f16 (VOP3-P, dot10-insts, available on gfx11+gfx12)
+using bf16x2_dot_t = __attribute__((__vector_size__(2 * sizeof(__bf16)))) __bf16;
+  // gfx1x: v_dot2_f32_f16 (VOP3-P, dot10-insts, available on gfx11+gfx12).
+  // bf16 has its own dot here too; widening to fp32 instead costs 7 VALU slots
+  // against 2, enough to make this loop VALU-bound rather than memory-bound
+  // once YTILE > 1.
   #define DOT2C(V0, V2, V3)                                               \
     if constexpr (std::is_same_v<scalar_t, half>) {                       \
       asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3)); \
     } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {      \
-      float2 s = __bfloat1622float2(*((__hip_bfloat162*)(&(V2)))) *       \
-                 __bfloat1622float2(*((__hip_bfloat162*)(&(V3))));        \
-      V0 += (s.x + s.y);                                                  \
+      V0 = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_dot_t*)(&(V2))),     \
+                                           *((bf16x2_dot_t*)(&(V3))),     \
+                                           V0, false);                    \
     }
 #endif
 
@@ -1217,17 +1221,23 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int max_lds_len = get_lds_size() / 2;
+  // 0 = auto, 2 = force wvSplitK_hf_, 3 = force wvSplitK_hf_big_
+  static int _wv_tier = []() {
+    const char* e = getenv("VLLM_WVSPLITK_TIER");
+    return e ? atoi(e) : 0;
+  }();
 
 #define WVSPLITK_CFG(_THRDS, _WVPRGRP, _YTILE, _UNRL, _N)                     \
   {                                                                           \
     dim3 block(_THRDS, _WVPRGRP);                                             \
     int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, _WVPRGRP);                 \
-    if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))               \
+    if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0) && !_wv_tier)  \
       wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>        \
           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
                                        By_in, af4, bf4, biasf4, c, __wvPrGrp, \
                                        CuCount);                              \
-    else if (Kbp_in * N_in <= max_lds_len * 1.2)                              \
+    else if ((Kbp_in * N_in <= max_lds_len * 1.2 || _wv_tier == 2) &&         \
+             _wv_tier != 3 && (_N < 6 || _wv_tier == 2))                      \
       wvSplitK_hf_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>            \
           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
                                        By_in, af4, bf4, biasf4, c, __wvPrGrp, \
@@ -1293,6 +1303,21 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     }                                                                       \
   }
 
+// For N>5 a single (YTILE, UNRL) is fixed per N rather than walking the sYT
+// ladder used below for N<=5. Register pressure scales with N through
+// sum[N][YTILE], sum4[N][YTILE] and bigA[N][UNRL], so the ladder's YTILE=3/4
+// rungs spill and give back the bandwidth advantage this kernel exists for;
+// pinning one config per N also keeps template instantiation bounded. A's LDS
+// residency is still handled by WVSPLITK_CFG, which drops to the _hf_/_big_
+// variants once Kbp*N no longer fits.
+#define WVSPLIT_TILE_BIGN(__N, _YTILE, _UNRL)      \
+  {                                                \
+    if (on_gfx1x())                                \
+      WVSPLITK_CFG(32, 16, _YTILE, _UNRL, __N)     \
+    else                                           \
+      WVSPLITK_CFG(64, 16, _YTILE, _UNRL, __N)     \
+  }
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK", [&] {
     using fptype = typename scalar<scalar_t>::type;
     fptype* af4 = reinterpret_cast<fptype*>(in_a.data_ptr());
@@ -1322,6 +1347,30 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
         break;
       case 5:
         WVSPLIT_TILE(sYT, 5)
+        break;
+      case 6:
+        WVSPLIT_TILE_BIGN(6, 2, 2)
+        break;
+      case 7:
+        WVSPLIT_TILE_BIGN(7, 2, 2)
+        break;
+      case 8:
+        WVSPLIT_TILE_BIGN(8, 2, 2)
+        break;
+      case 9:
+        WVSPLIT_TILE_BIGN(9, 2, 1)
+        break;
+      case 10:
+        WVSPLIT_TILE_BIGN(10, 2, 1)
+        break;
+      case 11:
+        WVSPLIT_TILE_BIGN(11, 2, 1)
+        break;
+      case 12:
+        WVSPLIT_TILE_BIGN(12, 2, 1)
+        break;
+      case 16:
+        WVSPLIT_TILE_BIGN(16, 2, 1)
         break;
       default:
         throw std::runtime_error(

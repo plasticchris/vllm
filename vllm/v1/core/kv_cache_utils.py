@@ -255,6 +255,59 @@ class KVCacheBlockCopy(NamedTuple):
     dst_block_id: int
 
 
+class KVCacheBlockRoPERotation(NamedTuple):
+    """Leyline-style in-place RoPE delta rotation on a cloned KV cache block."""
+
+    block_id: int
+    delta_pos: int
+    start_offset: int = 0
+    end_offset: int = 0
+
+
+class KVCacheBlockSplice(NamedTuple):
+    """Leyline-style offset-aware fused copy+rotate of a donor KV block range
+    into a target KV block (the single new op from design §2b).
+
+    The donor's already-RoPE'd cached keys for token slots ``[src_start,
+    src_end)`` are copied into the target's slots ``[dst_start, dst_end)``:
+    V is copied verbatim (RoPE never touches values), K is copied with an in
+    place RoPE delta rotation of ``delta_pos`` (R(dst_pos)k == R(delta)R(src_pos)k)
+    applied in the same pass. This is what the whole-block
+    ``copy_kv_cache_blocks_inplace`` cannot express: a non-zero intra-block
+    shift where ``dst_start - src_start == delta_pos`` (A1). The range must be
+    a token-aligned sub-block (both bounds inside [0, block_size)).
+    """
+
+    src_block_id: int
+    dst_block_id: int
+    src_start: int
+    src_end: int
+    dst_start: int
+    dst_end: int
+    delta_pos: int
+
+
+class MambaStateTransplant(NamedTuple):
+    """Leyline hybrid splice (design §2b/§2d): a CoW of the donor's Mamba (GDN)
+    boundary-state block into the target's state slot at the splice point, so
+    the tail-prefill forward continues from the donor's recurrent state.
+
+    ``src_block_id`` is the donor Mamba block holding the boundary state at
+    ``d_cached`` (``d_cached >= target_end``); ``dst_block_id`` is the target
+    Mamba block for the transplant column; ``target_idx`` is the state column
+    (== ``(target_end - 1) // mamba_block_size``) where the boundary state is
+    planted. The worker executes the whole-block state copy AND stages
+    ``_mamba_state_idx_gpu[req] = target_idx`` (align mode) so the phase-3
+    boundary-migration kernel does not clobber the planted state (A6 trap).
+    """
+
+    req_id: str
+    group_id: int
+    src_block_id: int
+    dst_block_id: int
+    target_idx: int
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python

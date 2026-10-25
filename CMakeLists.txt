@@ -1242,6 +1242,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       message(STATUS
         "Building fused KDA chunk for HIP archs: ${FUSED_KDA_CHUNK_HIP_ARCHS}")
     endif()
+    set(FUSED_GDN_DECODE_HIP_SRC
+      "csrc/gdn/fused_gdn_decode_kernel_rocm.cu")
+    list(APPEND VLLM_STABLE_EXT_SRC "${FUSED_GDN_DECODE_HIP_SRC}")
+    message(STATUS
+      "Building fused GDN decode for HIP archs: ${VLLM_GPU_ARCHES}")
   endif()
 
   message(STATUS "Enabling C_stable extension.")
@@ -1299,6 +1304,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(FUSED_KDA_CHUNK_HIP_SRC)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_FUSED_KDA_CHUNK=1)
+    endif()
+    if(FUSED_GDN_DECODE_HIP_SRC)
+      target_compile_definitions(_C_stable_libtorch PRIVATE
+        VLLM_ENABLE_FUSED_GDN_DECODE=1)
     endif()
   endif()
 
@@ -1539,6 +1548,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/skinny_gemms_int4.cu"
+    "csrc/rocm/wmma_w4a16.cu"
     "csrc/rocm/attention_dispatch.cu"
     "csrc/rocm/attention_paged_attn_h64_f16_auto.cu"
     "csrc/rocm/attention_paged_attn_h128_f16_auto.cu"

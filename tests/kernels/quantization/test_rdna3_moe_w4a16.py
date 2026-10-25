@@ -61,6 +61,8 @@ MODEL_CONFIGS = [
     pytest.param(16, 2048, 768, 8, 32, id="Qwen3-30B-A3B"),
     # Qwen3.6-35B-A3B-GPTQ-W4A16-G32 dims (E capped)
     pytest.param(16, 2048, 512, 8, 32, id="Qwen3.6-35B-A3B"),
+    # Qwen3.8-Flash-Next per-rank dimensions (E capped, global top-k=10)
+    pytest.param(16, 2560, 640, 10, 128, id="Qwen3.8-Flash-Next"),
 ]
 
 # Token counts: decode (1), small batch (4), medium (16), prefill (64)
@@ -113,7 +115,7 @@ def _make_ct_weights(E, N, K, group_size, dtype):
 @pytest.mark.parametrize("E, K, N_inter, top_k, group_size", MODEL_CONFIGS)
 @pytest.mark.parametrize("M", NUM_TOKENS)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("block_size_m", [1, 4])
+@pytest.mark.parametrize("block_size_m", [1, 4, 8])
 def test_fused_moe_w1_matches_dense(
     E, K, N_inter, top_k, group_size, M, dtype, block_size_m
 ):
@@ -334,6 +336,44 @@ def test_full_moe_e2e(E, K, N_inter, top_k, group_size, M, dtype):
         f"rel L2 = {rel_l2:.4f} (threshold {threshold}), "
         f"max abs diff: {(fused - ref).abs().max().item()}"
     )
+
+
+@gfx1100_only
+def test_symmetric_implicit_zero_matches_explicit():
+    """Empty zero points select the same symmetric INT4 dequantization."""
+    E, M, K, N, top_k, group_size = 2, 1, 256, 128, 1, 128
+    torch.manual_seed(99)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    weight = _make_packed_weights(E, K, N)
+    scales = _make_scales(E, K // group_size, N, torch.bfloat16)
+    explicit_zeros = _make_qzeros(E, K // group_size, N)
+    topk_ids = torch.zeros((M, top_k), dtype=torch.int32, device=device)
+    sorted_ids, expert_ids, count = moe_align_block_size(topk_ids, 1, E)
+
+    outputs = []
+    for zeros in (
+        explicit_zeros,
+        torch.empty(0, dtype=torch.int32, device=device),
+    ):
+        out = torch.zeros(M, N, dtype=torch.bfloat16, device=device)
+        ops.moe_gptq_gemm_rdna3(
+            x,
+            out,
+            weight,
+            scales,
+            zeros,
+            torch.empty(0, device=device),
+            sorted_ids,
+            expert_ids,
+            count,
+            top_k,
+            1,
+            False,
+            0,
+        )
+        outputs.append(out)
+
+    assert torch.equal(outputs[0], outputs[1])
 
 
 @gfx1100_only

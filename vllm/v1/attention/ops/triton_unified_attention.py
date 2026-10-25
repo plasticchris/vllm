@@ -9,6 +9,7 @@
 
 from typing import Any
 
+import os
 import torch
 
 import vllm.envs as envs
@@ -29,6 +30,14 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     store_segm_reduce_scalars,
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
+
+# Allow the split-KV (3D) decode path for small uniform-Q MTP/spec steps
+# (max_query_len<=N). Default 1 keeps stock behavior (3D only for pure Q=1
+# decode). Set VLLM_TRITON_3D_SPEC_Q=8 to route MTP verify through split-KV
+# instead of the serial 2D scan -> fixes the long-context MTP decode cliff on
+# gfx1100 (TRITON_ATTN backend, e.g. Gemma-4). Bounded by seq_threshold_3D so
+# total query rows still fit the preallocated segment buffers.
+_TRITON_3D_SPEC_Q = int(os.environ.get("VLLM_TRITON_3D_SPEC_Q", "1"))
 
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
@@ -291,6 +300,9 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    lse_ptr=None,
+    lse_stride_head: tl.int64 = 0,
+    OUTPUT_LSE: tl.constexpr = False,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -657,6 +669,12 @@ def kernel_unified_attention(
         )
     else:
         acc = acc / L[:, None]
+        if OUTPUT_LSE:
+            tl.store(
+                lse_ptr + query_offset_1 * lse_stride_head + query_offset_0,
+                M + tl.log(L),
+                mask=query_mask_0 & query_mask_1,
+            )
         if USE_FP8_Q_DESCALE:
             acc *= value_scale
         if USE_FP8:
@@ -873,6 +891,7 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    output_lse=None,  # DCA: per-token LSE for chunk combination
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -968,17 +987,39 @@ def unified_attention(
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
     # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
     # more query rows per block + 8 warps is ~2x faster on B200.
+    _is_family100 = current_platform.is_device_capability_family(100)
+    _is_rocm = current_platform.is_rocm()
     tuned_large_head = (
-        head_size == 256
-        and max_seqlen_q > 1
+        max_seqlen_q > 1
         and num_queries_per_kv <= 16
-        and current_platform.is_device_capability_family(100)
+        and (
+            (_is_family100 and head_size == 256)
+            or (_is_rocm and head_size in (256, 512))
+        )
     )
+    _rocm_tile = 128
     if tuned_large_head:
-        BLOCK_M = 32
-        BLOCK_Q = BLOCK_M // num_queries_per_kv
-        launch_num_warps = 8
-        launch_num_stages = 2
+        if _is_rocm:
+            # gfx1100 (RDNA3): 64 KiB LDS/workgroup in CU mode. BLOCK_M is the
+            # dominant prefill lever: the 2D kernel re-reads all KV per query
+            # block, so KV HBM traffic ~ 1/BLOCK_M, and Gemma-4's head-512
+            # full-attention layers are HBM-bound at depth. BLOCK_M=64 (the
+            # ceiling before the [BLOCK_M, head] fp32 accumulator spills VGPRs)
+            # cuts their KV traffic 4x vs the decode default (BLOCK_M=16).
+            # num_stages=1 keeps the K/V double-buffer within 64 KiB. Swept on
+            # 7900 XTX (Gemma-4-31B prefill): total attention -64% at 24k vs the
+            # decode default; greedy output unchanged.
+            BLOCK_M = 64
+            launch_num_warps = 8
+            launch_num_stages = 1
+            # head 256 fits a 128-wide KV tile at num_stages=1 (64 KiB); head
+            # 512 is 2x the per-slot bytes, so cap its tile at 64 (also 64 KiB).
+            _rocm_tile = 128 if head_size == 256 else 64
+        else:
+            BLOCK_M = 32
+            launch_num_warps = 8
+            launch_num_stages = 2
+        BLOCK_Q = max(1, BLOCK_M // num_queries_per_kv)
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -1011,7 +1052,7 @@ def unified_attention(
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
-        TILE_SIZE_PREFILL = 128
+        TILE_SIZE_PREFILL = _rocm_tile if _is_rocm else 128
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
@@ -1062,7 +1103,7 @@ def unified_attention(
     # Launch the 2D kernel if
     # 1. No split-K threshold or scratch buffers, or the scratch has fewer
     #    rows than query tokens, or
-    # 2. max_seqlen_q > 1 and either it exceeds MAX_3D_QUERY_LEN, masking is
+    # 2. max_seqlen_q > 1 and either it exceeds the spec-query threshold, masking is
     #    non-causal, per-sequence causal, or mm-prefix, or the tuned
     #    large-head path applies, or
     # 3. The number of Q blocks exceeds seq_threshold_3D, or
@@ -1076,19 +1117,21 @@ def unified_attention(
         or (
             max_seqlen_q > 1
             and (
-                max_seqlen_q > MAX_3D_QUERY_LEN
+                max_seqlen_q > _TRITON_3D_SPEC_Q
                 or not use_causal
                 or use_per_seq_causal
                 or use_mm_prefix
                 or tuned_large_head
             )
         )
-        or num_seqs * triton.cdiv(max_seqlen_q, BLOCK_Q) > seq_threshold_3D
+        or q.shape[0] > seq_threshold_3D
         or is_batch_invariant
     )
+    if output_lse is not None:
+        # DCA chunk-combination needs the 2D per-token LSE output.
+        use_3d = False
     if use_3d and softmax_segm_max.shape[0] < q.shape[0]:
         logger.debug_once("Split-K scratch rows < query tokens; using 2D.")
-        use_3d = False
 
     # The kernel signature is the same for 2D and 3D — only the launch
     # grid + a handful of constexpr toggles differ.  Per-token-head scale
@@ -1205,6 +1248,9 @@ def unified_attention(
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
         **launch_kwargs,
+        lse_ptr=(output_lse if output_lse is not None else out),
+        lse_stride_head=(output_lse.stride(0) if output_lse is not None else 0),
+        OUTPUT_LSE=(output_lse is not None),
     )
 
     if use_3d:

@@ -65,6 +65,8 @@ def create_scheduler(
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
     long_prefill_token_threshold_adaptive: bool = False,
+    decode_active_long_prefill_token_threshold: int | None = None,
+    decode_active_prefill_token_budget: int | None = None,
     disable_chunked_mm_input: bool = False,
     mm_encoder_only: bool = False,
     use_kv_connector: None | bool | str | MockKVConfig = None,
@@ -133,6 +135,10 @@ def create_scheduler(
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
         long_prefill_token_threshold_adaptive=(long_prefill_token_threshold_adaptive),
+        decode_active_long_prefill_token_threshold=(
+            decode_active_long_prefill_token_threshold
+        ),
+        decode_active_prefill_token_budget=decode_active_prefill_token_budget,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,

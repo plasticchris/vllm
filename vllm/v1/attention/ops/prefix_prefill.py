@@ -985,10 +985,45 @@ def context_attention_fwd(
         extra_kargs = {}
 
     real_block_size = v_cache.shape[3]
-    # _paged_kv_cache_offsets resolves context tokens against PHYSICAL_BLOCK_SIZE
-    # individually, so tiles need not divide the page size.
-    BLOCK_M = 128
-    BLOCK_N = 64
+    is_pow2 = real_block_size > 0 and (real_block_size & (real_block_size - 1) == 0)
+    is_gfx1100 = False
+    if current_platform.is_rocm() and not is_pow2:
+        from vllm.platforms.rocm import on_gfx1100
+
+        is_gfx1100 = on_gfx1100()
+    use_wide_gfx1100_tile = is_gfx1100 and Lk_padded == 256
+
+    # For standard models involving powers of 2,
+    # follow the original logic (Llama 128/64)
+    if is_pow2:
+        BLOCK_M = 128
+        BLOCK_N = 64
+        fwd_num_warps = 4
+    else:
+        # Non-pow2 paged block (hybrid Mamba/attn block_size 816, Qwen3-next 544):
+        # only the *context* tile (TRITON_BLOCK_SIZE below, 32) needs the per-token
+        # paged addressing. BLOCK_M (query rows) and BLOCK_N (new-token keys) are
+        # independent of the cache block layout and flash-attention is invariant to
+        # this tiling, so the old 32/32 only wasted work: grid = cdiv(query_len,
+        # BLOCK_M), so BLOCK_M=32 re-read the whole cached context ~4x more than the
+        # pow2 path. Raise the query tile to the pow2 path's footprint
+        # (BLOCK_M*BLOCK_DMODEL_PADDED ~= 128*128 -> BLOCK_M 64 at head_size 256) and
+        # At head size 256, gfx1100 can double cache reuse with 128 rows over
+        # 16 warps while preserving the prior per-thread footprint.
+        BLOCK_M = (
+            128
+            if use_wide_gfx1100_tile
+            else min(128, max(32, 16384 // Lk_padded))
+        )
+        BLOCK_N = 64
+        fwd_num_warps = 16 if use_wide_gfx1100_tile else 8
+
+    # Larger workgroups and lower unrolling reduce gfx1100 scratch spills.
+    cache_unroll = 1 if is_gfx1100 and not is_pow2 else 4
+
+    # TRITON_BLOCK_SIZE is kept at 32 to ensure
+    # correct alignment logic when the kernel handles
+    # non-standard sizes (such as 544).
     TRITON_BLOCK_SIZE = 32
 
     grid_fn = lambda META: (batch, head, triton.cdiv(max_input_len, META["BLOCK_M"]))
@@ -1042,9 +1077,9 @@ def context_attention_fwd(
         USE_FP8=fp8_out_scale is not None,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_unroll_cache=4,
+        num_unroll_cache=cache_unroll,
         num_unroll_request=1,
-        num_warps=4,
+        num_warps=fwd_num_warps,
         num_stages=1,
         USE_SINKS=sinks is not None,
         INTERLEAVED_V_PACK_FACTOR=interleaved_v_pack_factor,

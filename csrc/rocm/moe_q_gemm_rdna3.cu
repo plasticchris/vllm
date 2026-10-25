@@ -157,7 +157,9 @@ __global__ void moe_gemm_q4_kernel_rdna3(
       b_q_weight + (int64_t)expert_id * expert_weight_stride;
   const T* expert_scales = b_scales + (int64_t)expert_id * expert_scales_stride;
   const uint32_t* expert_qzeros =
-      b_qzeros + (int64_t)expert_id * expert_zeros_stride;
+      b_qzeros == nullptr
+          ? nullptr
+          : b_qzeros + (int64_t)expert_id * expert_zeros_stride;
 
   // LDS for activations
   constexpr int LDS_PAD = 8;
@@ -212,11 +214,16 @@ __global__ void moe_gemm_q4_kernel_rdna3(
   constexpr int zero_offset = 1;
 
   auto refresh_group = [&](int g) {
-    const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
     const T* sc_row = expert_scales + g * size_n;
     int zeros[4];
     T scales[4];
-    load4_zeros(qz_row, n, zeros);
+    if (expert_qzeros == nullptr) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) zeros[i] = 7;
+    } else {
+      const uint32_t* qz_row = expert_qzeros + g * (size_n / 8);
+      load4_zeros(qz_row, n, zeros);
+    }
     load4_scales<T>(sc_row, n, scales);
     if constexpr (std::is_same<T, half>::value) {
   #pragma unroll
@@ -591,7 +598,9 @@ void moe_gptq_gemm_rdna3(torch::Tensor a, torch::Tensor c,
   TORCH_CHECK(c.dim() == 2, "c must be 2D");
   TORCH_CHECK(b_q_weight.dim() == 3, "b_q_weight must be 3D [E, K/8, N]");
   TORCH_CHECK(b_scales.dim() == 3, "b_scales must be 3D [E, groups, N]");
-  TORCH_CHECK(b_qzeros.dim() == 3, "b_qzeros must be 3D [E, groups, N/8]");
+  TORCH_CHECK(
+      b_qzeros.numel() == 0 || b_qzeros.dim() == 3,
+      "b_qzeros must be empty for symmetric INT4 or 3D [E, groups, N/8]");
   TORCH_CHECK(
       a.scalar_type() == torch::kHalf || a.scalar_type() == torch::kBFloat16,
       "a must be half or bfloat16");
@@ -613,7 +622,9 @@ void moe_gptq_gemm_rdna3(torch::Tensor a, torch::Tensor c,
   // Per-expert strides
   int expert_weight_stride = (int)(b_q_weight.size(1) * b_q_weight.size(2));
   int expert_scales_stride = (int)(b_scales.size(1) * b_scales.size(2));
-  int expert_zeros_stride = (int)(b_qzeros.size(1) * b_qzeros.size(2));
+  int expert_zeros_stride = b_qzeros.numel() == 0
+                                ? 0
+                                : (int)(b_qzeros.size(1) * b_qzeros.size(2));
 
   int num_token_blocks = (int)(sorted_token_ids.size(0) / block_size_m);
 
@@ -628,7 +639,10 @@ void moe_gptq_gemm_rdna3(torch::Tensor a, torch::Tensor c,
     using T = std::remove_const_t<std::remove_pointer_t<decltype(a_ptr)>>;
     vllm::moe_gptq_rdna3::dispatch_moe_gemm_q4<T>(
         a_ptr, c_ptr, (const uint32_t*)b_q_weight.data_ptr<int32_t>(), s_ptr,
-        (const uint32_t*)b_qzeros.data_ptr<int32_t>(), topk_w_ptr,
+        b_qzeros.numel() == 0
+            ? nullptr
+            : (const uint32_t*)b_qzeros.data_ptr<int32_t>(),
+        topk_w_ptr,
         sorted_token_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
         num_tokens_post_padded.data_ptr<int32_t>(), num_token_blocks, size_m,
         size_n, size_k, groups, (int)top_k, (int)block_size_m,

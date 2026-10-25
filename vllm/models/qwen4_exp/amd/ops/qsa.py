@@ -10,10 +10,44 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx1100
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.ops.triton_unified_attention import _cast_kv_tile
 
+# Bound the per-layer score matrix; long prefills are tiled below without
+# changing selected indices. Production reserves another 95.4 MiB/GPU by
+# lowering its KV-cache budget before restoring this larger tile.
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+# The gfx1100 torch top-k runs beside a full logits tile, so its temporaries
+# must fit the same small VRAM reserve as the native kernel's workspace.
+_TORCH_TOPK_SLICE_BYTES = 8 * 1024 * 1024
+
+
+def _torch_top_k_per_row_decode(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    indices: torch.Tensor,
+    topk: int,
+) -> None:
+    """Stable gfx1100 replacement for the native ragged-row top-k.
+
+    Masks ``logits`` in place.
+    """
+    num_rows, width = logits.shape
+    k = min(topk, width)
+    columns = torch.arange(width, device=logits.device)
+    ranks = torch.arange(k, device=logits.device)
+    rows_per_slice = max(1, _TORCH_TOPK_SLICE_BYTES // max(width, 1))
+    indices[:num_rows].fill_(-1)
+    for start in range(0, num_rows, rows_per_slice):
+        end = min(start + rows_per_slice, num_rows)
+        row_ends = visible_blocks[start:end].to(torch.int64).clamp_(min=0, max=width)
+        rows = logits[start:end]
+        rows.masked_fill_(columns >= row_ends.unsqueeze(1), float("-inf"))
+        selected = rows.topk(k, dim=-1, sorted=True).indices
+        selected.masked_fill_(ranks >= row_ends.clamp(max=k).unsqueeze(1), -1)
+        indices[start:end, :k].copy_(selected)
 
 
 @triton.jit
@@ -189,6 +223,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -220,6 +256,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_QUANT_MODE: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -292,6 +329,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        keys = _cast_kv_tile(keys, query, k_scale_ptr, KV_QUANT_MODE)
+        values = _cast_kv_tile(values, query, v_scale_ptr, KV_QUANT_MODE)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -734,6 +773,7 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
     rows = q.shape[0]
@@ -745,8 +785,16 @@ def qsa_select_paged_tokens(
     if not rows:
         return out
 
-    columns = page_table.shape[1] * k_cache.shape[1]
     block_topk = token_topk // compress_ratio
+    capacity = page_table.shape[1] * k_cache.shape[1]
+    columns = capacity
+    if max_seq_len is not None:
+        # Score only columns reachable by this batch. Keep enough columns for
+        # fixed-width top-k output and align the scoring tile without reading
+        # beyond the physical page-table capacity.
+        live_columns = triton.cdiv(max_seq_len, compress_ratio)
+        live_columns = max(block_topk, triton.cdiv(live_columns, 32) * 32)
+        columns = min(capacity, live_columns)
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
@@ -766,6 +814,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
             compress_ratio,
+            num_columns=columns,
         )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
@@ -775,7 +824,14 @@ def qsa_select_paged_tokens(
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
-        if use_cooperative_topk:
+        if on_gfx1100():
+            _torch_top_k_per_row_decode(
+                logits,
+                visible_blocks,
+                blocks,
+                block_topk,
+            )
+        elif use_cooperative_topk:
             torch.ops._C.cooperative_topk(
                 logits,
                 visible_blocks,
@@ -824,8 +880,11 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 or FP8-E4M3 K/V caches."""
+
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -842,7 +901,18 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
+    assert q.dtype == torch.bfloat16
+    assert k_cache.dtype == v_cache.dtype
+    use_fp8 = k_cache.dtype == torch.float8_e4m3fn
+    if k_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("QSA K/V cache must be BF16 or FP8-E4M3")
+    if use_fp8:
+        if k_scale is None or v_scale is None:
+            raise ValueError("QSA FP8 K/V cache requires K and V scales")
+        if k_scale.numel() != 1 or v_scale.numel() != 1:
+            raise ValueError("QSA FP8 K/V cache expects scalar per-layer scales")
+        if k_scale.device != q.device or v_scale.device != q.device:
+            raise ValueError("QSA FP8 K/V scales must live on the query device")
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -877,8 +947,12 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
-    # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
-    # stage keeps the wide TP4 tile within that shared-memory budget.
+    # FP8 dequantization materializes K/V tiles at query precision. Keep the
+    # wide profile within RDNA/CDNA LDS by halving it; decode already uses 16.
+    if use_fp8:
+        block_n = max(16, block_n // 2)
+    # gfx942/gfx950 and RDNA3 have tight LDS limits. One software-pipelining
+    # stage keeps the wide tile within the shared-memory budget.
     partial_stages = 1 if current_platform.is_rocm() else 2
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
@@ -903,10 +977,16 @@ def qsa_sparse_paged_attention(
         )
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+    # Triton requires valid pointer arguments even when the BF16 compile-time
+    # branch removes all scale loads.
+    k_scale_arg = k_scale if use_fp8 else q
+    v_scale_arg = v_scale if use_fp8 else q
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
         k_cache,
         v_cache,
+        k_scale_arg,
+        v_scale_arg,
         logical_indices,
         block_table,
         token_to_req,
@@ -938,6 +1018,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_QUANT_MODE=1 if use_fp8 else 0,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )

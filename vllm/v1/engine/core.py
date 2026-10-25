@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import math
 import os
 import queue
 import signal
+import statistics
 import threading
 import time
 from collections import defaultdict, deque
@@ -132,6 +134,122 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        scheduler_config = vllm_config.scheduler_config
+        self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
+        self.prefill_schedule_high_load_interval = (
+            scheduler_config.prefill_schedule_high_load_interval
+        )
+        self.prefill_schedule_high_load_threshold = (
+            scheduler_config.prefill_schedule_high_load_threshold
+        )
+        self.prefill_schedule_high_load_decode_tokens = (
+            scheduler_config.prefill_schedule_high_load_decode_tokens
+        )
+        self.prefill_schedule_high_load_decode_lead_seconds = (
+            scheduler_config.prefill_schedule_high_load_decode_lead_seconds
+        )
+        self.decode_active_prefill_token_budget = (
+            scheduler_config.decode_active_prefill_token_budget
+        )
+        self.decode_active_prefill_high_load_token_budget = (
+            scheduler_config.decode_active_prefill_high_load_token_budget
+        )
+        self.prefill_schedule_adaptive_target_ms = (
+            scheduler_config.prefill_schedule_adaptive_target_ms
+        )
+        self.prefill_schedule_adaptive_update_interval = (
+            scheduler_config.prefill_schedule_adaptive_update_interval
+        )
+        self.prefill_schedule_adaptive_max_interval = (
+            scheduler_config.prefill_schedule_adaptive_max_interval
+        )
+        self.prefill_schedule_adaptive_min_token_budget = (
+            scheduler_config.prefill_schedule_adaptive_min_token_budget
+        )
+        self.prefill_schedule_adaptive_max_wait_seconds = (
+            scheduler_config.prefill_schedule_adaptive_max_wait_seconds
+        )
+        self.prefill_schedule_adaptive_reset_seconds = (
+            scheduler_config.prefill_schedule_adaptive_reset_seconds
+        )
+        self.prefill_schedule_mode = scheduler_config.prefill_schedule_mode
+        self.prefill_schedule_eb_age_seconds = (
+            scheduler_config.prefill_schedule_eb_age_seconds
+        )
+        self.prefill_schedule_eb_idle_subblock = (
+            scheduler_config.prefill_schedule_eb_idle_subblock
+        )
+        # The eb idle-window sub-block keys off the per-rank overlap flag,
+        # which is NOT rank-aligned on the DP proc (MoE-only path); keep it
+        # inert there, matching that proc's rank-aligned throttle override.
+        self._eb_idle_subblock_enabled = self.prefill_schedule_mode == "eb"
+        self._adaptive_prefill_interval = self.prefill_schedule_interval
+        # Normal-overlap ceiling is the decode-active budget (e.g. 3072);
+        # the high-load budget (e.g. 816) is the FLOOR under high load, not
+        # the ceiling — using it as the ceiling pinned prefill at 816 tok
+        # per step even when the controller had no pressure to shrink
+        # (2026-10-18 concurrency fix). Cold-start the interval at the BASE
+        # cadence, not the high-load one: starting at 128 with the 3072
+        # budget makes ~9s prefill steps (2026-10-18 second-order bug;
+        # decodes froze 9s each).
+        self._adaptive_prefill_max_budget = (
+            self.decode_active_prefill_token_budget
+            or self.decode_active_prefill_high_load_token_budget
+        )
+        self._adaptive_prefill_budget = self._adaptive_prefill_max_budget
+        self._adaptive_min_prefill_step_ms: float | None = None
+        self._adaptive_prefill_step_by_budget = {}
+        self._adaptive_prefill_latencies = deque(
+            maxlen=scheduler_config.prefill_schedule_adaptive_window
+        )
+        self._adaptive_decode_latencies = deque(
+            maxlen=scheduler_config.prefill_schedule_adaptive_window
+        )
+        self._prefill_ms_per_token_samples = deque(maxlen=128)
+        self._adaptive_high_load_latencies = deque(
+            maxlen=scheduler_config.prefill_schedule_adaptive_window
+        )
+        self._adaptive_prefill_observations = 0
+        self._adaptive_prefill_healthy_windows = 0
+        self._adaptive_prefill_p99_ms: float | None = None
+        self._adaptive_decode_p99_ms: float | None = None
+        self._adaptive_decode_gap_p99_ms: float | None = None
+        self._adaptive_prefill_penalty_p99_ms: float | None = None
+        # Drain penalty (async-scheduling blind spot, 2026-10-19): the decode
+        # step IMMEDIATELY FOLLOWING a prefill step carries the prefill's GPU
+        # cost that async scheduling deferred off-step. This -- not the prefill
+        # step's own wall -- is what stalls concurrent decodes, and it is the
+        # control signal the sub-block/interval controller should actually use.
+        self._adaptive_drain_latencies: deque[float] = deque(
+            maxlen=scheduler_config.prefill_schedule_adaptive_window
+        )
+        self._adaptive_drain_p99_ms: float | None = None
+        self._adaptive_drain_penalty_p99_ms: float | None = None
+        self._last_step_had_prefill = False
+        self._last_step_is_drain = False
+        self._adaptive_control_p99_ms: float | None = None
+        self._adaptive_oldest_prefill_wait_seconds = 0.0
+        # EB(0) telemetry: prefills the throttle is holding back. None until
+        # an eb step records a value (overlap mode / DP override never set it).
+        self._adaptive_deferred_prefill_count: int | None = None
+        # EB(0) force-serve progress guarantee (P5-1): the aged prefill id
+        # that an eb force-serve step must schedule THIS step. Consumed by
+        # scheduler.schedule() on the very next call; cleared after (None
+        # until the next force-serve). None on the overlap path / DP override.
+        self._eb_forced_prefill_id: str | None = None
+        self._adaptive_aging_interval: int | None = None
+        self._adaptive_aging_token_budget: int | None = None
+        self._adaptive_high_load = False
+        self._adaptive_control_tier: str | None = None
+        self._adaptive_cold_start = True
+        self._adaptive_reset_count = 0
+        self._adaptive_quiet_since: float | None = None
+        self._last_prefill_service_time = time.monotonic()
+        self._last_mamba_prefill_subblock_tokens: int | None = None
+        self.mamba_prefill_subblock_tokens = (
+            scheduler_config.mamba_prefill_subblock_tokens
+        )
+        self._prefill_schedule_step = 0
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -184,6 +302,32 @@ class EngineCore:
             hash_block_size=hash_block_size,
         )
         self._initialize_effective_attention_block_size()
+        # Keep the engine's base in step with the scheduler's: the scheduler
+        # clamps a launcher-tuned mamba prefill subblock that stopped dividing
+        # the cache block (the block shifts with the speculative depth), and
+        # the adaptive tiers (base/2, base*2) are derived from this base.
+        if (
+            self.mamba_prefill_subblock_tokens is not None
+            and scheduler_block_size % self.mamba_prefill_subblock_tokens != 0
+        ):
+            from vllm.v1.core.sched.scheduler import clamp_mamba_subblock_to_block
+
+            self.mamba_prefill_subblock_tokens = clamp_mamba_subblock_to_block(
+                scheduler_block_size, self.mamba_prefill_subblock_tokens
+            )
+        # The eb idle sub-block must satisfy the same invariant as the base:
+        # divide the cache block (it shifts with the speculative depth), or
+        # schedule() would reject it mid-run.
+        if (
+            self.prefill_schedule_mode == "eb"
+            and self.mamba_prefill_subblock_tokens is not None
+            and scheduler_block_size % self.prefill_schedule_eb_idle_subblock != 0
+        ):
+            from vllm.v1.core.sched.scheduler import clamp_mamba_subblock_to_block
+
+            self.prefill_schedule_eb_idle_subblock = clamp_mamba_subblock_to_block(
+                scheduler_block_size, self.prefill_schedule_eb_idle_subblock
+            )
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -644,15 +788,664 @@ class EngineCore:
         else:
             eco.scheduler_stats.iteration_details = iteration_details
 
+    def _attach_kv_cache_stats(
+        self, outputs: dict[int, EngineCoreOutputs]
+    ) -> None:
+        (
+            immediate_blocks,
+            evictable_blocks,
+            pinned_blocks,
+            total_blocks,
+        ) = self.scheduler.get_kv_cache_block_counts()
+        (
+            immediate_tokens,
+            evictable_tokens,
+            pinned_tokens,
+            total_tokens,
+        ) = self.scheduler.get_kv_cache_token_counts()
+        request_kv_tokens = self.scheduler.get_request_kv_token_counts()
+        spec_profitability = self.scheduler.get_spec_profitability_stats()
+        if not outputs:
+            outputs[0] = EngineCoreOutputs()
+        free_blocks = immediate_blocks + evictable_blocks
+        usage = pinned_blocks / total_blocks if total_blocks else 0.0
+        for output in outputs.values():
+            output.kv_cache_usage = usage
+            output.kv_cache_free_blocks = free_blocks
+            output.kv_cache_immediate_free_blocks = immediate_blocks
+            output.kv_cache_evictable_blocks = evictable_blocks
+            output.kv_cache_pinned_blocks = pinned_blocks
+            output.kv_cache_total_blocks = total_blocks
+            output.kv_cache_immediate_free_tokens = immediate_tokens
+            output.kv_cache_evictable_tokens = evictable_tokens
+            output.kv_cache_pinned_tokens = pinned_tokens
+            output.kv_cache_total_tokens = total_tokens
+            output.request_kv_tokens = request_kv_tokens
+            output.step_prefill_tokens = getattr(
+                self, "_last_step_prefill_tokens", 0
+            )
+            output.step_scheduled_tokens = getattr(
+                self, "_last_step_scheduled_tokens", 0
+            )
+            output.prefill_control_interval = getattr(
+                self, "_adaptive_prefill_interval", None
+            )
+            output.prefill_control_token_budget = getattr(
+                self, "_adaptive_prefill_budget", None
+            )
+            output.prefill_control_p99_ms = getattr(
+                self, "_adaptive_prefill_p99_ms", None
+            )
+            output.prefill_control_decode_p99_ms = getattr(
+                self, "_adaptive_decode_p99_ms", None
+            )
+            output.prefill_control_penalty_p99_ms = getattr(
+                self, "_adaptive_prefill_penalty_p99_ms", None
+            )
+            output.prefill_control_drain_p99_ms = getattr(
+                self, "_adaptive_drain_p99_ms", None
+            )
+            output.prefill_control_drain_penalty_p99_ms = getattr(
+                self, "_adaptive_drain_penalty_p99_ms", None
+            )
+            output.prefill_control_slo_p99_ms = getattr(
+                self, "_adaptive_control_p99_ms", None
+            )
+            output.prefill_control_oldest_wait_seconds = getattr(
+                self, "_adaptive_oldest_prefill_wait_seconds", None
+            )
+            output.prefill_control_deferred_count = getattr(
+                self, "_adaptive_deferred_prefill_count", None
+            )
+            output.prefill_control_aging_interval = getattr(
+                self, "_adaptive_aging_interval", None
+            )
+            output.prefill_control_aging_token_budget = getattr(
+                self, "_adaptive_aging_token_budget", None
+            )
+            output.prefill_control_high_load = getattr(
+                self, "_adaptive_high_load", None
+            )
+            output.prefill_control_cold_start = getattr(
+                self, "_adaptive_cold_start", None
+            )
+            output.prefill_control_observations = getattr(
+                self, "_adaptive_prefill_observations", None
+            )
+            output.prefill_control_reset_count = getattr(
+                self, "_adaptive_reset_count", None
+            )
+            quiet_since = getattr(self, "_adaptive_quiet_since", None)
+            output.prefill_control_quiet_seconds = (
+                max(time.monotonic() - quiet_since, 0.0)
+                if quiet_since is not None
+                else None
+            )
+            output.prefill_control_tier = getattr(
+                self, "_adaptive_control_tier", None
+            )
+            output.mamba_prefill_subblock_tokens = getattr(
+                self, "_last_mamba_prefill_subblock_tokens", None
+            )
+            prefill_costs = getattr(self, "_prefill_ms_per_token_samples", ())
+            output.prefill_control_prefill_ms_per_token = (
+                statistics.median(prefill_costs) if prefill_costs else None
+            )
+            output.prefill_control_decode_gap_p99_ms = getattr(
+                self, "_adaptive_decode_gap_p99_ms", None
+            )
+            output.spec_profitability = spec_profitability
+
+    def _prefill_load_is_high(self) -> bool:
+        high_load_interval = getattr(
+            self, "prefill_schedule_high_load_interval", None
+        )
+        high_load_budget = getattr(
+            self, "decode_active_prefill_high_load_token_budget", None
+        )
+        if high_load_interval is None and high_load_budget is None:
+            return False
+        threshold = getattr(self, "prefill_schedule_high_load_threshold", None)
+        if threshold is None:
+            return False
+        running, waiting = self.scheduler.get_request_counts()
+        if running + waiting < threshold:
+            return False
+        minimum_decode_tokens = getattr(
+            self, "prefill_schedule_high_load_decode_tokens", 0
+        )
+        if self.scheduler.get_max_decode_tokens() < minimum_decode_tokens:
+            return False
+        minimum_lead = getattr(
+            self, "prefill_schedule_high_load_decode_lead_seconds", 0.0
+        )
+        return self.scheduler.get_decode_prefill_arrival_gap() >= minimum_lead
+
+    def _current_prefill_token_budget(
+        self, high_load: bool | None = None, overlap: bool | None = None
+    ) -> int | None:
+        # P5-3 (2026-10-21): the adaptive/high-load budget controller is
+        # OVERLAP mode's — the launcher contract is "in eb mode
+        # cadence/budget control is out of scope; aging is the only
+        # cadence". Without this gate an adaptive pin of
+        # _adaptive_prefill_budget below one mamba block (era D 18:13:43:
+        # 408 < 800) reaches schedule() in eb mode too: the first
+        # block-aligned prefill split (subblock_tokens=None) floors the
+        # capped chunk at the current block boundary and returns 0, so a
+        # force-serve step schedules ZERO prefill tokens and the oldest
+        # deferred prefill ages unbounded until an idle window opens
+        # (44 live first-serve waits of 21-190 s). eb mode always uses
+        # the configured decode-active budget. (The DP proc is
+        # eb-inert: its rank-aligned throttle override never runs the eb
+        # branch (P1-2), and _eb_idle_subblock_enabled — forced False on
+        # DPEngineCoreProc — keeps the budget overlap-behaved there too,
+        # matching the P1-3 sub-block gate. The overlap path below is
+        # byte-identical.)
+        if (
+            getattr(self, "prefill_schedule_mode", "overlap") == "eb"
+            and getattr(self, "_eb_idle_subblock_enabled", True)
+        ):
+            return getattr(self, "decode_active_prefill_token_budget", None)
+        if high_load is None:
+            high_load = self._prefill_load_is_high()
+        if overlap is None:
+            overlap = high_load
+        if (
+            overlap
+            and getattr(self, "prefill_schedule_adaptive_target_ms", None)
+            is not None
+        ):
+            adaptive_budget = getattr(self, "_adaptive_prefill_budget", None)
+            aging_budget = getattr(self, "_adaptive_aging_token_budget", None)
+            if aging_budget is not None:
+                budget = max(adaptive_budget or 0, aging_budget)
+            elif adaptive_budget is not None:
+                budget = adaptive_budget
+            else:
+                budget = None
+            if high_load and budget is not None:
+                high_load_budget = getattr(
+                    self, "decode_active_prefill_high_load_token_budget", None
+                )
+                if high_load_budget is not None:
+                    budget = min(budget, high_load_budget)
+            if budget is not None:
+                return budget
+        if high_load:
+            high_load_budget = getattr(
+                self, "decode_active_prefill_high_load_token_budget", None
+            )
+            if high_load_budget is not None:
+                return high_load_budget
+        return getattr(self, "decode_active_prefill_token_budget", None)
+
+    @staticmethod
+    def _latency_p99(values: deque[float]) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        return ordered[math.ceil(len(ordered) * 0.99) - 1]
+
+    def _observe_prefill_control(self, scheduler_output: SchedulerOutput) -> None:
+        elapsed_ms = (time.monotonic() - scheduler_output.scheduled_timestamp) * 1000
+        scheduler_output.model_step_elapsed_ms = elapsed_ms
+        # Drain penalty (async-scheduling blind spot, 2026-10-19): a decode
+        # step that immediately follows a prefill step absorbs the prefill's
+        # GPU cost that async scheduling deferred off-step. Measure it
+        # unconditionally (it is the raw observation; the control decision
+        # below is what consumes it) and update the per-step prefill flag
+        # after we've read the previous value.
+        step_had_prefill = scheduler_output.scheduled_prefill_tokens > 0
+        # This decode step is a "drain" step iff the previous step had prefill
+        # (under async scheduling that prefill's GPU cost lands here). Capture
+        # it in its own deque AND keep it OUT of the clean decode baseline,
+        # otherwise the baseline is inflated by the drains and every penalty
+        # nets to ~0 -- which is exactly the blind spot that let the old
+        # controller conclude prefill was harmless and relax the sub-block.
+        is_drain = (
+            not step_had_prefill and getattr(self, "_last_step_had_prefill", False)
+        )
+        self._last_step_is_drain = is_drain
+        drain_deque = getattr(self, "_adaptive_drain_latencies", None)
+        if (
+            drain_deque is not None
+            and scheduler_output.scheduled_timestamp > 0
+            and is_drain
+        ):
+            drain_deque.append(elapsed_ms)
+            self._adaptive_drain_p99_ms = EngineCore._latency_p99(drain_deque)
+        self._last_step_had_prefill = step_had_prefill
+        target = getattr(self, "prefill_schedule_adaptive_target_ms", None)
+        if (
+            target is None
+            or not getattr(
+                scheduler_output,
+                "prefill_decode_overlap",
+                scheduler_output.high_prefill_load,
+            )
+            or scheduler_output.scheduled_timestamp <= 0
+        ):
+            return
+
+        self._adaptive_high_load_latencies.append(elapsed_ms)
+        model_step_p99 = EngineCore._latency_p99(
+            self._adaptive_high_load_latencies
+        )
+        scheduler = getattr(self, "scheduler", None)
+        get_decode_gap = getattr(scheduler, "get_decode_gap_p99_ms", None)
+        decode_gap_p99 = get_decode_gap() if get_decode_gap is not None else None
+        self._adaptive_decode_gap_p99_ms = decode_gap_p99
+        if scheduler_output.scheduled_prefill_tokens <= 0:
+            # Only CLEAN decode steps (not right after a prefill) form the
+            # baseline; drain steps are tracked separately above.
+            if not getattr(self, "_last_step_is_drain", False):
+                self._adaptive_decode_latencies.append(elapsed_ms)
+            if len(self._adaptive_decode_latencies) >= 4:
+                self._adaptive_decode_p99_ms = EngineCore._latency_p99(
+                    self._adaptive_decode_latencies
+                )
+            return
+
+        self._last_prefill_service_time = time.monotonic()
+        prefill_costs = getattr(self, "_prefill_ms_per_token_samples", None)
+        if prefill_costs is not None:
+            prefill_costs.append(
+                elapsed_ms / scheduler_output.scheduled_prefill_tokens
+            )
+        # Track the cheapest step per budget level for the target floor.
+        scheduled_tokens = getattr(
+            scheduler_output, "scheduled_prefill_tokens", 0
+        )
+        step_by_budget = getattr(self, "_adaptive_prefill_step_by_budget", None)
+        if step_by_budget is None:
+            step_by_budget = self._adaptive_prefill_step_by_budget = {}
+        previous = step_by_budget.get(scheduled_tokens)
+        if previous is None or elapsed_ms < previous:
+            step_by_budget[scheduled_tokens] = elapsed_ms
+        if len(step_by_budget) > 32:
+            for key in sorted(step_by_budget)[:-32]:
+                del step_by_budget[key]
+        min_step = min(step_by_budget.values()) if step_by_budget else None
+        self._adaptive_min_prefill_step_ms = min_step
+        self._adaptive_prefill_latencies.append(elapsed_ms)
+        self._adaptive_prefill_observations += 1
+        self._adaptive_prefill_p99_ms = EngineCore._latency_p99(
+            self._adaptive_prefill_latencies
+        )
+        baseline = self._adaptive_decode_p99_ms
+        prefill_p99 = self._adaptive_prefill_p99_ms
+        self._adaptive_prefill_penalty_p99_ms = (
+            max(prefill_p99 - baseline, 0.0)
+            if baseline is not None and prefill_p99 is not None
+            else None
+        )
+        # Drain penalty (async-scheduling blind spot, 2026-10-19): the extra
+        # latency the decode step right after a prefill absorbs, over the
+        # decode-only baseline. Under async scheduling this -- not the
+        # prefill step's own wall -- is what stalls concurrent decodes, so it
+        # must enter the control signal. It is 0 when prefill adds nothing.
+        drain_p99 = getattr(self, "_adaptive_drain_p99_ms", None)
+        self._adaptive_drain_penalty_p99_ms = (
+            max(drain_p99 - baseline, 0.0)
+            if baseline is not None and drain_p99 is not None
+            else None
+        )
+        # Control signal (set AFTER the penalty override, 2026-10-18): the
+        # prefill penalty, falling back to the decode gap / model step only
+        # when no baseline exists yet. The old code assigned the absolute
+        # decode gap here, so the penalty override below never reached the
+        # decision. Take the WORST of the prefill-step penalty and the
+        # decode-drain penalty: both are real, and the drain is the one the
+        # prefill-step wall undercounts under async scheduling.
+        penalties = [
+            p
+            for p in (
+                self._adaptive_prefill_penalty_p99_ms,
+                self._adaptive_drain_penalty_p99_ms,
+            )
+            if p is not None
+        ]
+        self._adaptive_control_p99_ms = (
+            max(penalties) if penalties else (decode_gap_p99 or model_step_p99)
+        )
+        cold_start = getattr(self, "_adaptive_cold_start", False)
+        if (
+            (not cold_start and len(self._adaptive_high_load_latencies) < 16)
+            or self._adaptive_prefill_observations
+            % self.prefill_schedule_adaptive_update_interval
+            != 0
+        ):
+            return
+
+        control_p99 = self._adaptive_control_p99_ms
+        assert control_p99 is not None
+        # Prefer the prefill penalty (extra step latency prefill adds over
+        # the decode-only baseline). The absolute decode gap cannot drop
+        # below the batch's natural decode-step time at >=2-3 concurrent
+        # decodes (MTP verify + TP all-reduce), so targeting it pinned the
+        # controller at max throttle under ordinary multi-session load
+        # (2026-10-18). The penalty is 0 when prefill adds nothing.
+        penalty = getattr(self, "_adaptive_prefill_penalty_p99_ms", None)
+        if penalty is not None:
+            control_p99 = penalty
+        # The target is unreachable when even the SMALLEST prefill step
+        # (min token budget) exceeds it: the controller would grind the
+        # budget to the floor and stop there instead of settling. Floor the
+        # target at the observed min-step cost so the floor state is the
+        # steady state (2026-10-18 second-order fix).
+        min_step_ms = getattr(self, "_adaptive_min_prefill_step_ms", None)
+        if min_step_ms is not None:
+            target = max(target, min_step_ms * 1.2)
+        self._adaptive_cold_start = False
+        if control_p99 > target:
+            self._adaptive_prefill_healthy_windows = 0
+            self._adaptive_prefill_interval = min(
+                self.prefill_schedule_adaptive_max_interval,
+                max(
+                    self._adaptive_prefill_interval + 1,
+                    math.ceil(self._adaptive_prefill_interval * 1.5),
+                ),
+            )
+            minimum_budget = self.prefill_schedule_adaptive_min_token_budget
+            if minimum_budget is not None and self._adaptive_prefill_budget is not None:
+                halved = self._adaptive_prefill_budget // 2
+                aligned = (halved // minimum_budget) * minimum_budget
+                self._adaptive_prefill_budget = max(minimum_budget, aligned)
+        elif control_p99 < target * 0.7:
+            self._adaptive_prefill_healthy_windows += 1
+            if self._adaptive_prefill_healthy_windows >= 3:
+                base_interval = (
+                    self.prefill_schedule_high_load_interval
+                    if getattr(self, "_adaptive_control_tier", None) == "high"
+                    and self.prefill_schedule_high_load_interval
+                    else self.prefill_schedule_interval
+                )
+                self._adaptive_prefill_interval = max(
+                    base_interval, math.floor(self._adaptive_prefill_interval * 0.8)
+                )
+                if (
+                    self.prefill_schedule_adaptive_min_token_budget is not None
+                    and self._adaptive_prefill_budget is not None
+                    and self._adaptive_prefill_max_budget is not None
+                ):
+                    self._adaptive_prefill_budget = min(
+                        self._adaptive_prefill_max_budget,
+                        self._adaptive_prefill_budget
+                        + self.prefill_schedule_adaptive_min_token_budget,
+                    )
+                self._adaptive_prefill_healthy_windows = 0
+        else:
+            self._adaptive_prefill_healthy_windows = 0
+
+    def _activate_adaptive_prefill_tier(self, tier: str) -> None:
+        previous_tier = getattr(self, "_adaptive_control_tier", None)
+        if previous_tier == tier:
+            return
+        self._adaptive_control_tier = tier
+        self._last_prefill_service_time = time.monotonic()
+        if previous_tier is not None:
+            if tier == "high" and self.prefill_schedule_high_load_interval:
+                self._adaptive_prefill_interval = max(
+                    self._adaptive_prefill_interval,
+                    self.prefill_schedule_high_load_interval,
+                )
+                # Entering high load clamps the budget to the high-load
+                # floor; the healthy-window regrowth below restores it
+                # when the tier drops back to overlap.
+                high_load_budget = getattr(
+                    self, "decode_active_prefill_high_load_token_budget", None
+                )
+                if (
+                    high_load_budget is not None
+                    and self._adaptive_prefill_budget is not None
+                ):
+                    self._adaptive_prefill_budget = min(
+                        self._adaptive_prefill_budget, high_load_budget
+                    )
+            return
+        self._adaptive_prefill_interval = (
+            self.prefill_schedule_high_load_interval
+            if tier == "high" and self.prefill_schedule_high_load_interval
+            else self.prefill_schedule_interval
+        )
+        self._adaptive_prefill_budget = self._adaptive_prefill_max_budget
+        self._adaptive_prefill_latencies.clear()
+        self._adaptive_decode_latencies.clear()
+        self._adaptive_high_load_latencies.clear()
+        self._adaptive_prefill_observations = 0
+        self._adaptive_prefill_healthy_windows = 0
+        self._adaptive_prefill_p99_ms = None
+        self._adaptive_decode_p99_ms = None
+        self._adaptive_decode_gap_p99_ms = None
+        self._adaptive_prefill_penalty_p99_ms = None
+        self._adaptive_drain_p99_ms = None
+        self._adaptive_drain_penalty_p99_ms = None
+        self._adaptive_drain_latencies.clear()
+        self._last_step_had_prefill = False
+        self._last_step_is_drain = False
+        self._adaptive_control_p99_ms = None
+        self._adaptive_cold_start = True
+
+    def _current_mamba_prefill_subblock(
+        self, overlap: bool, high_load: bool
+    ) -> int | None:
+        base = getattr(self, "mamba_prefill_subblock_tokens", None)
+        if (
+            getattr(self, "prefill_schedule_mode", "overlap") == "eb"
+            and getattr(self, "_eb_idle_subblock_enabled", True)
+            and base is not None
+        ):
+            # EB phase separation: keep the A/B-tuned base (100) whenever any
+            # decode is active (incl. an aging force-serve mid-decode); in an
+            # idle window (no decode overlap) run prefills at the roofline
+            # with the enlarged idle sub-block. `overlap` is re-read from the
+            # scheduler every step, so the base reverts within one step of a
+            # decode becoming active. (Inert on the DP proc; overlap mode
+            # below is unchanged.)
+            selected = (
+                base
+                if overlap
+                else getattr(self, "prefill_schedule_eb_idle_subblock", base)
+            )
+            self._last_mamba_prefill_subblock_tokens = selected
+            return selected
+        if not overlap or base is None:
+            return None
+        target = getattr(self, "prefill_schedule_adaptive_target_ms", None)
+        observed = getattr(self, "_adaptive_control_p99_ms", None)
+        if high_load or (
+            target is not None and observed is not None and observed > target
+        ):
+            selected = max(base // 2, 1)
+        elif target is not None and observed is not None and observed < target * 0.7:
+            # Do NOT enlarge past the configured (A/B-tuned) base. Under async
+            # scheduling a prefill step's own wall time undercounts its true GPU
+            # cost: the MTP draft/verify work drains onto the NEXT (decode) step,
+            # so a "low observed penalty" here is not "small drain". Enlarging the
+            # chunk to 2x moves a ~480ms decode stall to ~560ms with no prefill
+            # throughput gain (2026-10-19 per-step telemetry: the post-prefill
+            # decode stall scales 1:1 with sub-block size, 100->200->400).
+            # Hold the validated base; only tighten (base//2) under real pressure.
+            selected = base
+        else:
+            selected = base
+        self._last_mamba_prefill_subblock_tokens = selected
+        return selected
+
+    def _reset_adaptive_prefill_control(self) -> None:
+        # Base cadence, not high-load (matches the constructor; a reset
+        # re-enters the overlap tier through _activate_adaptive_prefill_tier).
+        self._adaptive_prefill_interval = self.prefill_schedule_interval
+        self._adaptive_prefill_budget = self._adaptive_prefill_max_budget
+        self._adaptive_min_prefill_step_ms = None
+        self._adaptive_prefill_step_by_budget = {}
+        self._adaptive_prefill_latencies.clear()
+        self._adaptive_decode_latencies.clear()
+        self._adaptive_high_load_latencies.clear()
+        self._adaptive_prefill_observations = 0
+        self._adaptive_prefill_healthy_windows = 0
+        self._adaptive_prefill_p99_ms = None
+        self._adaptive_decode_p99_ms = None
+        self._adaptive_decode_gap_p99_ms = None
+        self._adaptive_prefill_penalty_p99_ms = None
+        self._adaptive_drain_p99_ms = None
+        self._adaptive_drain_penalty_p99_ms = None
+        self._adaptive_drain_latencies.clear()
+        self._last_step_had_prefill = False
+        self._last_step_is_drain = False
+        self._adaptive_control_p99_ms = None
+        self._adaptive_control_tier = None
+        self._adaptive_cold_start = True
+        self._adaptive_reset_count = getattr(self, "_adaptive_reset_count", 0) + 1
+        self._adaptive_quiet_since = None
+
+    def _should_throttle_prefills(
+        self, high_load: bool | None = None, overlap: bool | None = None
+    ) -> bool:
+        """Whether this step should protect active decodes from prefill work.
+
+        In "eb" mode this is strict phase separation: while any decode is
+        active, ALWAYS defer prefills, except that a deferred prefill is
+        force-served once its wait reaches
+        ``prefill_schedule_eb_age_seconds`` (the EB(0) aging exception, k).
+        When no decode is active, never defer. The "overlap" path (default)
+        below is unchanged.
+        """
+        if high_load is None:
+            high_load = self._prefill_load_is_high()
+        if overlap is None:
+            scheduler = getattr(self, "scheduler", None)
+            overlap = high_load or (
+                scheduler is not None and scheduler.has_decode_prefill_overlap()
+            )
+        if getattr(self, "prefill_schedule_mode", "overlap") == "eb":
+            scheduler = getattr(self, "scheduler", None)
+            # EB keys off decode activity, not high load: even under low
+            # load a prefill dumped mid-decode drains onto the next decode
+            # step (the 28.6% drain tax), so "eb" = always-defer-while-decode.
+            active_decode = (
+                scheduler is not None and scheduler.has_decode_prefill_overlap()
+            )
+            oldest_wait = 0.0
+            force_prefill_service = False
+            deferred_prefills = 0
+            # P5-1 progress guarantee: reset every eb step (single-shot;
+            # only a force-serve step below re-sets it).
+            self._eb_forced_prefill_id = None
+            if active_decode:
+                get_eb_wait = getattr(
+                    scheduler, "get_oldest_eb_prefill_wait_seconds", None
+                )
+                if callable(get_eb_wait) and type(get_eb_wait).__name__ == "method":
+                    oldest_wait = get_eb_wait()
+                else:
+                    oldest_wait = scheduler.get_oldest_prefill_wait_seconds()
+                age = getattr(self, "prefill_schedule_eb_age_seconds", None)
+                if age is not None and oldest_wait >= age:
+                    force_prefill_service = True
+                    # P5-1 progress guarantee: force-serving must actually
+                    # SCHEDULE the aged prefill this step. Under the P3-4
+                    # era-A load shape a force-serve step could schedule
+                    # nothing (head-of-line unselected cold prefill broke
+                    # the waiting phase), so the wait grew unbounded past
+                    # k. Hand schedule() the oldest deferred id: it is
+                    # selected unconditionally this step and the waiting
+                    # loop skips past unselected prefills ahead of it, so
+                    # every force-serve step makes at least one held
+                    # prefill progress and the oldest deferred wait stops
+                    # growing unboundedly.
+                    self._eb_forced_prefill_id = (
+                        scheduler.get_oldest_deferred_prefill_id()
+                    )
+                # Telemetry for /status: how many prefills this policy is
+                # holding back right now (waiting with no output tokens).
+                get_deferred = getattr(
+                    scheduler, "get_deferred_prefill_count", None
+                )
+                deferred_prefills = (
+                    get_deferred() if get_deferred is not None else 0
+                )
+            self._adaptive_high_load = high_load
+            self._adaptive_oldest_prefill_wait_seconds = oldest_wait
+            self._adaptive_deferred_prefill_count = deferred_prefills
+            self._adaptive_aging_interval = None
+            self._adaptive_aging_token_budget = None
+            self._prefill_schedule_step += 1
+            return active_decode and not force_prefill_service
+        interval = self.prefill_schedule_interval
+        force_prefill_service = False
+        self._adaptive_aging_interval = None
+        self._adaptive_aging_token_budget = None
+        if overlap:
+            if getattr(self, "prefill_schedule_adaptive_target_ms", None) is not None:
+                now = time.monotonic()
+                tier = "high" if high_load else "overlap"
+                reset_seconds = getattr(
+                    self, "prefill_schedule_adaptive_reset_seconds", None
+                )
+                quiet_since = getattr(self, "_adaptive_quiet_since", None)
+                if (
+                    quiet_since is not None
+                    and reset_seconds is not None
+                    and now - quiet_since >= reset_seconds
+                ):
+                    EngineCore._reset_adaptive_prefill_control(self)
+                if hasattr(self, "_adaptive_control_tier"):
+                    EngineCore._activate_adaptive_prefill_tier(self, tier)
+                self._adaptive_quiet_since = None
+                self._adaptive_high_load = high_load
+                interval = self._adaptive_prefill_interval
+                max_wait = self.prefill_schedule_adaptive_max_wait_seconds
+                oldest_wait = self.scheduler.get_oldest_prefill_wait_seconds()
+                self._adaptive_oldest_prefill_wait_seconds = oldest_wait
+                if max_wait is not None and oldest_wait >= max_wait:
+                    debt_ratio = oldest_wait / max_wait
+                    aging_interval = max(
+                        1, math.ceil(interval / ((1.0 + debt_ratio) ** 2))
+                    )
+                    self._adaptive_aging_interval = aging_interval
+                    interval = min(interval, aging_interval)
+                    minimum_budget = self.prefill_schedule_adaptive_min_token_budget
+                    maximum_budget = self._adaptive_prefill_max_budget
+                    if minimum_budget is not None and maximum_budget is not None:
+                        self._adaptive_aging_token_budget = min(
+                            maximum_budget,
+                            minimum_budget * math.ceil(debt_ratio),
+                        )
+                    if now - self._last_prefill_service_time >= max_wait:
+                        force_prefill_service = True
+            elif high_load:
+                interval = (
+                    getattr(self, "prefill_schedule_high_load_interval", None)
+                    or interval
+                )
+        else:
+            now = time.monotonic()
+            if (
+                getattr(self, "_adaptive_control_tier", None) is not None
+                and getattr(self, "_adaptive_quiet_since", None) is None
+            ):
+                self._adaptive_quiet_since = now
+            self._adaptive_high_load = False
+            self._adaptive_oldest_prefill_wait_seconds = 0.0
+            reset_seconds = getattr(
+                self, "prefill_schedule_adaptive_reset_seconds", None
+            )
+            quiet_since = getattr(self, "_adaptive_quiet_since", None)
+            if (
+                quiet_since is not None
+                and reset_seconds is not None
+                and now - quiet_since >= reset_seconds
+            ):
+                EngineCore._reset_adaptive_prefill_control(self)
+        step = self._prefill_schedule_step
+        self._prefill_schedule_step += 1
+        return not force_prefill_service and interval > 1 and step % interval != 0
     def _attach_weight_version(self, outputs: dict[int, EngineCoreOutputs]) -> None:
         # Weight versions change only while generation is paused.
         for eco in outputs.values():
             eco.weight_version = self._weight_version
 
-    def _should_throttle_prefills(self) -> bool:
-        """Whether to defer new prefills this step (DP prefill balancing).
-        Overridden by the DP engine core; never throttles otherwise."""
-        return False
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
@@ -664,7 +1457,36 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        high_prefill_load = self._prefill_load_is_high()
+        prefill_decode_overlap = self.scheduler.has_decode_prefill_overlap()
+        throttle_prefills = self._should_throttle_prefills(
+            high_prefill_load, prefill_decode_overlap
+        )
+        mamba_subblock = self._current_mamba_prefill_subblock(
+            prefill_decode_overlap, high_prefill_load
+        )
+        schedule_started = time.monotonic()
+        # P5-1: pass through (and consume) the single-shot eb force-serve id
+        # decided by _should_throttle_prefills above; None on overlap steps.
+        eb_forced_prefill_id = self._eb_forced_prefill_id
+        self._eb_forced_prefill_id = None
+        scheduler_output = self.scheduler.schedule(
+            throttle_prefills,
+            self._current_prefill_token_budget(
+                high_prefill_load, prefill_decode_overlap
+            ),
+            mamba_subblock,
+            eb_forced_prefill_id,
+        )
+        scheduler_output.scheduled_timestamp = schedule_started
+        scheduler_output.high_prefill_load = high_prefill_load
+        scheduler_output.prefill_decode_overlap = prefill_decode_overlap
+        scheduler_output.mamba_prefill_subblock_tokens = mamba_subblock
+        # Expose per-step scheduler bookkeeping on the outputs (survives the
+        # empty-output case where the step scheduled work but emitted no
+        # request outputs, e.g. KV-pressure stalls).
+        self._last_step_prefill_tokens = scheduler_output.scheduled_prefill_tokens
+        self._last_step_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -675,6 +1497,8 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
+        self._observe_prefill_control(scheduler_output)
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
@@ -683,6 +1507,7 @@ class EngineCore:
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
+        self._attach_kv_cache_stats(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -722,7 +1547,36 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            high_prefill_load = self._prefill_load_is_high()
+            prefill_decode_overlap = self.scheduler.has_decode_prefill_overlap()
+            throttle_prefills = self._should_throttle_prefills(
+                high_prefill_load, prefill_decode_overlap
+            )
+            mamba_subblock = self._current_mamba_prefill_subblock(
+                prefill_decode_overlap, high_prefill_load
+            )
+            schedule_started = time.monotonic()
+            # P5-1: same single-shot force-serve hand-off as step().
+            eb_forced_prefill_id = self._eb_forced_prefill_id
+            self._eb_forced_prefill_id = None
+            scheduler_output = self.scheduler.schedule(
+                throttle_prefills,
+                self._current_prefill_token_budget(
+                    high_prefill_load, prefill_decode_overlap
+                ),
+                mamba_subblock,
+                eb_forced_prefill_id,
+            )
+            scheduler_output.scheduled_timestamp = schedule_started
+            scheduler_output.high_prefill_load = high_prefill_load
+            scheduler_output.prefill_decode_overlap = prefill_decode_overlap
+            scheduler_output.mamba_prefill_subblock_tokens = mamba_subblock
+            self._last_step_prefill_tokens = (
+                scheduler_output.scheduled_prefill_tokens
+            )
+            self._last_step_scheduled_tokens = (
+                scheduler_output.total_num_scheduled_tokens
+            )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -777,6 +1631,8 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
+        self._observe_prefill_control(scheduler_output)
+
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
@@ -785,6 +1641,7 @@ class EngineCore:
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
+        self._attach_kv_cache_stats(engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -2289,6 +3146,24 @@ class DPEngineCoreProc(EngineCoreProc):
         scheduler_config = vllm_config.scheduler_config
         self.prefill_schedule_interval = scheduler_config.prefill_schedule_interval
         self.dp_sync_interval = vllm_config.parallel_config.dp_sync_interval
+        self.prefill_schedule_high_load_interval = (
+            scheduler_config.prefill_schedule_high_load_interval
+        )
+        self.prefill_schedule_high_load_threshold = (
+            scheduler_config.prefill_schedule_high_load_threshold
+        )
+        self.prefill_schedule_high_load_decode_tokens = (
+            scheduler_config.prefill_schedule_high_load_decode_tokens
+        )
+        self.prefill_schedule_high_load_decode_lead_seconds = (
+            scheduler_config.prefill_schedule_high_load_decode_lead_seconds
+        )
+        self.decode_active_prefill_token_budget = (
+            scheduler_config.decode_active_prefill_token_budget
+        )
+        self.decode_active_prefill_high_load_token_budget = (
+            scheduler_config.decode_active_prefill_high_load_token_budget
+        )
 
         # Counts forward-passes of the model so that we can synchronize
         # finished with DP peers every N steps.
@@ -2319,6 +3194,10 @@ class DPEngineCoreProc(EngineCoreProc):
             engine_index=dp_rank,
             tensor_queue=tensor_queue,
         )
+        # eb's idle-window sub-block keys off the per-rank overlap flag, and
+        # that flag is not rank-aligned across DP ranks (see the rank-aligned
+        # _should_throttle_prefills override below) — keep it inert here.
+        self._eb_idle_subblock_enabled = False
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         # Configure GPUs and stateless process group for data parallel.
@@ -2442,8 +3321,14 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
-    def _should_throttle_prefills(self) -> bool:
-        # Throttle new prefills to cadence-aligned steps for DP balancing.
+    def _prefill_load_is_high(self) -> bool:
+        # A local request count can differ across DP ranks. Keep the globally
+        # aligned base cadence until high-load state is reduced across ranks.
+        return False
+
+    def _should_throttle_prefills(
+        self, high_load: bool | None = None, overlap: bool | None = None
+    ) -> bool:
         # step_counter is identical across DP ranks. On a fresh wave the
         # counter is 0, so prefills are admitted immediately after idle.
         return (

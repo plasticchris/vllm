@@ -277,6 +277,51 @@ class EngineCoreOutputs(
     # [num_reqs]
     outputs: list[EngineCoreOutput] = []
     scheduler_stats: SchedulerStats | None = None
+    kv_cache_usage: float | None = None
+    kv_cache_free_blocks: int | None = None
+    kv_cache_immediate_free_blocks: int | None = None
+    kv_cache_evictable_blocks: int | None = None
+    kv_cache_pinned_blocks: int | None = None
+    kv_cache_total_blocks: int | None = None
+    kv_cache_immediate_free_tokens: int | None = None
+    kv_cache_evictable_tokens: int | None = None
+    kv_cache_pinned_tokens: int | None = None
+    kv_cache_total_tokens: int | None = None
+    request_kv_tokens: dict[str, int] | None = None
+    prefill_control_interval: int | None = None
+    prefill_control_token_budget: int | None = None
+    prefill_control_p99_ms: float | None = None
+    prefill_control_decode_p99_ms: float | None = None
+    prefill_control_penalty_p99_ms: float | None = None
+    # Drain penalty (async-scheduling blind spot, 2026-10-19): the decode step
+    # right after a prefill absorbs the prefill's deferred GPU cost; this is
+    # what actually stalls concurrent decodes.
+    prefill_control_drain_p99_ms: float | None = None
+    prefill_control_drain_penalty_p99_ms: float | None = None
+    prefill_control_slo_p99_ms: float | None = None
+    prefill_control_oldest_wait_seconds: float | None = None
+    # EB(0) telemetry (PREFILL_MODE=eb): prefills the throttle is holding
+    # back right now (oldest one's wait = prefill_control_oldest_wait_seconds).
+    # None until an eb step records a value (overlap / DP override never set it).
+    prefill_control_deferred_count: int | None = None
+    prefill_control_aging_interval: int | None = None
+    prefill_control_aging_token_budget: int | None = None
+    prefill_control_high_load: bool | None = None
+    prefill_control_cold_start: bool | None = None
+    prefill_control_observations: int | None = None
+    prefill_control_reset_count: int | None = None
+    prefill_control_quiet_seconds: float | None = None
+    prefill_control_tier: str | None = None
+    mamba_prefill_subblock_tokens: int | None = None
+    prefill_control_prefill_ms_per_token: float | None = None
+    prefill_control_decode_gap_p99_ms: float | None = None
+    spec_profitability: dict[str, Any] | None = None
+    # Per-step scheduler bookkeeping (set even when the step produced no
+    # request outputs): prefill = newly computed context tokens this step
+    # (cache hits excluded); scheduled = all tokens scheduled this step
+    # including decode slots and speculative drafts.
+    step_prefill_tokens: int = 0
+    step_scheduled_tokens: int = 0
     timestamp: float = 0.0
 
     utility_output: UtilityOutput | None = None

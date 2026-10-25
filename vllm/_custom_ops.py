@@ -2135,7 +2135,6 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g
         CuCount: int,
         group_size: int,
     ) -> torch.Tensor:
-        # Kernel returns {in_b.size(0), in_a.size(0)} = [num_tokens, out_features].
         num_tokens = in_b.size(0)
         out_features = in_a.size(0)
         return torch.empty(
@@ -2164,6 +2163,38 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(
         b_scale: torch.Tensor,
     ) -> torch.Tensor:
         return torch.empty((a.size(0), b_q.size(0)), dtype=a.dtype, device=a.device)
+
+def wvSplitK_int4_wmma(
+    weight: torch.Tensor,
+    activation: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    zero_points: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # Fused int4-dequant WMMA GEMM (gfx1100 batched decode). weight is the
+    # ExLlama-shuffle int32 view [N, K//8]; activation is [M, K].
+    return torch.ops._rocm_C.wvSplitK_int4_wmma(
+        weight, activation, scale, zero_points, bias, group_size
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_wmma"):
+
+    @register_fake("_rocm_C::wvSplitK_int4_wmma")
+    def _wvSplitK_int4_wmma_fake(
+        weight: torch.Tensor,
+        activation: torch.Tensor,
+        scale: torch.Tensor,
+        zero_points: torch.Tensor | None,
+        bias: torch.Tensor | None,
+        group_size: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (activation.size(0), weight.size(0)),
+            dtype=activation.dtype,
+            device=activation.device,
+        )
 
 
 def wvSplitKrc(

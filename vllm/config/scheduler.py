@@ -19,6 +19,7 @@ logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
 SchedulerPolicy = Literal["fcfs", "priority"]
+PrefillScheduleMode = Literal["overlap", "eb"]
 
 
 @config
@@ -75,6 +76,56 @@ class SchedulerConfig:
     batches stay smaller without shrinking runner or graph capacity. Must
     be ``<= max_num_seqs``. ``None`` (default) keeps current behavior.
     """
+    decode_active_long_prefill_token_threshold: int | None = Field(
+        default=None, ge=1
+    )
+    """Optional per-request prefill chunk limit while decode work is active.
+    This allows larger, throughput-oriented chunks when the engine has no
+    decodes without increasing decode interruption latency."""
+
+    short_prefill_priority_token_threshold: int | None = Field(default=None, ge=1)
+    """Prioritize waiting prefills no larger than this many prompt tokens."""
+
+    short_prefill_priority_max_burst: int = Field(default=4, ge=1)
+    """Maximum consecutive short-prefill promotions while long prefills wait."""
+
+    short_prefill_priority_aging_seconds: float = Field(default=10.0, gt=0.0)
+    """Long-prefill age that reduces the short-prefill promotion burst to one."""
+
+    mamba_prefill_subblock_tokens: int | None = Field(default=None, ge=1)
+    """Experimental decode-active Mamba prefill slice below one cache block."""
+
+    prefill_schedule_mode: PrefillScheduleMode = "overlap"
+    """Prefill scheduling policy while decodes are active:
+
+    - "overlap" (default, today's behavior): interleave bounded prefill
+      chunks on a fixed cadence while decodes run.
+    - "eb": defer all prefill while any decode is active (EB(0)-style
+      phase separation); a deferred prefill is force-served once its
+      wait reaches ``prefill_schedule_eb_age_seconds``. When no decode
+      is active, prefills get the full step token budget at the idle
+      Mamba sub-block."""
+
+    prefill_schedule_eb_age_seconds: float = Field(default=10.0, gt=0.0)
+    """Only used when ``prefill_schedule_mode`` is "eb": maximum seconds a
+    prefill may wait while decodes are active before it is force-served
+    (the EB aging exception)."""
+
+    prefill_schedule_eb_idle_subblock: int = Field(default=400, ge=1)
+    """Only used when ``prefill_schedule_mode`` is "eb": Mamba prefill
+    sub-block (tokens) while no decode is active; clamped to divide the
+    scheduler block size. Reverts to ``mamba_prefill_subblock_tokens``
+    when a decode becomes active."""
+
+    max_num_partial_prefills: int = Field(default=1, ge=1)
+    """For chunked prefill, the maximum number of sequences that can be
+    partially prefilled concurrently."""
+
+    max_long_partial_prefills: int = Field(default=1, ge=1)
+    """For chunked prefill, the maximum number of prompts longer than
+    long_prefill_token_threshold that will be prefilled concurrently. Setting
+    this less than max_num_partial_prefills will allow shorter prompts to jump
+    the queue in front of longer prompts in some cases, improving latency."""
 
     long_prefill_token_threshold: int = Field(default=0, ge=0)
     """For chunked prefill, a request is considered long if the prompt is
@@ -201,12 +252,65 @@ class SchedulerConfig:
     (the default) disables the watermark."""
 
     prefill_schedule_interval: int = Field(default=1, ge=1)
-    """Only admit prefill once every N engine steps, leaving the steps in
-    between to decode alone. 1 (the default) admits prefill on every step.
+    """When decode work is active, schedule prefill compute once every N engine
+    steps. This protects inter-token latency on a single engine and aligns
+    prefill work across ranks in data-parallel deployments."""
 
-    A deferred step carries no prefill at all, including chunks of an
-    already-admitted prompt, so a long prompt can take up to N times as many
-    steps to finish prefilling."""
+    decode_active_prefill_token_budget: int | None = Field(default=None, ge=1)
+    """Maximum prefill tokens per step while decode requests are active."""
+
+    prefill_schedule_high_load_interval: int | None = Field(default=None, ge=1)
+    """Optional prefill cadence used when the number of running plus waiting
+    requests reaches ``prefill_schedule_high_load_threshold``."""
+
+    prefill_schedule_high_load_threshold: int = Field(default=5, ge=1)
+    """Request count that activates the high-load prefill policy."""
+
+    prefill_schedule_high_load_decode_tokens: int = Field(default=0, ge=0)
+    """Minimum generated tokens on a running decode before high-load prefill
+    protection activates."""
+
+    prefill_schedule_high_load_decode_lead_seconds: float = Field(
+        default=0.0, ge=0.0
+    )
+    """Minimum arrival-time lead an active decode must have over active
+    prefills before high-load protection activates. This avoids penalizing
+    equal-length fanouts that transition from prefill to decode unevenly."""
+
+    decode_active_prefill_high_load_token_budget: int | None = Field(
+        default=None, ge=1
+    )
+    """Optional decode-active prefill budget used under high load."""
+
+    prefill_schedule_adaptive_target_ms: float | None = Field(
+        default=None, gt=0.0
+    )
+    """Enable closed-loop high-load prefill control with this decode-visible
+    scheduler-step p99 latency target in milliseconds."""
+
+    prefill_schedule_adaptive_window: int = Field(default=128, ge=16)
+    """Number of high-load scheduler-step latencies in the control window."""
+
+    prefill_schedule_adaptive_update_interval: int = Field(default=16, ge=1)
+    """High-load steps between control updates."""
+
+    prefill_schedule_adaptive_max_interval: int = Field(default=128, ge=1)
+    """Maximum prefill cadence interval selected by the controller."""
+
+    prefill_schedule_adaptive_min_token_budget: int | None = Field(
+        default=None, ge=1
+    )
+    """Minimum decode-active prefill budget selected by the controller."""
+
+    prefill_schedule_adaptive_max_wait_seconds: float | None = Field(
+        default=None, gt=0.0
+    )
+    """Maximum time an adaptive high-load policy may defer all prefills."""
+
+    prefill_schedule_adaptive_reset_seconds: float | None = Field(
+        default=30.0, gt=0.0
+    )
+    """Quiet time after which adaptive prefill history and controls reset."""
 
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to

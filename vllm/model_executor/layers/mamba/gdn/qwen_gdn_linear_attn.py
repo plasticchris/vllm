@@ -72,6 +72,8 @@ from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.fused_gdn_decode_post_conv_mtp import (
     fused_gdn_decode_post_conv_mtp_triton,
 )
+
+from vllm.triton_utils import tl, triton
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
@@ -107,6 +109,9 @@ if GDN_AITER_TRITON_AVAILABLE:
 logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
+# Longest non-spec query of a batch with prefills that still runs through the
+# recurrent kernel (see _resolve_recurrent_prefill_max_query_len).
+DEFAULT_RECURRENT_PREFILL_MAX_QUERY_LEN = 32
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
@@ -270,6 +275,36 @@ def _resolve_gdn_prefill_backend(
     return backend, "triton"
 
 
+def _resolve_recurrent_prefill_max_query_len(vllm_config: VllmConfig) -> int:
+    """Longest prefill chunk that runs through the recurrent GDN kernel.
+
+    When every non-spec query of a batch with prefills is at most this many
+    tokens long, the decodes and the prefills of that batch run in one
+    recurrent-kernel launch. That launch replaces the decode launch plus the
+    chunked prefill pipeline, whose six kernels cost about the same for 1 token
+    as for a full 64-token chunk. Longer batches keep the chunked pipeline,
+    because the recurrent kernel is sequential in the tokens of a sequence.
+
+    Set ``additional_config["gdn_recurrent_prefill_max_query_len"]``; 0
+    disables the recurrent prefill route.
+    """
+    additional_config = vllm_config.additional_config
+    value = (
+        additional_config.get(
+            "gdn_recurrent_prefill_max_query_len",
+            DEFAULT_RECURRENT_PREFILL_MAX_QUERY_LEN,
+        )
+        if isinstance(additional_config, dict)
+        else DEFAULT_RECURRENT_PREFILL_MAX_QUERY_LEN
+    )
+    max_query_len = int(value)
+    if max_query_len < 0:
+        raise ValueError(
+            f"gdn_recurrent_prefill_max_query_len must be >= 0, got {max_query_len}."
+        )
+    return max_query_len
+
+
 def _log_gdn_backend_decision(
     vllm_config: VllmConfig,
     requested_backend: str,
@@ -377,6 +412,9 @@ class ChunkGatedDeltaRule(CustomOp):
         vllm_config = get_current_vllm_config()
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
+        # Whether the prefill kernel writes straight into a passed
+        # core_attn_out rather than copying its own output into it.
+        self.writes_output_in_place = active_backend == "triton"
 
         if backend in ("flashinfer", "cutedsl") and active_backend != backend:
             logger.warning_once(
@@ -1042,11 +1080,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def rearrange_mixed_qkv(self, mixed_qkv):
         """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
 
-        The original code used ``rearrange(x, "l (h d) -> 1 l h d", d=...)``
-        followed by ``.contiguous()`` on each tensor.  This version flattens
-        all three splits into a single buffer via ``torch.cat`` so that
-        torch.compile emits one Triton copy kernel instead of three separate
-        contiguous() calls.
+        The q/k/v slices of a packed row are non-contiguous, so a copy is
+        unavoidable. This method runs inside the vllm::qwen_gdn_attention_core
+        custom op, which torch.compile treats as opaque, so an eager
+        split/reshape/cat here never gets fused and costs four launches per layer
+        per decode step. repack_mixed_qkv does the same movement in one.
         """
         if mixed_qkv is None:
             return None, None, None
@@ -1056,11 +1094,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         k_dim = self.key_dim // self.tp_size
         v_dim = self.value_dim // self.tp_size
 
-        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
-
-        fused = torch.cat(
-            [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0
-        )
+        fused = repack_mixed_qkv(mixed_qkv, q_dim, k_dim, v_dim)
 
         q_size = seq_len * q_dim
         k_size = seq_len * k_dim
@@ -1693,15 +1727,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
+        # Short prefills join the decodes in one recurrent-kernel launch;
+        # the other batches with prefills use the chunked prefill pipeline.
+        use_chunked_prefill = (
+            attn_metadata.num_prefills > 0
+            and not getattr(attn_metadata, "use_recurrent_prefill", False)
+        )
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
             spec_sequence_masks is None
-            and attn_metadata.num_prefills > 0
+            and use_chunked_prefill
             and attn_metadata.num_decodes > 0
         )
         num_decode_tokens = attn_metadata.num_decode_tokens
+        prefill_out: torch.Tensor | None = None
 
-        if attn_metadata.num_prefills > 0:
+        if use_chunked_prefill:
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
@@ -1802,8 +1843,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             core_attn_out_decode = None
 
-        # 2.3: Process the remaining part (prefill chunk, or non-spec decode-only)
-        if attn_metadata.num_prefills > 0:
+        # 2.3: Process the remaining part (prefill chunk, or all non-spec
+        # sequences in one recurrent launch)
+        if use_chunked_prefill:
             # State indices, initial-state mask and cu_seqlens for the chunk
             # kernel are precomputed by the metadata builder (the prefill tail
             # when decodes are peeled off, else the full non-spec batch), so they
@@ -1815,6 +1857,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
             plan = attn_metadata.flashinfer_checkpoint_plan
+            # Without spec decode the prefill tokens are a contiguous range of
+            # core_attn_out, so the triton prefill kernel can write them in place
+            # (asgard gfx1100 optimization; the backend only supports it when it
+            # does not copy into a separate buffer).
+            prefill_out = None
+            if (
+                spec_sequence_masks is None
+                and getattr(self.chunk_gated_delta_rule, "writes_output_in_place", False)
+            ):
+                prefill_start = num_decode_tokens if split_non_spec else 0
+                prefill_out = core_attn_out[prefill_start:num_actual_tokens]
             if plan is None:
                 (
                     core_attn_out_non_spec,
@@ -1832,6 +1885,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     chunk_offsets=attn_metadata.chunk_offsets,
                     use_qk_l2norm_in_kernel=False,
                     aiter_prefill_metadata=attn_metadata.aiter_prefill_metadata,
+                    core_attn_out=prefill_out,
                 )
             else:
                 # Only FlashInfer's prefill emits checkpoints.
@@ -1870,18 +1924,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
 
-            if split_non_spec:
+            if split_non_spec and prefill_out is not None:
+                core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
+            elif split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
                 # outputs (decode-first order).
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec], dim=1
                 )
-        elif attn_metadata.num_decodes > 0:
+        elif attn_metadata.num_decodes > 0 or attn_metadata.num_prefills > 0:
+            # Decodes, plus short prefills when use_recurrent_prefill is set.
+            # The 1-D state indices make the kernel store each sequence's state
+            # once, after its last token; has_initial_state zeroes the start
+            # state of new sequences (it is None for decode-only batches).
+            num_non_spec_seqs = attn_metadata.num_decodes + attn_metadata.num_prefills
+            if spec_sequence_masks is not None:
+                a_non_spec = a.index_select(0, non_spec_token_indx)
+                b_non_spec = b.index_select(0, non_spec_token_indx)
+            else:
+                a_non_spec = a
+                b_non_spec = b
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a_non_spec,
+                    b=b_non_spec,
                     dt_bias=self.dt_bias,
                     q=query_non_spec,
                     k=key_non_spec,
@@ -1889,11 +1956,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     initial_state=ssm_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                        : attn_metadata.num_decodes
-                        + 1  # type: ignore[attr-defined]
+                        : num_non_spec_seqs + 1
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
+                    has_initial_state=has_initial_state,
                 )
             )
         else:
@@ -1907,7 +1974,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        else:
+        elif prefill_out is None:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
     def _forward_core_decode_aiter(
@@ -2309,3 +2376,131 @@ direct_register_custom_op(
     op_func=qwen_gdn_attention_core_fused_norm_packed,
     mutates_args=["core_attn_out"],
 )
+
+
+@triton.jit
+def fused_gdn_gating_kernel(
+    g,
+    beta_output,
+    A_log,
+    a,
+    b,
+    dt_bias,
+    seq_len,
+    NUM_HEADS: tl.constexpr,
+    beta: tl.constexpr,
+    threshold: tl.constexpr,
+    BLK_HEADS: tl.constexpr,
+):
+    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
+    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    mask = head_off < NUM_HEADS
+    blk_A_log = tl.load(A_log + head_off, mask=mask)
+    blk_a = tl.load(a + off, mask=mask)
+    blk_b = tl.load(b + off, mask=mask)
+    blk_bias = tl.load(dt_bias + head_off, mask=mask)
+    # If the model is loaded in fp16, without the .float() here, A might be -inf
+    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
+    softplus_x = tl.where(
+        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+    )
+    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
+    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    # compute beta_output = sigmoid(b)
+    blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
+    tl.store(
+        beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
+    )
+
+
+def fused_gdn_gating(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused computation of g and beta for Gated Delta Net.
+    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    beta_output = b.sigmoid()
+    TODO maybe use torch.compile to replace this triton kernel
+    """
+    batch, num_heads = a.shape
+    seq_len = 1
+    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
+    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
+    beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+    fused_gdn_gating_kernel[grid](
+        g,
+        beta_output,
+        A_log,
+        a,
+        b,
+        dt_bias,
+        seq_len,
+        num_heads,
+        beta,
+        threshold,
+        8,
+        num_warps=1,
+    )
+    return g, beta_output
+
+
+@triton.jit
+def _repack_mixed_qkv_kernel(
+    src,
+    dst,
+    seq_len,
+    Q_DIM: tl.constexpr,
+    K_DIM: tl.constexpr,
+    V_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    total = Q_DIM + K_DIM + V_DIM
+    q_size = seq_len * Q_DIM
+    k_size = seq_len * K_DIM
+
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < seq_len * total
+
+    in_q = offs < q_size
+    in_k = (offs >= q_size) & (offs < q_size + k_size)
+
+    # Select the destination section branch-free so the whole repack is one launch.
+    base = tl.where(in_q, 0, tl.where(in_k, q_size, q_size + k_size))
+    width = tl.where(in_q, Q_DIM, tl.where(in_k, K_DIM, V_DIM))
+    row_off = tl.where(in_q, 0, tl.where(in_k, Q_DIM, Q_DIM + K_DIM))
+
+    local = offs - base
+    src_off = (local // width) * total + row_off + local % width
+    tl.store(dst + offs, tl.load(src + src_off, mask=mask, other=0), mask=mask)
+
+
+def repack_mixed_qkv(
+    mixed_qkv: torch.Tensor, q_dim: int, k_dim: int, v_dim: int
+) -> torch.Tensor:
+    """Scatter a packed [seq, Q+K+V] tensor into one [q | k | v] contiguous buffer.
+
+    Equivalent to ``torch.cat([q.reshape(-1), k.reshape(-1), v.reshape(-1)])``
+    over a last-dim ``torch.split``, but in a single launch instead of four
+    (three reshape materializations plus the cat). Bitwise identical.
+    """
+    assert mixed_qkv.shape[-1] == q_dim + k_dim + v_dim, (
+        f"packed width {mixed_qkv.shape[-1]} != {q_dim}+{k_dim}+{v_dim}"
+    )
+    # The index arithmetic assumes a row stride of exactly q_dim+k_dim+v_dim.
+    if not mixed_qkv.is_contiguous():
+        mixed_qkv = mixed_qkv.contiguous()
+
+    seq_len = mixed_qkv.shape[0]
+    n = seq_len * (q_dim + k_dim + v_dim)
+    out = torch.empty(n, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    BLOCK = 1024
+    _repack_mixed_qkv_kernel[(triton.cdiv(n, BLOCK),)](
+        mixed_qkv, out, seq_len, q_dim, k_dim, v_dim, BLOCK=BLOCK, num_warps=4
+    )
+    return out

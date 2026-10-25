@@ -277,7 +277,7 @@ class CudaGraphManager:
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
-            and self.decode_query_len > self.vllm_config.num_speculative_tokens
+            and self.decode_query_len > 1
         ):
             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
             # _per_step. Recover num_new_sampled_tokens_per_step

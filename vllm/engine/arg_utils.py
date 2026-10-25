@@ -114,7 +114,7 @@ from vllm.config.parallel import (
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
 )
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import PrefillScheduleMode, SchedulerPolicy
 from vllm.config.utils import get_field
 from vllm.config.vllm import OptimizationLevel, PerformanceMode
 from vllm.config.watermarking import WatermarkConfig
@@ -619,6 +619,30 @@ class EngineArgs:
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
     )
+    decode_active_long_prefill_token_threshold: int | None = (
+        SchedulerConfig.decode_active_long_prefill_token_threshold
+    )
+    short_prefill_priority_token_threshold: int | None = (
+        SchedulerConfig.short_prefill_priority_token_threshold
+    )
+    short_prefill_priority_max_burst: int = (
+        SchedulerConfig.short_prefill_priority_max_burst
+    )
+    short_prefill_priority_aging_seconds: float = (
+        SchedulerConfig.short_prefill_priority_aging_seconds
+    )
+    mamba_prefill_subblock_tokens: int | None = (
+        SchedulerConfig.mamba_prefill_subblock_tokens
+    )
+    prefill_schedule_mode: PrefillScheduleMode = (
+        SchedulerConfig.prefill_schedule_mode
+    )
+    prefill_schedule_eb_age_seconds: float = (
+        SchedulerConfig.prefill_schedule_eb_age_seconds
+    )
+    prefill_schedule_eb_idle_subblock: int = (
+        SchedulerConfig.prefill_schedule_eb_idle_subblock
+    )
     max_num_seqs: int | None = None
     max_num_active_seqs: int | None = SchedulerConfig.max_num_active_seqs
     max_num_queued_reqs: int | None = None
@@ -715,6 +739,45 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
+    decode_active_prefill_token_budget: int | None = (
+        SchedulerConfig.decode_active_prefill_token_budget
+    )
+    prefill_schedule_high_load_interval: int | None = (
+        SchedulerConfig.prefill_schedule_high_load_interval
+    )
+    prefill_schedule_high_load_threshold: int = (
+        SchedulerConfig.prefill_schedule_high_load_threshold
+    )
+    prefill_schedule_high_load_decode_tokens: int = (
+        SchedulerConfig.prefill_schedule_high_load_decode_tokens
+    )
+    prefill_schedule_high_load_decode_lead_seconds: float = (
+        SchedulerConfig.prefill_schedule_high_load_decode_lead_seconds
+    )
+    decode_active_prefill_high_load_token_budget: int | None = (
+        SchedulerConfig.decode_active_prefill_high_load_token_budget
+    )
+    prefill_schedule_adaptive_target_ms: float | None = (
+        SchedulerConfig.prefill_schedule_adaptive_target_ms
+    )
+    prefill_schedule_adaptive_window: int = (
+        SchedulerConfig.prefill_schedule_adaptive_window
+    )
+    prefill_schedule_adaptive_update_interval: int = (
+        SchedulerConfig.prefill_schedule_adaptive_update_interval
+    )
+    prefill_schedule_adaptive_max_interval: int = (
+        SchedulerConfig.prefill_schedule_adaptive_max_interval
+    )
+    prefill_schedule_adaptive_min_token_budget: int | None = (
+        SchedulerConfig.prefill_schedule_adaptive_min_token_budget
+    )
+    prefill_schedule_adaptive_max_wait_seconds: float | None = (
+        SchedulerConfig.prefill_schedule_adaptive_max_wait_seconds
+    )
+    prefill_schedule_adaptive_reset_seconds: float | None = (
+        SchedulerConfig.prefill_schedule_adaptive_reset_seconds
+    )
 
     watermark: float = SchedulerConfig.watermark
 
@@ -1773,8 +1836,24 @@ class EngineArgs:
             **scheduler_kwargs["long_prefill_token_threshold"],
         )
         scheduler_group.add_argument(
-            "--long-prefill-token-threshold-adaptive",
-            **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
+            "--decode-active-long-prefill-token-threshold",
+            **scheduler_kwargs["decode_active_long_prefill_token_threshold"],
+        )
+        scheduler_group.add_argument(
+            "--short-prefill-priority-token-threshold",
+            **scheduler_kwargs["short_prefill_priority_token_threshold"],
+        )
+        scheduler_group.add_argument(
+            "--short-prefill-priority-max-burst",
+            **scheduler_kwargs["short_prefill_priority_max_burst"],
+        )
+        scheduler_group.add_argument(
+            "--short-prefill-priority-aging-seconds",
+            **scheduler_kwargs["short_prefill_priority_aging_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--mamba-prefill-subblock-tokens",
+            **scheduler_kwargs["mamba_prefill_subblock_tokens"],
         )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
@@ -1802,6 +1881,70 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--prefill-schedule-interval",
             **scheduler_kwargs["prefill_schedule_interval"],
+        )
+        scheduler_group.add_argument(
+            "--decode-active-prefill-token-budget",
+            **scheduler_kwargs["decode_active_prefill_token_budget"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-high-load-interval",
+            **scheduler_kwargs["prefill_schedule_high_load_interval"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-high-load-threshold",
+            **scheduler_kwargs["prefill_schedule_high_load_threshold"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-high-load-decode-tokens",
+            **scheduler_kwargs["prefill_schedule_high_load_decode_tokens"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-high-load-decode-lead-seconds",
+            **scheduler_kwargs["prefill_schedule_high_load_decode_lead_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--decode-active-prefill-high-load-token-budget",
+            **scheduler_kwargs["decode_active_prefill_high_load_token_budget"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-target-ms",
+            **scheduler_kwargs["prefill_schedule_adaptive_target_ms"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-window",
+            **scheduler_kwargs["prefill_schedule_adaptive_window"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-update-interval",
+            **scheduler_kwargs["prefill_schedule_adaptive_update_interval"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-max-interval",
+            **scheduler_kwargs["prefill_schedule_adaptive_max_interval"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-min-token-budget",
+            **scheduler_kwargs["prefill_schedule_adaptive_min_token_budget"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-max-wait-seconds",
+            **scheduler_kwargs["prefill_schedule_adaptive_max_wait_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-adaptive-reset-seconds",
+            **scheduler_kwargs["prefill_schedule_adaptive_reset_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-mode",
+            **scheduler_kwargs["prefill_schedule_mode"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-eb-age-seconds",
+            **scheduler_kwargs["prefill_schedule_eb_age_seconds"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-eb-idle-subblock",
+            **scheduler_kwargs["prefill_schedule_eb_idle_subblock"],
         )
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
@@ -2674,9 +2817,62 @@ class EngineArgs:
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),
+            decode_active_long_prefill_token_threshold=(
+                self.decode_active_long_prefill_token_threshold
+            ),
+            short_prefill_priority_token_threshold=(
+                self.short_prefill_priority_token_threshold
+            ),
+            short_prefill_priority_max_burst=(
+                self.short_prefill_priority_max_burst
+            ),
+            short_prefill_priority_aging_seconds=(
+                self.short_prefill_priority_aging_seconds
+            ),
+            mamba_prefill_subblock_tokens=self.mamba_prefill_subblock_tokens,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            decode_active_prefill_token_budget=(
+                self.decode_active_prefill_token_budget
+            ),
+            prefill_schedule_high_load_interval=(
+                self.prefill_schedule_high_load_interval
+            ),
+            prefill_schedule_high_load_threshold=(
+                self.prefill_schedule_high_load_threshold
+            ),
+            prefill_schedule_high_load_decode_tokens=(
+                self.prefill_schedule_high_load_decode_tokens
+            ),
+            prefill_schedule_high_load_decode_lead_seconds=(
+                self.prefill_schedule_high_load_decode_lead_seconds
+            ),
+            decode_active_prefill_high_load_token_budget=(
+                self.decode_active_prefill_high_load_token_budget
+            ),
+            prefill_schedule_adaptive_target_ms=(
+                self.prefill_schedule_adaptive_target_ms
+            ),
+            prefill_schedule_adaptive_window=self.prefill_schedule_adaptive_window,
+            prefill_schedule_adaptive_update_interval=(
+                self.prefill_schedule_adaptive_update_interval
+            ),
+            prefill_schedule_adaptive_max_interval=(
+                self.prefill_schedule_adaptive_max_interval
+            ),
+            prefill_schedule_adaptive_min_token_budget=(
+                self.prefill_schedule_adaptive_min_token_budget
+            ),
+            prefill_schedule_adaptive_max_wait_seconds=(
+                self.prefill_schedule_adaptive_max_wait_seconds
+            ),
+            prefill_schedule_adaptive_reset_seconds=(
+                self.prefill_schedule_adaptive_reset_seconds
+            ),
+            prefill_schedule_mode=self.prefill_schedule_mode,
+            prefill_schedule_eb_age_seconds=self.prefill_schedule_eb_age_seconds,
+            prefill_schedule_eb_idle_subblock=self.prefill_schedule_eb_idle_subblock,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,

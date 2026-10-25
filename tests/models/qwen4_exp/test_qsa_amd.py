@@ -314,6 +314,45 @@ def test_fused_pre_indexer_gate_is_config_shaped(overrides, expected) -> None:
         )
         is expected
     )
+def test_qsa_torch_topk_masks_ragged_rows() -> None:
+    logits = torch.tensor(
+        [[9.0, 8.0, 7.0, 6.0, 5.0], [1.0, 2.0, 3.0, 4.0, 5.0]]
+    )
+    visible_blocks = torch.tensor([2, 4], dtype=torch.int32)
+    output = torch.full((2, 4), 99, dtype=torch.int32)
+
+    qsa_ops._torch_top_k_per_row_decode(logits, visible_blocks, output, topk=4)
+
+    assert output.tolist() == [[0, 1, -1, -1], [3, 2, 1, 0]]
+
+
+def test_qsa_torch_topk_fits_beside_long_prefill_tile() -> None:
+    # One 2,048-token chunk at ~60k context, the shape that ran a TP rank out
+    # of VRAM when the fallback copied the whole tile.
+    rows, width, topk = 2048, 14912, 512
+    device = torch.device("cuda")
+    positions = torch.arange(rows, device=device) + 57600
+    visible_blocks = ((positions + 1) // 4).to(torch.int32)
+    visible_blocks[:3] = torch.tensor([0, 100, 511], dtype=torch.int32)
+    # Distinct scores per row make the expected top-k unique.
+    logits = torch.rand((rows, width), device=device).argsort(dim=-1).float()
+    row_ends = visible_blocks.to(torch.int64).unsqueeze(1)
+    columns = torch.arange(width, device=device)
+    expected = logits.masked_fill(columns >= row_ends, float("-inf"))
+    expected = expected.topk(topk, dim=-1).indices
+    ranks = torch.arange(topk, device=device)
+    expected.masked_fill_(ranks >= row_ends.clamp(max=topk), -1)
+    output = torch.empty((rows, topk), dtype=torch.int32, device=device)
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    baseline = torch.cuda.memory_allocated()
+    qsa_ops._torch_top_k_per_row_decode(logits, visible_blocks, output, topk)
+    torch.cuda.synchronize()
+
+    tile_bytes = logits.numel() * logits.element_size()
+    assert torch.cuda.max_memory_allocated() - baseline < tile_bytes // 4
+    assert torch.equal(output, expected.to(torch.int32))
 
 
 def test_qsa_selection_uses_portable_topk_on_rocm(
@@ -337,6 +376,7 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
         lambda *args, **kwargs: (logits, visible_blocks),
     )
     monkeypatch.setattr(qsa_ops.current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(qsa_ops, "on_gfx1100", lambda: False)
 
     def top_k_per_row_decode(
         topk_logits,

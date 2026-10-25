@@ -460,6 +460,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         is_profile: bool = False,
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
+        if (
+            num_speculative_steps is not None
+            and num_speculative_steps != self.num_speculative_steps
+        ):
+            raise ValueError("DFlash does not support dynamic speculative depth")
         num_reqs = input_batch.num_reqs
         if dummy_run and dp_sync_state is not None:
             num_reqs = min(num_reqs, dp_sync_state.num_reqs)

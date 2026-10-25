@@ -40,7 +40,11 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_pp_group,
+    is_global_first_rank,
+)
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -1266,15 +1270,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        jump_requests = {
+            op.req_id for op in (scheduler_output.mamba_state_transplants or ())
+        }
+        staged_jump = False
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
+            if req_id in jump_requests:
+                # Only an explicit splice jump may override the GPU counter;
+                # ordinary async decode/rejection updates remain GPU-owned.
+                self.req_states.num_computed_tokens.stage_write_elem(
+                    req_index, num_computed_tokens
+                )
+                staged_jump = True
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+
+        if staged_jump:
+            self.req_states.num_computed_tokens.apply_write()
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -1297,6 +1315,96 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
+
+        # Apply Leyline-style in-place RoPE delta rotations on spliced KV blocks.
+        if getattr(scheduler_output, "kv_cache_rope_rotations", None):
+            inv_freq, is_neox = self._resolve_rope_inv_freq()
+            if inv_freq is not None:
+                from vllm.v1.attention.ops.leyline_rope import (
+                    apply_kv_cache_rope_rotations_inplace,
+                )
+
+                apply_kv_cache_rope_rotations_inplace(
+                    self.compilation_config.static_forward_context,
+                    self.kv_cache_config.num_blocks,
+                    scheduler_output.kv_cache_rope_rotations,
+                    inv_freq=inv_freq,
+                    is_neox_style=is_neox,
+                )
+
+        # Leyline hybrid §2b: fused copy+rotate splices of donor full-attention
+        # KV into the target suffix slots, run with this step's execution so the
+        # tail-prefill forward reads the spliced KV. Runs AFTER the plain CoW
+        # block copies and BEFORE the Mamba boundary-state transplant and the
+        # phase-3 Mamba preprocess, so the continuation sees both the spliced
+        # KV and the transplanted recurrent state. Only set when
+        # kv_splice_mode == "amortize"; off by default.
+        if getattr(scheduler_output, "kv_cache_block_splices", None):
+            inv_freq, is_neox = self._resolve_rope_inv_freq()
+            if inv_freq is None:
+                raise RuntimeError("Hybrid splice requires resolvable RoPE frequencies")
+            if inv_freq is not None:
+                from vllm.v1.attention.ops.leyline_rope import (
+                    apply_kv_cache_block_splices_inplace,
+                )
+
+                apply_kv_cache_block_splices_inplace(
+                    self.compilation_config.static_forward_context,
+                    self.kv_cache_config.num_blocks,
+                    scheduler_output.kv_cache_block_splices,
+                    inv_freq=inv_freq,
+                    is_neox_style=is_neox,
+                )
+
+        # Apply Leyline hybrid-splice Mamba boundary-state transplants: whole-block
+        # CoW of the donor GDN state into the target's splice-point slot, run
+        # after zeroing + CoW copies and BEFORE the phase-3 Mamba boundary
+        # migration (preprocess_state) so the migration kernel never sees an
+        # empty destination. No-op when the step has no transplants (the common
+        # case: mode off / no Mamba model / no splice).
+        mamba_state_transplants = getattr(
+            scheduler_output, "mamba_state_transplants", None
+        )
+        if mamba_state_transplants:
+            from vllm.v1.worker.mamba_utils import (
+                apply_mamba_state_transplants,
+                stage_mamba_state_idx_guard,
+            )
+
+            apply_mamba_state_transplants(
+                self.kv_cache_config,
+                self.compilation_config.static_forward_context,
+                mamba_state_transplants,
+            )
+            # Align-mode A6 clobber guard: stage _mamba_state_idx_gpu[req] to the
+            # transplant column so the phase-3 migration kernel's per-request
+            # pre-copy fast-exits (src_col == new_state_idx == target_idx) instead
+            # of copying a stale/null state over the freshly transplanted one.
+            # Non-align modes have no _mamba_state_idx_gpu tensor (CPU-only dict),
+            # so this is a no-op there and the request's state column (the
+            # manager's) is unchanged by the transplant.
+            state_idx = getattr(self.model_state, "_mamba_state_idx_gpu", None)
+            req_index = getattr(self.req_states, "req_id_to_index", None)
+            if state_idx is not None and req_index is not None:
+                stage_mamba_state_idx_guard(
+                    state_idx, req_index, mamba_state_transplants
+                )
+
+    def _resolve_rope_inv_freq(self) -> tuple[torch.Tensor | None, bool]:
+        cached = getattr(self, "_cached_rope_inv_freq", None)
+        if cached is not None:
+            return cached
+        from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
+
+        for mod in self.model.modules():
+            if isinstance(mod, RotaryEmbeddingBase):
+                inv_freq = mod._compute_inv_freq(mod.base).to(
+                    device=self.device, dtype=torch.float32
+                )
+                is_neox = bool(getattr(mod, "is_neox_style", True))
+                self._cached_rope_inv_freq = (inv_freq, is_neox)
+                return self._cached_rope_inv_freq
+        return None, True
 
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
@@ -2115,6 +2223,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states=aux_hidden_states,
             dp_sync_state=dp_sync_state,
             finished_req_ids=finished_req_ids,
+            num_speculative_steps=scheduler_output.num_spec_tokens_to_schedule,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
             num_spec_tokens_to_schedule=(
@@ -2278,6 +2387,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            if getattr(self, "_last_runtime_speculative_steps", None) != num_spec_tokens:
+                if is_global_first_rank():
+                    logger.info(
+                        "MRV2 speculative depth: K=%d requests=%d",
+                        num_spec_tokens,
+                        input_batch.num_reqs,
+                    )
+                self._last_runtime_speculative_steps = num_spec_tokens
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.observe_verification(
                     input_batch.idx_mapping, num_sampled, num_rejected
@@ -2466,14 +2583,14 @@ class ExecuteModelState(NamedTuple):
     aux_hidden_states: list[torch.Tensor] | None
     dp_sync_state: DPSyncState | None
     finished_req_ids: set[str]
+    num_speculative_steps: int
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     num_spec_tokens_to_schedule: int
 
 
 class BatchReqState(NamedTuple):
-    """CPU request state for a scheduled batch, in batch (sorted) order."""
-
+    # CPU request state for a scheduled batch, in batch order.
     req_ids: list[str]
     num_scheduled_tokens: np.ndarray  # [num_reqs]
     # May be less than scheduler_output.total_num_scheduled_tokens:

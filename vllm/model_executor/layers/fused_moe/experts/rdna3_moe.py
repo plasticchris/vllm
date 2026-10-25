@@ -35,11 +35,22 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt4Static,
     kInt4Static32,
 )
+import os
+
 from vllm.platforms import current_platform
 
 
 def rdna3_moe_kernel_available() -> bool:
     """Whether the fused RDNA3 MoE HIP kernel is built into this binary."""
+    # asgard gate (2026-09): opt-in so stock gfx1100 binaries keep the
+    # Triton WNA16 path unless the native kernel is explicitly wanted.
+    if os.getenv("VLLM_ROCM_RDNA3_NATIVE_MOE", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
     if not current_platform.is_rocm():
         return False
 
@@ -178,8 +189,11 @@ class Rdna3WNA16Experts(mk.FusedMoEExpertsModular):
         gate_up_out = scratch[: rows * gate_up].view(rows, gate_up)
         act_out = scratch[rows * gate_up : rows * (gate_up + act_n)].view(rows, act_n)
 
-        # BLOCK_SIZE_M=1 for decode (no padding waste), 4 for prefill.
-        block_size_m = 1 if M <= 4 else 4
+        # BLOCK_SIZE_M=1 for decode (no padding waste), 4 for prefill, 8 when
+        # the asgard gate is on (bigger prefill tiles on 96-CU gfx1100).
+        block_size_m = 1 if M <= 4 else (
+            8 if os.environ.get("VLLM_ROCM_RDNA3_NATIVE_MOE") else 4
+        )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids,
             block_size_m,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import Literal, cast
 
@@ -130,12 +131,20 @@ class CustomAllreduce:
     _DEFAULT_MNNVL_MULTIMEM_REDUCE_SCATTER_MAX_SIZE = 64 * 1024 * 1024
     _MNNVL_MULTIMEM_REDUCE_SCATTER_BLOCKS = 8
 
-    # max_size: max supported allreduce size
+    # max_size: max supported allreduce size (eager-mode copy buffer). Env override
+    # VLLM_CUSTOM_AR_MAX_BYTES raises the dispatch boundary so bigger ARs use the
+    # custom P2P kernels instead of NCCL. Measured A/B 2026-08-23 on gfx1100 (qwen3.8
+    # 27B, TP=4, C=1024): 256 MB boundary LOSES at prefill sizes — warm prefill
+    # 1452 -> 588 tok/s, mixed prefill 906 -> 529 tok/s, clean decode 29.4 -> 23.8
+    # tok/s (2-stage custom AR is ~2.5x slower than RCCL's 16-channel ring on big
+    # P2P-payload ARs). Keep the default 8 MB (decode-sized ARs only, the only
+    # regime where custom beats NCCL); the knob exists for future kernels, not
+    # for current prefill workloads.
     def __init__(
         self,
         group: ProcessGroup,
         device: int | str | torch.device,
-        max_size=8192 * 1024,
+        max_size: int | None = None,
         max_all_gather_size=_DEFAULT_ALL_GATHER_MAX_SIZE,
         max_mnnvl_all_gather_size=None,
         max_reduce_scatter_size=_DEFAULT_REDUCE_SCATTER_MAX_SIZE,
@@ -162,6 +171,7 @@ class CustomAllreduce:
         self._capture_registered = register_graph_buffers
         self._ptr = 0
         self.disabled = True
+        self._rdna3 = False
         self.mnnvl_buffer = None
         self.mnnvl_handle = None
         self.mnnvl_peer_buffers: list[torch.Tensor] | None = None
@@ -182,6 +192,11 @@ class CustomAllreduce:
         self.mnnvl_multimem_rs_multicast_ptr = 0
         self.mnnvl_only = False
         self.batch_invariant = envs.VLLM_BATCH_INVARIANT
+
+        if max_size is None:
+            max_size = int(os.environ.get("VLLM_CUSTOM_AR_MAX_BYTES", 8192 * 1024))
+            if max_size <= 0 or max_size % 16:
+                max_size = 8192 * 1024
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -228,6 +243,11 @@ class CustomAllreduce:
         mnnvl_multimem_rs_supported = _supports_mnnvl_multimem_reduce_scatter(
             device, world_size
         )
+        # gfx11 uses the copy path because registered graph buffers resolve
+        # incorrect peer pointers during graph replay on this PCIe topology.
+        self._rdna3 = current_platform.is_rocm() and "gfx11" in getattr(
+            torch.cuda.get_device_properties(self.device), "gcnArchName", ""
+        )
         if not same_node and not _group_can_attempt_mnnvl(group, device):
             logger.warning(
                 "Custom collectives are disabled because this multi-node "
@@ -264,7 +284,7 @@ class CustomAllreduce:
             physical_device_ids = [t.item() for t in gather_list]
             assert current_platform.is_cuda_alike()
             fully_connected = current_platform.is_fully_connected(physical_device_ids)
-        if same_node and world_size > 2 and not fully_connected:
+        if same_node and world_size > 2 and not fully_connected and not self._rdna3:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
                 " more than two PCIe-only GPUs. To silence this warning, "
@@ -332,7 +352,10 @@ class CustomAllreduce:
         self.world_size = world_size
         self.fully_connected = fully_connected
         self._ptr = ops.init_custom_ar(
-            self.meta_ptrs, self.rank_data, rank, self.fully_connected
+            self.meta_ptrs,
+            self.rank_data,
+            rank,
+            self.fully_connected or self._rdna3,
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
         self._init_mnnvl_buffer(
@@ -505,8 +528,9 @@ class CustomAllreduce:
         if not is_weak_contiguous(inp):
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
-        if self.world_size == 2 or self.fully_connected:
+        # little performance improvement over NCCL -- except gfx11/PCIe
+        # here, where the tuned custom kernels beat RCCL over the P2P mesh.
+        if self.world_size == 2 or self.fully_connected or self._rdna3:
             return self.batch_invariant or inp_size < self.max_size
         return False
 
@@ -550,7 +574,12 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=self._capture_registered)
+                # On RDNA3 the registered graph-buffer path corrupts output
+                # (see __init__); use the copy path there. Elsewhere keep
+                # the zero-copy registered path.
+                return self.all_reduce(
+                    input, registered=self._capture_registered and not self._rdna3
+                )
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.

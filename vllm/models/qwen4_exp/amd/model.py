@@ -300,7 +300,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                ple_output,
+                self.ple.prefix,
             )
+            hidden_states = hidden_states + ple_output
 
         # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None and prev_injection is not None:

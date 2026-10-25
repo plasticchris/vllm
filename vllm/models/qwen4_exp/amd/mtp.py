@@ -13,6 +13,7 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
     multi stream [T, hc_count*H] (fed to the next draft step).
 """
 
+import os
 from collections.abc import Iterable
 
 import regex as re
@@ -23,6 +24,7 @@ from transformers import Qwen4ExpTextConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -58,6 +60,48 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+
+logger = init_logger(__name__)
+
+_DRAFT_HEAD_ENV = "VLLM_QWEN35_DRAFT_HEAD"
+
+
+def _draft_head_artifact() -> tuple[str, int] | None:
+    """Path and vocab size of a reduced draft head, or None if not configured.
+
+    Mirrors qwen3_5_mtp._draft_head_artifact. Shrinking the draft head trades
+    acceptance for bandwidth: the target still verifies every proposal, so a
+    token absent from the reduced vocabulary can never be drafted but can still
+    be emitted. Cost is acceptance, not correctness.
+    """
+    path = os.environ.get(_DRAFT_HEAD_ENV)
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise ValueError(f"{_DRAFT_HEAD_ENV}={path!r} does not exist")
+
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        keys = set(f.keys())
+        missing = {"lm_head.weight", "d2t"} - keys
+        if missing:
+            raise ValueError(f"{path!r} is missing {sorted(missing)}")
+        rows = f.get_slice("lm_head.weight").get_shape()[0]
+        declared = (f.metadata() or {}).get("draft_vocab_size")
+    if declared is not None and int(declared) != rows:
+        raise ValueError(
+            f"{path!r} declares draft_vocab_size={declared} but holds {rows} rows"
+        )
+    return path, rows
+
+
+def _iter_draft_head_weights(path: str) -> Iterable[tuple[str, torch.Tensor]]:
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        yield "lm_head.weight", f.get_tensor("lm_head.weight")
+        yield "draft_id_to_target_id", f.get_tensor("d2t")
 
 
 def _remap_ignored_layers(
@@ -420,19 +464,54 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
             prefix=maybe_prefix(prefix, "mtp"),
         )
 
-        if get_pp_group().is_last_rank:
+        artifact = _draft_head_artifact()
+        self.draft_head_path = None
+        draft_vocab_size = config.vocab_size
+        if artifact is not None:
+            self.draft_head_path, draft_vocab_size = artifact
             if config.tie_word_embeddings:
+                raise ValueError(
+                    "a reduced draft head cannot be used with tied word "
+                    "embeddings: the head is the embedding table"
+                )
+            if draft_vocab_size > config.vocab_size:
+                raise ValueError(
+                    f"draft vocab {draft_vocab_size} exceeds target vocab "
+                    f"{config.vocab_size}"
+                )
+
+        if get_pp_group().is_last_rank:
+            if config.tie_word_embeddings and draft_vocab_size == config.vocab_size:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
-                    config.vocab_size,
+                    draft_vocab_size,
                     config.hidden_size,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(draft_vocab_size)
+
+        if draft_vocab_size != config.vocab_size:
+            # Indexed by global draft id, so every rank holds the whole table.
+            self.draft_id_to_target_id = nn.Parameter(
+                torch.zeros(draft_vocab_size, dtype=torch.long),
+                requires_grad=False,
+            )
+            # Without this the eagle loader shares the target's full-vocab head
+            # with the draft, discarding this one and leaving d2t indexed by
+            # target ids.
+            self.has_own_lm_head = True
+            logger.info(
+                "Qwen4ExpMTP reduced draft head: vocab %d -> %d (%.0f%% of the "
+                "head's weight traffic), remapping via draft_id_to_target_id.",
+                config.vocab_size,
+                draft_vocab_size,
+                100.0 * draft_vocab_size / config.vocab_size,
+            )
+
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -465,12 +544,37 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_top_tokens(
+        self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+    ) -> torch.Tensor:
+        """Greedy draft tokens without gathering the full vocabulary.
+
+        With a reduced draft head, the local-argmax index is a draft-vocab id
+        that must be remapped to the target vocab via draft_id_to_target_id
+        (target_id = k + d2t[k]); mirrors LocalArgmaxMixin.get_top_tokens.
+        """
+        top = self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        d2t = getattr(self, "draft_id_to_target_id", None)
+        if d2t is not None:
+            top = top + d2t[top]
+        return top
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
             for name, weight in weights:
                 remapped_name = _remap_mtp_weight_name(name)
-                if remapped_name is not None:
-                    yield remapped_name, weight
+                if remapped_name is None:
+                    continue
+                if (
+                    self.draft_head_path is not None
+                    and remapped_name == "lm_head.weight"
+                ):
+                    # The artifact supersedes the checkpoint's full head.
+                    continue
+                yield remapped_name, weight
+
+            if self.draft_head_path is not None:
+                yield from _iter_draft_head_weights(self.draft_head_path)
 
         mapper = WeightsMapper(
             orig_to_new_substr={"hyper_connection_mixer.block_inject_weight": None}

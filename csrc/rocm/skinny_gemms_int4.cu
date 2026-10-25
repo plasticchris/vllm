@@ -1125,6 +1125,12 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
         WVSPLIT_INT4G_TILE(sYT, 4, _HAS_ZP) break;         \
       case 5:                                              \
         WVSPLIT_INT4G_TILE(sYT, 5, _HAS_ZP) break;         \
+      case 6:                                              \
+        WVSPLIT_INT4G_TILE(sYT, 6, _HAS_ZP) break;         \
+      case 7:                                              \
+        WVSPLIT_INT4G_TILE(sYT, 7, _HAS_ZP) break;         \
+      case 8:                                              \
+        WVSPLIT_INT4G_TILE(sYT, 8, _HAS_ZP) break;         \
       default:                                             \
         throw std::runtime_error("Unsupported N value: " + \
                                  std::to_string(N_in));    \

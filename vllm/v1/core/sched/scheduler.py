@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
+import hashlib
 import itertools
+import json
+import math
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -36,6 +42,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.leyline_splice import cancel_splice, commit_splice, prepare_splice
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -80,6 +87,61 @@ from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def clamp_mamba_subblock_to_block(block_size: int, requested: int) -> int:
+    """Largest divisor of ``block_size // 2`` that is <= ``requested``.
+
+    The Mamba cache block size shifts with the speculative depth: the
+    mamba conv state grows one row per draft token and the attention
+    block is padded to whole attention pages to hold the mamba page, so
+    a base tuned for one depth (e.g. 408 for the 816-token block at
+    K=4) stops dividing the block when the depth changes (the 800-token
+    block at flat K=2). Clamping to a divisor of block/2 keeps the base
+    and both adaptive tiers (base/2, base*2) dividing the cache block.
+    """
+    half = block_size // 2
+    for candidate in range(min(requested, half), 0, -1):
+        if half % candidate == 0:
+            return candidate
+    return 1
+
+
+class _TsvTrace:
+    def __init__(self, path: str | None, columns: str, flush_interval: float = 1):
+        self.path = path
+        self.columns = columns
+        self.file = None
+        self.flush_interval = flush_interval
+        self.last_flush = time.monotonic()
+
+    def write(self, *values: object) -> None:
+        if self.path is None:
+            return
+        if self.file is None:
+            self.file = open(self.path, "a")
+            self.file.write(f"# start={time.time():.6f}\t{self.columns}\n")
+        self.file.write(f"{time.time():.6f}\t" + "\t".join(map(str, values)) + "\n")
+        now = time.monotonic()
+        if now - self.last_flush >= self.flush_interval:
+            self.file.flush()
+            self.last_flush = now
+
+    def close(self) -> None:
+        if self.file is not None:
+            self.file.close()
+
+
+_spec_trace = _TsvTrace(
+    os.environ.get("VLLM_SPEC_TRACE"),
+    "timestamp\tstep\tbatch_size\trequest_id\tdrafted\taccepted",
+)
+_prefix_trace = _TsvTrace(
+    os.environ.get("VLLM_PREFIX_TRACE"),
+    "timestamp\tstep\trequest_id\tqueried\thits\tpreempted",
+)
+atexit.register(_spec_trace.close)
+atexit.register(_prefix_trace.close)
 
 
 class Scheduler(SchedulerInterface):
@@ -230,6 +292,12 @@ class Scheduler(SchedulerInterface):
         # scan or enqueued in a blocked status.
         self.deferred_waiting: set[Request] = set()
         self.running: list[Request] = []
+        self._decode_completion_times: dict[str, float] = {}
+        self._decode_gap_samples: deque[tuple[float, float]] = deque(maxlen=4096)
+        self._decode_gap_window_seconds = max(
+            self.scheduler_config.prefill_schedule_adaptive_reset_seconds or 30.0,
+            30.0,
+        )
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -312,7 +380,89 @@ class Scheduler(SchedulerInterface):
             self.num_lookahead_tokens > 0 and vllm_config.use_v2_model_runner
         )
         self.dynamic_sd_lookup: list[int] | None = None
+        self.long_context_threshold: int | None = None
+        self.long_context_num_spec_tokens: int | None = None
+        self.greedy_num_spec_tokens: int | None = None
+        self.profitability_aware_min_batch_size: int | None = None
+        self.profitability_min_samples = 0
+        self.profitability_exploration_interval = 32
+        self.profitability_hysteresis = 0.0
+        self.profitability_acceptance_threshold: float | None = None
+        self._spec_acceptance_history: deque[float] = deque(maxlen=8)
+        self._spec_acceptance_request_ids: frozenset[str] = frozenset()
+        self._spec_request_profitability_history: dict[int, deque[float]] = {
+            2: deque(maxlen=16),
+            3: deque(maxlen=16),
+        }
+        self._last_spec_profitability_acceptance_gated = False
+        self._spec_profitability_window = 16
+        self._spec_profitability_history: dict[
+            tuple[int, int], deque[float]
+        ] = {}
+        self._spec_profitability_steps: defaultdict[int, int] = defaultdict(int)
+        self._last_spec_profitability_batch_size: int | None = None
+        self._last_spec_profitability_selected_k: int | None = None
+        self._last_spec_profitability_exploration = False
+        self._last_spec_profitability_warm_start_batches: list[int] = []
+        self.profitability_state_path: str | None = None
+        self.profitability_state_save_interval = 16
+        self.profitability_state_ttl_seconds = 86400.0
+        self.profitability_state_half_life_seconds = 21600.0
+        self.profitability_neighbor_batch_radius = 2
+        self._profitability_state_fingerprint = ""
+        self._spec_profitability_unsaved = 0
+        self._spec_profitability_loaded_samples = 0
+        self._spec_profitability_state_age_seconds: float | None = None
         if speculative_config is not None:
+            self.long_context_threshold = speculative_config.long_context_threshold
+            self.long_context_num_spec_tokens = (
+                speculative_config.long_context_num_speculative_tokens
+            )
+            self.greedy_num_spec_tokens = speculative_config.greedy_num_speculative_tokens
+            self.profitability_aware_min_batch_size = (
+                speculative_config.profitability_aware_min_batch_size
+            )
+            self.profitability_min_samples = (
+                speculative_config.profitability_min_samples
+            )
+            self.profitability_exploration_interval = (
+                speculative_config.profitability_exploration_interval
+            )
+            self.profitability_hysteresis = (
+                speculative_config.profitability_hysteresis
+            )
+            self.profitability_acceptance_threshold = (
+                speculative_config.profitability_acceptance_threshold
+            )
+            self._spec_acceptance_history = deque(
+                maxlen=speculative_config.profitability_acceptance_window
+            )
+            self._spec_profitability_window = speculative_config.profitability_window
+            self._spec_request_profitability_history = {
+                2: deque(maxlen=self._spec_profitability_window),
+                3: deque(maxlen=self._spec_profitability_window),
+            }
+            self.profitability_state_path = speculative_config.profitability_state_path
+            self.profitability_state_save_interval = (
+                speculative_config.profitability_state_save_interval
+            )
+            self.profitability_state_ttl_seconds = (
+                speculative_config.profitability_state_ttl_seconds
+            )
+            self.profitability_state_half_life_seconds = (
+                speculative_config.profitability_state_half_life_seconds
+            )
+            self.profitability_neighbor_batch_radius = (
+                speculative_config.profitability_neighbor_batch_radius
+            )
+            self._profitability_state_fingerprint = (
+                self._build_spec_profitability_fingerprint(
+                    vllm_config, speculative_config
+                )
+            )
+            self._load_spec_profitability_state()
+            if self.profitability_state_path:
+                atexit.register(self._save_spec_profitability_state)
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -374,9 +524,9 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
-        # DP prefill balancing: Flag to track whether the last cadence-aligned
-        # prefill batch fully drained the waiting queue. Prefill throttling
-        # is disabled in this case.
+        # Flag to track whether the last cadence-aligned prefill batch exhausted
+        # the token budget before draining the waiting queue. Prefill throttling
+        # backs off in this case so sustained admission can keep up.
         self.prefill_capacity_bound = False
         # The DP engine core drives this cadence from a counter shared across
         # ranks; an engine without one never throttles, so apply the interval
@@ -408,6 +558,9 @@ class Scheduler(SchedulerInterface):
         # schedule() call including empty ones, so it would expire the hold
         # early; it keeps its own meaning (next_decode_eligible_step).
         self.num_executed_steps = 0
+        self._prefill_rr_cursor = 0
+        self._idle_prefill_rr_cursor = 0
+        self._short_prefill_priority_streak = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -427,10 +580,35 @@ class Scheduler(SchedulerInterface):
             ),
             None,
         )
-        self.mamba_has_prefill_checkpoint_blocks = self.has_mamba_layers and all(
-            not isinstance(group.kv_cache_spec, MambaSpec)
-            or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
-            for group in kv_cache_config.kv_cache_groups
+        requested_subblock = self.scheduler_config.mamba_prefill_subblock_tokens
+        if (
+            requested_subblock is not None
+            and self.block_size % requested_subblock != 0
+        ):
+            # The block size shifts with the speculative depth (see
+            # clamp_mamba_subblock_to_block), so a launcher-tuned base can
+            # stop dividing it. Clamp instead of dead-ending startup.
+            self.mamba_prefill_subblock_tokens = clamp_mamba_subblock_to_block(
+                self.block_size, requested_subblock
+            )
+            logger.warning(
+                "mamba_prefill_subblock_tokens=%d does not divide the Mamba "
+                "cache block %d (it shifts with the speculative depth); "
+                "clamping to %d",
+                requested_subblock,
+                self.block_size,
+                self.mamba_prefill_subblock_tokens,
+            )
+        else:
+            self.mamba_prefill_subblock_tokens = requested_subblock
+        self.mamba_has_prefill_checkpoint_blocks = (
+            self.has_mamba_layers
+            and not self.use_eagle
+            and all(
+                not isinstance(group.kv_cache_spec, MambaSpec)
+                or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+                for group in kv_cache_config.kv_cache_groups
+            )
         )
         # Fine-grained hits reuse the prompt's hash-aligned Mamba checkpoint.
         # Split there only if the backend cannot save it within the final chunk.
@@ -530,14 +708,14 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        subblock_tokens: int | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
-        In "align" cache mode reusable SSM states are materialized at block
-        boundaries, plus mandatory early stops (the prompt's partial-tail hash
-        boundary, a detected shared-prefix junction). If a block is larger
-        than the configured prefill chunk limit, intermediate chunks keep
-        private running state until they reach the next cacheable position.
+        In "align" mode, reusable states are materialized at block boundaries
+        and mandatory prefix junctions. Internal checkpoints permit arbitrary
+        chunks; an explicit sub-block size retains private running state while
+        preserving aligned publication boundaries.
         """
         start = (
             request.num_computed_tokens
@@ -550,7 +728,16 @@ class Scheduler(SchedulerInterface):
         if start >= prefill_end:
             return num_new_tokens
 
-        block_size = self.cache_config.block_size
+        block_size = self.block_size
+        plan = getattr(request, "leyline_splice_plan", None)
+        if plan is not None and start < plan.middle_end:
+            # Advance up to middle_end in normal chunks while still stopping at
+            # any full Mamba block boundary inside [start, middle_end) so APC
+            # prefix states are cached on the way to the splice point.
+            next_b = (start // block_size + 1) * block_size
+            if start < next_b < plan.middle_end:
+                return min(num_new_tokens, next_b - start)
+            return min(num_new_tokens, plan.middle_end - start)
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
@@ -583,12 +770,16 @@ class Scheduler(SchedulerInterface):
         )
         if use_internal_checkpoint:
             last_cache_position = 0
-        # Invariant: slot p holds the state after exactly (p + 1) * block_size
-        # tokens. State is written at chunk ends, so chunk ends must be block
-        # aligned. Exempt: the prompt's last chunk, whose slot decode advances
-        # to the boundary. A block too wide for one chunk advances sub-block
-        # and re-aligns at the next boundary.
-        if end < prefill_end:
+
+        subblock_end = start + min(subblock_tokens or num_new_tokens, num_new_tokens)
+        use_partial_state = (
+            subblock_tokens is not None
+            and subblock_end < prefill_end
+            and subblock_end % block_size != 0
+        )
+        if use_partial_state:
+            end = subblock_end
+        elif end < prefill_end and not use_internal_checkpoint:
             max_prefill_tokens = self.max_num_scheduled_tokens
             long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
             if long_prefill_threshold > 0:
@@ -620,11 +811,8 @@ class Scheduler(SchedulerInterface):
             else block_floored
         )
         stops = (
-            # Same invariant: a chunk starting mid-block stops at the boundary
-            # rather than running past it.
-            next_block_boundary
-            if start % block_size != 0 and not use_internal_checkpoint
-            else 0,
+            # A chunk starting mid-block must stop at the next boundary.
+            next_block_boundary if start % block_size != 0 else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
             # Stop at the prompt checkpoint unless the backend saves it internally.
@@ -638,6 +826,415 @@ class Scheduler(SchedulerInterface):
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
+
+    def _fair_prefill_selection(
+        self,
+        candidate_ids: list[str],
+        budget: int,
+        minimum_chunk: int,
+        priority_id: str | None = None,
+    ) -> tuple[set[str], int]:
+        max_selected = max(1, budget // minimum_chunk)
+        count = min(len(candidate_ids), max_selected)
+        if priority_id is not None and priority_id in candidate_ids:
+            other_ids = [item for item in candidate_ids if item != priority_id]
+            selected = {priority_id}
+            if other_ids and count > 1:
+                start = self._prefill_rr_cursor % len(other_ids)
+                selected.update(
+                    other_ids[(start + offset) % len(other_ids)]
+                    for offset in range(count - 1)
+                )
+                self._prefill_rr_cursor = (start + count - 1) % len(other_ids)
+        else:
+            start = self._prefill_rr_cursor % len(candidate_ids)
+            selected = {
+                candidate_ids[(start + offset) % len(candidate_ids)]
+                for offset in range(count)
+            }
+            self._prefill_rr_cursor = (start + count) % len(candidate_ids)
+        return selected, max(1, budget // count)
+
+    def _idle_prefill_block_budgets(
+        self,
+        candidate_ids: list[str],
+        token_budget: int,
+        block_size: int,
+        max_chunk: int,
+        priority_id: str | None = None,
+    ) -> dict[str, int]:
+        """Distribute whole idle-prefill blocks without wasting the remainder."""
+        if not candidate_ids or token_budget < block_size:
+            return {}
+        total_blocks = token_budget // block_size
+        max_blocks = max(1, max_chunk // block_size)
+        if priority_id is not None and priority_id in candidate_ids:
+            other_ids = [item for item in candidate_ids if item != priority_id]
+            start = self._idle_prefill_rr_cursor % max(len(other_ids), 1)
+            ordered = [priority_id] + [
+                other_ids[(start + offset) % len(other_ids)]
+                for offset in range(len(other_ids))
+            ]
+        else:
+            start = self._idle_prefill_rr_cursor % len(candidate_ids)
+            ordered = [
+                candidate_ids[(start + offset) % len(candidate_ids)]
+                for offset in range(len(candidate_ids))
+            ]
+        selected = ordered[: min(len(ordered), total_blocks)]
+        budgets = {request_id: block_size for request_id in selected}
+        remaining = total_blocks - len(selected)
+        extra_blocks = 0
+        while remaining > 0:
+            made_progress = False
+            for request_id in selected:
+                if budgets[request_id] // block_size >= max_blocks:
+                    continue
+                budgets[request_id] += block_size
+                remaining -= 1
+                extra_blocks += 1
+                made_progress = True
+                if remaining == 0:
+                    break
+            if not made_progress:
+                break
+        advance = extra_blocks if extra_blocks else len(selected)
+        rotation_size = (
+            len(candidate_ids) - 1
+            if priority_id is not None and priority_id in candidate_ids
+            else len(candidate_ids)
+        )
+        if rotation_size:
+            self._idle_prefill_rr_cursor = (
+                start + max(advance - int(priority_id is not None), 1)
+            ) % rotation_size
+        return budgets
+
+    def _estimated_uncached_prefill_tokens(self, request: Request) -> int:
+        if request.num_computed_tokens > 0:
+            return max(request.num_prompt_tokens - request.num_computed_tokens, 0)
+        if (
+            not self.kv_cache_manager.enable_caching
+            or request.skip_reading_prefix_cache
+        ):
+            return request.num_prompt_tokens
+        try:
+            _, cached_tokens, _ = (
+                self.kv_cache_manager.coordinator.find_longest_cache_hit(
+                    request.block_hashes, request.num_tokens - 1
+                )
+            )
+        except Exception:
+            cached_tokens = 0
+        return max(request.num_prompt_tokens - cached_tokens, 0)
+
+    def _select_short_waiting_prefill(self) -> str | None:
+        threshold = self.scheduler_config.short_prefill_priority_token_threshold
+        if threshold is None:
+            return None
+        candidates: list[tuple[Request, RequestQueue]] = []
+        long_prefills: list[Request] = [
+            request
+            for request in self.running
+            if request.is_prefill_chunk
+            and self._estimated_uncached_prefill_tokens(request) > threshold
+        ]
+        for request_queue in (self.skipped_waiting, self.waiting):
+            for request in request_queue:
+                is_prefill = request.num_computed_tokens < request.num_tokens - 1
+                if not is_prefill or request.status != RequestStatus.WAITING:
+                    continue
+                if self._estimated_uncached_prefill_tokens(request) <= threshold:
+                    candidates.append((request, request_queue))
+                else:
+                    long_prefills.append(request)
+        if not candidates:
+            self._short_prefill_priority_streak = 0
+            return None
+
+        max_burst = self.scheduler_config.short_prefill_priority_max_burst
+        oldest_long_age = max(
+            (time.time() - request.arrival_time for request in long_prefills),
+            default=0.0,
+        )
+        if oldest_long_age >= self.scheduler_config.short_prefill_priority_aging_seconds:
+            max_burst = 1
+        if long_prefills and self._short_prefill_priority_streak >= max_burst:
+            self._short_prefill_priority_streak = 0
+            return None
+
+        request, request_queue = min(
+            candidates,
+            key=lambda item: (
+                self._estimated_uncached_prefill_tokens(item[0]),
+                item[0].arrival_time,
+            ),
+        )
+        request_queue.remove_request(request)
+        request_queue.prepend_request(request)
+        self._short_prefill_priority_streak += 1
+        return request.request_id
+
+    @staticmethod
+    def _build_spec_profitability_fingerprint(
+        vllm_config: VllmConfig, speculative_config: Any
+    ) -> str:
+        try:
+            from vllm.platforms import current_platform
+
+            device_name = current_platform.get_device_name()
+        except Exception:
+            device_name = "unknown"
+        tunable_path = os.environ.get("PYTORCH_TUNABLEOP_FILENAME")
+        tunable_digest = None
+        if tunable_path:
+            path = Path(tunable_path)
+            candidates = [path] if path.is_file() else sorted(
+                path.parent.glob(f"{path.stem}[0-9]*{path.suffix}")
+            )
+            if candidates:
+                digest = hashlib.sha256()
+                for candidate in candidates:
+                    digest.update(candidate.name.encode())
+                    digest.update(candidate.read_bytes())
+                tunable_digest = digest.hexdigest()
+        identity = {
+            "model": vllm_config.model_config.compute_hash(),
+            "device": device_name,
+            "tensor_parallel_size": vllm_config.parallel_config.tensor_parallel_size,
+            "num_speculative_tokens": speculative_config.num_speculative_tokens,
+            "batch_schedule": speculative_config.num_speculative_tokens_per_batch_size,
+            "profitability_window": speculative_config.profitability_window,
+            "profitability_acceptance_threshold": (
+                speculative_config.profitability_acceptance_threshold
+            ),
+            "profitability_acceptance_window": (
+                speculative_config.profitability_acceptance_window
+            ),
+            "mamba_prefill_subblock_tokens": (
+                vllm_config.scheduler_config.mamba_prefill_subblock_tokens
+            ),
+            "tunable_ops": tunable_digest,
+        }
+        payload = json.dumps(identity, sort_keys=True, default=str).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    def _load_spec_profitability_state(self) -> None:
+        path = self.profitability_state_path
+        if not path:
+            return
+        try:
+            with open(path) as state_file:
+                state = json.load(state_file)
+            if state.get("version") != 2:
+                raise ValueError("unsupported state version")
+            if state.get("fingerprint") != self._profitability_state_fingerprint:
+                raise ValueError("state fingerprint does not match this runtime")
+            saved_at = float(state["saved_at"])
+            state_age = max(time.time() - saved_at, 0.0)
+            if state_age > self.profitability_state_ttl_seconds:
+                raise ValueError("state has expired")
+            loaded_history: dict[tuple[int, int], deque[float]] = {}
+            loaded_steps: dict[int, int] = {}
+            loaded_samples = 0
+            for key, values in state.get("history", {}).items():
+                batch_size, k = (int(part) for part in key.split(":"))
+                valid = [
+                    float(value)
+                    for value in values
+                    if isinstance(value, (int, float)) and value > 0
+                ]
+                if valid:
+                    retention = 0.5 ** (
+                        state_age / self.profitability_state_half_life_seconds
+                    )
+                    keep = max(1, math.ceil(len(valid) * retention))
+                    history = deque(
+                        valid[-keep:], maxlen=self._spec_profitability_window
+                    )
+                    loaded_history[(batch_size, k)] = history
+                    loaded_samples += len(history)
+            for key, value in state.get("steps", {}).items():
+                if isinstance(value, int) and value >= 0:
+                    loaded_steps[int(key)] = value
+            self._spec_profitability_history.update(loaded_history)
+            self._spec_profitability_steps.update(loaded_steps)
+            self._spec_profitability_loaded_samples = loaded_samples
+            self._spec_profitability_state_age_seconds = state_age
+            logger.info(
+                "Loaded %d speculative profitability samples from %s",
+                loaded_samples,
+                path,
+            )
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.warning(
+                "Ignoring invalid speculative profitability state at %s",
+                path,
+                exc_info=True,
+            )
+
+    def _save_spec_profitability_state(self) -> None:
+        path = self.profitability_state_path
+        if not path or not self._spec_profitability_history:
+            return
+        state = {
+            "version": 2,
+            "fingerprint": self._profitability_state_fingerprint,
+            "saved_at": time.time(),
+            "history": {
+                f"{batch_size}:{k}": list(history)
+                for (batch_size, k), history in sorted(
+                    self._spec_profitability_history.items()
+                )
+            },
+            "steps": {
+                str(batch_size): steps
+                for batch_size, steps in sorted(
+                    self._spec_profitability_steps.items()
+                )
+            },
+        }
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temporary = f"{path}.tmp.{os.getpid()}"
+        try:
+            with open(temporary, "w") as state_file:
+                json.dump(state, state_file, sort_keys=True)
+                state_file.write("\n")
+            os.replace(temporary, path)
+            self._spec_profitability_unsaved = 0
+        except Exception:
+            logger.warning(
+                "Could not persist speculative profitability state to %s",
+                path,
+                exc_info=True,
+            )
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def _profitability_history_for_batch(
+        self, batch_size: int, k: int
+    ) -> tuple[list[float], list[int]]:
+        exact = list(self._spec_profitability_history.get((batch_size, k), ()))
+        if len(exact) >= self.profitability_min_samples:
+            return exact, []
+        radius = self.profitability_neighbor_batch_radius
+        neighbors = sorted(
+            (
+                (abs(other_batch - batch_size), other_batch, list(history))
+                for (other_batch, other_k), history in (
+                    self._spec_profitability_history.items()
+                )
+                if other_k == k
+                and other_batch != batch_size
+                and abs(other_batch - batch_size) <= radius
+                and history
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        combined = exact.copy()
+        sources: list[int] = []
+        for _, other_batch, history in neighbors:
+            combined.extend(history)
+            sources.append(other_batch)
+            if len(combined) >= self.profitability_min_samples:
+                break
+        return combined[-self._spec_profitability_window :], sources
+
+    def _profitability_adjusted_spec_tokens(
+        self,
+        batch_size: int,
+        base_tokens: int,
+        request_ids: Iterable[str] = (),
+    ) -> int:
+        selected = base_tokens
+        exploration = False
+        acceptance_gated = False
+        request_signature = frozenset(request_ids)
+        if request_signature != self._spec_acceptance_request_ids:
+            self._spec_acceptance_request_ids = request_signature
+            self._spec_acceptance_history.clear()
+            for history in self._spec_request_profitability_history.values():
+                history.clear()
+
+        minimum_batch = self.profitability_aware_min_batch_size
+        if (
+            minimum_batch is not None
+            and batch_size >= minimum_batch
+            and base_tokens == 3
+        ):
+            lower_tokens = 2
+            self._spec_profitability_steps[batch_size] += 1
+            step = self._spec_profitability_steps[batch_size]
+            if request_signature:
+                # Generated content strongly affects draft acceptance. Re-sample
+                # both depths for each active request instead of inheriting a
+                # decision made by unrelated content. Global/persisted history
+                # remains the warm-start path for callers without request IDs.
+                base_history = list(
+                    self._spec_request_profitability_history[base_tokens]
+                )
+                lower_history = list(
+                    self._spec_request_profitability_history[lower_tokens]
+                )
+                base_sources = lower_sources = []
+            else:
+                base_history, base_sources = self._profitability_history_for_batch(
+                    batch_size, base_tokens
+                )
+                lower_history, lower_sources = self._profitability_history_for_batch(
+                    batch_size, lower_tokens
+                )
+            self._last_spec_profitability_warm_start_batches = sorted(
+                set(base_sources + lower_sources)
+            )
+            if len(lower_history) < self.profitability_min_samples:
+                selected = lower_tokens
+            elif len(base_history) < self.profitability_min_samples:
+                selected = base_tokens
+            else:
+                base_rate = sum(base_history) / len(base_history)
+                lower_rate = sum(lower_history) / len(lower_history)
+                selected = (
+                    lower_tokens
+                    if lower_rate
+                    > base_rate * (1.0 + self.profitability_hysteresis)
+                    else base_tokens
+                )
+
+            threshold = self.profitability_acceptance_threshold
+            if (
+                threshold is not None
+                and len(self._spec_acceptance_history)
+                >= self.profitability_min_samples
+                and sum(self._spec_acceptance_history)
+                / len(self._spec_acceptance_history)
+                < threshold
+            ):
+                selected = lower_tokens
+                acceptance_gated = True
+
+            # Low-acceptance K3 probes create visible latency spikes because
+            # they run an extra draft pass precisely when most draft work is
+            # discarded. Probe less often while acceptance-gated, but retain a
+            # bounded recovery path if the generated content becomes easier.
+            exploration_interval = self.profitability_exploration_interval
+            if acceptance_gated:
+                exploration_interval *= 32
+            if step % exploration_interval == 0:
+                selected = base_tokens if selected == lower_tokens else lower_tokens
+                exploration = True
+                acceptance_gated = False
+        self._last_spec_profitability_batch_size = batch_size
+        self._last_spec_profitability_selected_k = selected
+        self._last_spec_profitability_exploration = exploration
+        self._last_spec_profitability_acceptance_gated = acceptance_gated
+        return selected
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -674,7 +1271,13 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def schedule(
+        self,
+        throttle_prefills: bool = False,
+        decode_active_prefill_token_budget: int | None = None,
+        mamba_prefill_subblock_tokens: int | None = None,
+        eb_forced_prefill_id: str | None = None,
+    ) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -715,6 +1318,7 @@ class Scheduler(SchedulerInterface):
         # Whether a waiting request was admitted with prompt left to compute.
         # Separate from `prefill_scheduled`, which covers only the running loop.
         prefill_admitted = False
+        scheduled_prefill_tokens = 0
         # Whether any scheduled request has a synchronous connector KV load.
         has_sync_kv_loads = False
 
@@ -723,11 +1327,151 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # Protect active decodes with both cadence and an aggregate prefill cap.
+        active_decode = any(not r.is_prefill_chunk for r in self.running)
+        active_mamba_subblock = (
+            mamba_prefill_subblock_tokens
+            if mamba_prefill_subblock_tokens is not None
+            else self.mamba_prefill_subblock_tokens
+        )
+        if (
+            active_mamba_subblock is not None
+            and self.block_size % active_mamba_subblock != 0
+        ):
+            raise ValueError(
+                "dynamic Mamba prefill subblock must divide cache block"
+            )
         defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+            throttle_prefills and not self.prefill_capacity_bound and active_decode
+        )
+        priority_prefill_id = (
+            None if defer_prefills else self._select_short_waiting_prefill()
+        )
+        # P5-1 (eb force-serve progress guarantee): the engine passes the
+        # aged prefill id whose wait reached k on a force-serve step. It
+        # MUST be scheduled this step: it is selected unconditionally
+        # (overriding the fairness priority, which is a nudge) and the
+        # waiting loop skips past unselected prefills ahead of it instead
+        # of breaking the whole waiting phase (the P3-4 era-A stall: an
+        # unselected head-of-line cold prefill kept breaking the loop, so
+        # a force-serve step scheduled nothing and the wait grew
+        # unbounded past k). It is deliberately NOT routed through
+        # ``priority_prefill_id`` itself: that var also drives the
+        # running-chunk short-priority clause (whose invariant is
+        # "set implies threshold configured"), and the forced id is a
+        # waiting request, not a running one. Only applies when prefills
+        # are admitted this step (never while deferring); overlap never
+        # passes one (its attr is always None, so every condition below
+        # degenerates to the pre-P5-1 form).
+        forced_prefill_pending = False
+        if eb_forced_prefill_id is not None and not defer_prefills:
+            forced_prefill_pending = True
+        configured_prefill_budget = (
+            self.scheduler_config.decode_active_prefill_token_budget
+            if decode_active_prefill_token_budget is None
+            else decode_active_prefill_token_budget
+        )
+        prefill_token_budget = configured_prefill_budget if active_decode else None
+        selected_prefills: set[str] | None = None
+        prefill_request_budget: int | None = None
+        if prefill_token_budget is not None and not defer_prefills:
+            candidate_ids = (
+                [priority_prefill_id] if priority_prefill_id is not None else []
+            )
+            if forced_prefill_pending and (
+                eb_forced_prefill_id not in candidate_ids
+            ):
+                # P5-1: the forced id must be selectable even if the
+                # admission-slot slice of the waiting queue left it out.
+                candidate_ids.insert(0, eb_forced_prefill_id)
+            candidate_ids.extend(
+                request.request_id
+                for request in self.running
+                if request.is_prefill_chunk
+                and request.request_id != priority_prefill_id
+            )
+            available_slots = max(
+                self.max_num_running_reqs
+                - len(self.running)
+                - self.num_waiting_for_streaming_input,
+                0,
+            )
+            waiting = list(self.skipped_waiting) + list(self.waiting)
+            if self.policy == SchedulingPolicy.PRIORITY:
+                waiting.sort()
+            candidate_ids.extend(
+                request.request_id
+                for request in waiting[:available_slots]
+                if request.num_computed_tokens < request.num_tokens - 1
+                and request.request_id != priority_prefill_id
+            )
+            if candidate_ids:
+                minimum_chunk = (
+                    self.cache_config.block_size
+                    if self.need_mamba_block_aligned_split
+                    else 1
+                )
+                # P5-1: the forced id is the unconditional selection
+                # priority on a force-serve step (it wins over the
+                # short-waiting fairness priority, which only nudges).
+                selection_priority = (
+                    eb_forced_prefill_id
+                    if forced_prefill_pending
+                    else priority_prefill_id
+                )
+                selected_prefills, prefill_request_budget = (
+                    self._fair_prefill_selection(
+                        candidate_ids,
+                        prefill_token_budget,
+                        minimum_chunk,
+                        priority_id=selection_priority,
+                    )
+                )
+
+        long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+        idle_prefill_budgets: dict[str, int] | None = None
+        if (
+            active_decode
+            and self.scheduler_config.decode_active_long_prefill_token_threshold
+            is not None
+        ):
+            long_prefill_threshold = (
+                self.scheduler_config.decode_active_long_prefill_token_threshold
+            )
+        elif (
+            not active_decode
+            and long_prefill_threshold > 0
+            and self.need_mamba_block_aligned_split
+        ):
+            available_slots = max(
+                self.max_num_running_reqs
+                - len(self.running)
+                - self.num_waiting_for_streaming_input,
+                0,
+            )
+            waiting = list(self.skipped_waiting) + list(self.waiting)
+            candidate_ids = (
+                [priority_prefill_id] if priority_prefill_id is not None else []
+            )
+            candidate_ids.extend(
+                request.request_id
+                for request in self.running
+                if request.is_prefill_chunk
+                and request.request_id != priority_prefill_id
+            )
+            candidate_ids.extend(
+                request.request_id
+                for request in waiting[:available_slots]
+                if request.num_computed_tokens < request.num_tokens - 1
+                and request.request_id != priority_prefill_id
+            )
+            idle_prefill_budgets = self._idle_prefill_block_budgets(
+                candidate_ids,
+                token_budget,
+                self.block_size,
+                long_prefill_threshold,
+                priority_id=priority_prefill_id,
+            )
 
         # `long_prefill_token_threshold` exists to stop a long prefill from
         # starving other requests of the token budget. When it is the only
@@ -797,9 +1541,22 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            if defer_prefills and request.is_prefill_chunk:
-                # DP prefill balancing: defer this in-progress prefill chunk to a
-                # cadence-aligned step; decodes still run to fill this step.
+            if request.is_prefill_chunk and (
+                (
+                    priority_prefill_id is not None
+                    and self._estimated_uncached_prefill_tokens(request)
+                    > self.scheduler_config.short_prefill_priority_token_threshold
+                )
+                or defer_prefills
+                or (
+                    selected_prefills is not None
+                    and request.request_id not in selected_prefills
+                )
+                or (
+                    idle_prefill_budgets is not None
+                    and request.request_id not in idle_prefill_budgets
+                )
+            ):
                 req_index += 1
                 continue
 
@@ -813,6 +1570,13 @@ class Scheduler(SchedulerInterface):
             ):
                 req_index += 1
                 continue
+            splice_plan = getattr(request, "leyline_splice_plan", None)
+            splice_jump = (
+                splice_plan is not None
+                and request.num_computed_tokens == splice_plan.middle_end
+            )
+            if splice_jump:
+                request.num_computed_tokens = splice_plan.target_end
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -821,6 +1585,18 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            if request.is_prefill_chunk and prefill_token_budget is not None:
+                num_new_tokens = min(
+                    num_new_tokens,
+                    prefill_token_budget,
+                    prefill_request_budget or prefill_token_budget,
+                )
+            if 0 < long_prefill_threshold < num_new_tokens:
+                num_new_tokens = long_prefill_threshold
+            if request.is_prefill_chunk and idle_prefill_budgets is not None:
+                num_new_tokens = min(
+                    num_new_tokens, idle_prefill_budgets[request.request_id]
+                )
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -860,13 +1636,28 @@ class Scheduler(SchedulerInterface):
                     shift_computed_tokens=self.num_prefill_lookahead,
                 )
 
-            # Multi-module MTP: avoid ending a prefill chunk within
-            # num_prefill_lookahead of the prefill end.
+            # Keep multi-module MTP prefill inputs valid, then re-apply Mamba
+            # alignment after any encoder-budget clipping.
             num_new_tokens = self._reserve_prefill_lookahead(
                 request, request.num_computed_tokens, num_new_tokens
             )
+            if self.need_mamba_block_aligned_split:
+                num_new_tokens = self._mamba_block_aligned_split(
+                    request,
+                    num_new_tokens,
+                    subblock_tokens=(
+                        active_mamba_subblock if active_decode else None
+                    ),
+                )
 
+            if splice_plan is not None and not splice_jump:
+                num_new_tokens = min(
+                    num_new_tokens,
+                    max(0, splice_plan.middle_end - request.num_computed_tokens),
+                )
             if num_new_tokens == 0:
+                if splice_jump:
+                    request.num_computed_tokens = splice_plan.middle_end
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -928,9 +1719,16 @@ class Scheduler(SchedulerInterface):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
-                            restored = num_scheduled_tokens.pop(preempted_req_id)
-                            token_budget += restored
-                            input_budget += restored + draft_slots
+                            restored_tokens = num_scheduled_tokens.pop(
+                                preempted_req_id
+                            )
+                            token_budget += restored_tokens
+                            input_budget += restored_tokens + draft_slots
+                            if (
+                                prefill_token_budget is not None
+                                and preempted_req.is_prefill_chunk
+                            ):
+                                prefill_token_budget += restored_tokens
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -961,13 +1759,25 @@ class Scheduler(SchedulerInterface):
                 # Cannot schedule this request.
                 break
 
+            if splice_jump and not commit_splice(
+                self.kv_cache_manager, request, num_new_tokens
+            ):
+                self.running.remove(request)
+                self._preempt_request(request, scheduled_timestamp)
+                preempted_reqs.append(request)
+                break
+
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            if request.is_prefill_chunk:
+                scheduled_prefill_tokens += num_new_tokens
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            if request.is_prefill_chunk and prefill_token_budget is not None:
+                prefill_token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
@@ -1240,6 +2050,7 @@ class Scheduler(SchedulerInterface):
                 duplicate_encoder_inputs = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                is_waiting_prefill = num_computed_tokens < request.num_tokens - 1
 
                 # SWA bounded replay: recompute the tail of the hit without
                 # rewriting its cached KV. An async load replays once the KV
@@ -1250,11 +2061,48 @@ class Scheduler(SchedulerInterface):
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
-                elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
-                    # DP prefill balancing: defer this step's local prefill
-                    # compute to a cadence-aligned step.
-                    break
+                elif is_waiting_prefill and (
+                    defer_prefills
+                    or (
+                        selected_prefills is not None
+                        and request_id not in selected_prefills
+                    )
+                    or (
+                        idle_prefill_budgets is not None
+                        and request_id not in idle_prefill_budgets
+                    )
+                ):
+                    if defer_prefills or not forced_prefill_pending:
+                        # Everything deferred this step, or no forced
+                        # prefill to reach: pre-P5-1 head-of-line break
+                        # (unchanged overlap/eb-defer semantics).
+                        break
+                    # The forced (aged) prefill is behind this unselected
+                    # one in the queue: skip past it — re-queued at the
+                    # front for the next step — instead of stalling the
+                    # whole waiting phase on it (P3-4 era-A: 154-k cold
+                    # head-of-line held the forced waiter 117–140 s at
+                    # kvpct ~30% because every force-serve step broke
+                    # here and scheduled nothing).
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
                 else:
+                    hybrid_advance = 0
+                    if (
+                        self.use_v2_model_runner
+                        and not self.use_pp
+                        and self.dcp_world_size == self.pcp_world_size == 1
+                        and not load_kv_async
+                        and num_external_computed_tokens == 0
+                    ):
+                        plan = prepare_splice(self.kv_cache_manager, request)
+                        if plan is not None and num_computed_tokens > plan.middle_end:
+                            cancel_splice(self.kv_cache_manager, request)
+                            plan = None
+                        if plan is not None and num_computed_tokens == plan.middle_end:
+                            hybrid_advance = plan.target_end - num_computed_tokens
+                            num_computed_tokens = plan.target_end
                     request_token_budget = min(token_budget, input_budget - draft_slots)
                     if did_prefix_cache_lookup:
                         # Fresh admission: local and/or sync external hit.
@@ -1294,6 +2142,20 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    if 0 < long_prefill_threshold < num_new_tokens:
+                        num_new_tokens = long_prefill_threshold
+                    if is_waiting_prefill and idle_prefill_budgets is not None:
+                        num_new_tokens = min(
+                            num_new_tokens, idle_prefill_budgets[request_id]
+                        )
+                    if is_waiting_prefill and prefill_token_budget is not None:
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            prefill_token_budget,
+                            prefill_request_budget or prefill_token_budget,
+                        )
+                        if num_new_tokens == 0:
+                            break
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1315,7 +2177,7 @@ class Scheduler(SchedulerInterface):
                             request,
                             num_new_tokens,
                             num_new_local_computed_tokens,
-                            num_external_computed_tokens,
+                            num_external_computed_tokens + hybrid_advance,
                         )
                         if num_new_tokens == 0:
                             break
@@ -1348,18 +2210,36 @@ class Scheduler(SchedulerInterface):
                             shift_computed_tokens=self.num_prefill_lookahead,
                         )
 
-                    # Multi-module MTP: avoid ending a prefill chunk within
-                    # num_prefill_lookahead of the prefill end.
+                    # Keep multi-module MTP prefill inputs valid, then apply
+                    # the fork's decode-active Mamba sub-block policy.
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
                     )
+                    if self.need_mamba_block_aligned_split:
+                        num_new_tokens = self._mamba_block_aligned_split(
+                            request,
+                            num_new_tokens,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens + hybrid_advance,
+                            subblock_tokens=(
+                                active_mamba_subblock if active_decode else None
+                            ),
+                        )
 
+                    plan = getattr(request, "leyline_splice_plan", None)
+                    if plan is not None and not hybrid_advance:
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            max(0, plan.middle_end - num_computed_tokens),
+                        )
                     if num_new_tokens == 0:
                         # The request cannot be scheduled. Requeue it so it does
                         # not stall the requests behind it.
                         skip_request(request_queue)
                         continue
 
+                if load_kv_async:
+                    hybrid_advance = 0
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
@@ -1401,7 +2281,9 @@ class Scheduler(SchedulerInterface):
                     num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
+                    num_external_computed_tokens=(
+                        num_external_computed_tokens + hybrid_advance
+                    ),
                     delay_cache_blocks=load_kv_async,
                     skip_zeroing_group_ids=(
                         self.connector.get_loaded_kv_cache_group_ids(request)
@@ -1421,6 +2303,12 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    break
+
+                if hybrid_advance and not commit_splice(
+                    self.kv_cache_manager, request, num_new_tokens
+                ):
+                    self.kv_cache_manager.free(request)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1459,6 +2347,14 @@ class Scheduler(SchedulerInterface):
                         request, num_new_local_computed_tokens
                     )
 
+                request = request_queue.pop_request()
+                _prefix_trace.write(
+                    self.current_step,
+                    request_id,
+                    request.num_tokens,
+                    num_new_local_computed_tokens,
+                    int(request.num_preemptions > 0),
+                )
                 if load_kv_async:
                     # This path deliberately does not reach `prefill_admitted`
                     # below, so it does not restart the prefill cadence:
@@ -1514,8 +2410,27 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
+                spliced_advance = self.kv_cache_manager.maybe_apply_leyline_splice(
+                    request, num_computed_tokens
+                )
+                if spliced_advance > 0 and not pad_spec_decode:
+                    advance = min(spliced_advance, max(0, num_new_tokens - 1))
+                    if advance > 0:
+                        num_computed_tokens += advance
+                        num_new_tokens -= advance
+                        # Budgets have not been charged yet: charge only the
+                        # actual forwarded tail below, with no double refund.
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                if is_waiting_prefill:
+                    scheduled_prefill_tokens += num_new_tokens
+                if forced_prefill_pending and request_id == eb_forced_prefill_id:
+                    # The aged prefill was scheduled this step: the
+                    # guarantee is met; resume the pre-P5-1 break
+                    # semantics for the (unselected) requests behind it.
+                    forced_prefill_pending = False
+                if is_waiting_prefill and prefill_token_budget is not None:
+                    prefill_token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -1557,11 +2472,13 @@ class Scheduler(SchedulerInterface):
             if step_skipped_waiting:
                 self.waiting.prepend_requests(step_skipped_waiting)
 
-            # DP prefill balancing: on a step that admitted prefills (release),
-            # record whether it was capacity-bound.
+            # A waiting queue alone may only mean that max_num_seqs is full.
+            # Treat the release as capacity-bound only when its token budget was
+            # exhausted; otherwise the throttle remains useful for active decodes.
             if not defer_prefills:
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+                self.prefill_capacity_bound = bool(self.waiting) and token_budget == 0
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1653,6 +2570,30 @@ class Scheduler(SchedulerInterface):
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        pending_kv_cache_rope_rotations = (
+            self.kv_cache_manager.take_kv_cache_rope_rotations() or None
+        )
+        # Leyline hybrid §2b: fused copy+rotate splices and Mamba boundary-state
+        # transplants. The splice ops run with this step's execution and touch
+        # donor blocks retained for the step (see _apply_leyline_hybrid_splice);
+        # their correctness is guaranteed once the step's forward has read them.
+        # The donor (src) and target (dst) FA blocks and the donor Mamba block
+        # are pinned for the step and released at step completion (mirrors the
+        # pure-attention CoW pin/release), so no splice pin leaks (GAP 2).
+        pending_kv_cache_block_splices, splice_retained = (
+            self.kv_cache_manager.take_kv_cache_block_splices()
+        )
+        if splice_retained:
+            self._free_cow_retained_blocks(splice_retained, self.sched_step_seq + 1)
+        pending_mamba_state_transplants, transplant_retained = (
+            self.kv_cache_manager.take_mamba_state_transplants()
+        )
+        if transplant_retained:
+            self._free_cow_retained_blocks(
+                transplant_retained, self.sched_step_seq + 1
+            )
+        pending_kv_cache_block_splices = pending_kv_cache_block_splices or None
+        pending_mamba_state_transplants = pending_mamba_state_transplants or None
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -1660,6 +2601,34 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+            if self.long_context_threshold is not None and all(
+                self.requests[req_id].num_computed_tokens
+                >= self.requests[req_id].num_prompt_tokens
+                for req_id in num_scheduled_tokens
+            ):
+                max_context = max(
+                    self.requests[req_id].num_computed_tokens
+                    for req_id in num_scheduled_tokens
+                )
+                if max_context >= self.long_context_threshold:
+                    assert self.long_context_num_spec_tokens is not None
+                    num_spec_tokens_to_schedule = min(
+                        num_spec_tokens_to_schedule,
+                        self.long_context_num_spec_tokens,
+                    )
+            if self.greedy_num_spec_tokens is not None and all(
+                self.requests[req_id].sampling_params.temperature == 0
+                for req_id in num_scheduled_tokens
+            ):
+                num_spec_tokens_to_schedule = min(
+                    num_spec_tokens_to_schedule,
+                    self.greedy_num_spec_tokens,
+                )
+            num_spec_tokens_to_schedule = self._profitability_adjusted_spec_tokens(
+                len(num_scheduled_tokens),
+                num_spec_tokens_to_schedule,
+                num_scheduled_tokens,
+            )
 
         scheduled_encoder_input_stats = None
         if (
@@ -1688,6 +2657,10 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            kv_cache_rope_rotations=pending_kv_cache_rope_rotations,
+            kv_cache_block_splices=pending_kv_cache_block_splices,
+            mamba_state_transplants=pending_mamba_state_transplants,
+            scheduled_prefill_tokens=scheduled_prefill_tokens,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,
@@ -1797,8 +2770,12 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        now_wall = time.time()
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            was_prefill = request.num_computed_tokens < (
+                request.num_tokens + request.num_output_placeholders
+            )
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
@@ -1807,6 +2784,8 @@ class Scheduler(SchedulerInterface):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            if was_prefill and num_scheduled_token > 0:
+                request._eb_last_prefill_service_time = now_wall
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
@@ -2253,6 +3232,16 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         # Stopped resumable requests to re-enqueue, in output order.
         continuing_reqs: list[Request] = []
+        completion_timestamp = time.monotonic()
+        decode_completion_times = getattr(self, "_decode_completion_times", None)
+        if decode_completion_times is None:
+            decode_completion_times = self._decode_completion_times = {}
+        decode_gap_samples = getattr(self, "_decode_gap_samples", None)
+        if decode_gap_samples is None:
+            decode_gap_samples = self._decode_gap_samples = deque(maxlen=4096)
+        spec_step_committed_tokens = 0
+        spec_step_num_tokens: int | None = None
+        spec_step_requests = 0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -2296,15 +3285,21 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
-                # Rejections roll back num_computed_tokens (and, under async
-                # scheduling, num_output_placeholders, which covers the spec
-                # tokens). A stale rejection count predates the preemption
-                # rollback and must not apply.
                 if not output_is_stale:
+                    spec_step_committed_tokens += len(generated_token_ids)
+                    spec_step_num_tokens = num_draft_tokens
+                    spec_step_requests += 1
                     if request.num_computed_tokens > 0:
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
+                    _spec_trace.write(
+                        self.current_step,
+                        len(scheduler_output.num_scheduled_tokens),
+                        req_id,
+                        num_draft_tokens,
+                        num_accepted,
+                    )
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
@@ -2346,6 +3341,16 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids, is_stale=output_is_stale
                 )
+                if new_token_ids:
+                    previous = decode_completion_times.get(req_id)
+                    if previous is not None and num_output_tokens_before > 0:
+                        decode_gap_samples.append(
+                            (
+                                completion_timestamp,
+                                (completion_timestamp - previous) * 1000.0,
+                            )
+                        )
+                    decode_completion_times[req_id] = completion_timestamp
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -2386,9 +3391,12 @@ class Scheduler(SchedulerInterface):
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
                 if prefill_stats is not None:
+                    skipped = int(request.kv_splice_stats.get("skipped_tokens", 0) or 0)
                     prefill_stats.finalize(
-                        self.kv_cache_manager.estimate_cached_tokens(request)
+                        self.kv_cache_manager.estimate_cached_tokens(request) + skipped
                     )
+                    if skipped:
+                        prefill_stats.num_local_cached_tokens += skipped
 
             # Extract sample logprobs before stop handling can replace the
             # sampling parameters for a streaming continuation.
@@ -2571,6 +3579,46 @@ class Scheduler(SchedulerInterface):
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
+        batch_size = len(scheduler_output.num_scheduled_tokens)
+        minimum_batch = getattr(self, "profitability_aware_min_batch_size", None)
+        if (
+            minimum_batch is not None
+            and batch_size >= minimum_batch
+            and scheduler_output.scheduled_prefill_tokens == 0
+            and scheduler_output.model_step_elapsed_ms > 0
+            and spec_step_num_tokens in (2, 3)
+            and spec_step_requests > 0
+            and spec_step_committed_tokens > 0
+        ):
+            key = (batch_size, spec_step_num_tokens)
+            history = self._spec_profitability_history.get(key)
+            if history is None:
+                history = deque(maxlen=self._spec_profitability_window)
+                self._spec_profitability_history[key] = history
+            observed_rate = (
+                spec_step_committed_tokens / scheduler_output.model_step_elapsed_ms
+            )
+            history.append(observed_rate)
+            if self._spec_acceptance_request_ids:
+                self._spec_request_profitability_history[
+                    spec_step_num_tokens
+                ].append(observed_rate)
+            if spec_step_num_tokens == 3:
+                accepted = max(
+                    spec_step_committed_tokens
+                    - spec_step_requests * self.num_sampled_tokens_per_step,
+                    0,
+                )
+                self._spec_acceptance_history.append(
+                    accepted / (spec_step_requests * spec_step_num_tokens)
+                )
+            self._spec_profitability_unsaved += 1
+            if (
+                self._spec_profitability_unsaved
+                >= self.profitability_state_save_interval
+            ):
+                self._save_spec_profitability_state()
+
         engine_core_outputs = {
             client_index: EngineCoreOutputs(outputs=outs)
             for client_index, outs in outputs.items()
@@ -2788,6 +3836,211 @@ class Scheduler(SchedulerInterface):
 
         scheduler_output.num_invalid_spec_tokens = num_invalid_spec_tokens
 
+    def get_max_decode_tokens(self) -> int:
+        return max(
+            (
+                request.num_output_tokens
+                for request in self.running
+                if not request.is_prefill_chunk
+            ),
+            default=0,
+        )
+
+    def get_decode_prefill_arrival_gap(self) -> float:
+        decode_arrivals = [
+            request.arrival_time
+            for request in self.running
+            if not request.is_prefill_chunk
+        ]
+        prefill_arrivals = [
+            request.arrival_time
+            for request in self.running
+            if request.is_prefill_chunk
+        ]
+        prefill_arrivals.extend(
+            request.arrival_time
+            for request in (*self.waiting, *self.skipped_waiting)
+            if request.num_output_tokens == 0
+        )
+        if not decode_arrivals or not prefill_arrivals:
+            return 0.0
+        return max(min(prefill_arrivals) - min(decode_arrivals), 0.0)
+
+    def get_kv_cache_block_counts(self) -> tuple[int, int, int, int]:
+        block_pool = self.kv_cache_manager.block_pool
+        immediate, evictable = block_pool.get_free_block_counts()
+        # The permanently allocated null block is not usable capacity.
+        total = max(block_pool.num_gpu_blocks - 1, 0)
+        pinned = max(total - immediate - evictable, 0)
+        return immediate, evictable, pinned, total
+
+    def get_kv_cache_token_counts(self) -> tuple[int, int, int, int]:
+        immediate, evictable, pinned, total = self.get_kv_cache_block_counts()
+        return (
+            immediate * self.block_size,
+            evictable * self.block_size,
+            pinned * self.block_size,
+            total * self.block_size,
+        )
+
+    def get_request_kv_token_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for request_id in self.requests:
+            block_ids = self.kv_cache_manager.get_block_ids(request_id)
+            allocated_blocks = max((len(group) for group in block_ids), default=0)
+            counts[request_id] = allocated_blocks * self.block_size
+        return counts
+
+    def get_decode_gap_p99_ms(self) -> float | None:
+        cutoff = time.monotonic() - self._decode_gap_window_seconds
+        while self._decode_gap_samples and self._decode_gap_samples[0][0] < cutoff:
+            self._decode_gap_samples.popleft()
+        if not self._decode_gap_samples:
+            return None
+        values = sorted(gap_ms for _, gap_ms in self._decode_gap_samples)
+        return values[math.ceil(len(values) * 0.99) - 1]
+
+    def has_decode_prefill_overlap(self) -> bool:
+        has_decode = any(not request.is_prefill_chunk for request in self.running)
+        if not has_decode:
+            return False
+        return any(request.is_prefill_chunk for request in self.running) or any(
+            request.num_output_tokens == 0
+            for request in (*self.waiting, *self.skipped_waiting)
+        )
+
+    def get_oldest_prefill_wait_seconds(self) -> float:
+        arrivals = [
+            request.arrival_time
+            for request in self.running
+            if request.is_prefill_chunk
+        ]
+        arrivals.extend(
+            request.arrival_time
+            for request in (*self.waiting, *self.skipped_waiting)
+            if request.num_output_tokens == 0
+        )
+        return max(time.time() - min(arrivals), 0.0) if arrivals else 0.0
+
+    def get_oldest_eb_prefill_wait_seconds(
+        self, now: float | None = None
+    ) -> float:
+        """Oldest prefill wait for EB(0) phase separation:
+        - waiting/skipped_waiting requests with zero output tokens use
+          ``request.arrival_time``;
+        - running ``is_prefill_chunk`` requests use
+          ``max(arrival_time, _eb_last_prefill_service_time)`` so a running
+          chunk that was just force-served does not stay permanently >= k and
+          latch ``force_prefill_service=True`` into a 100-token trickle on
+          every subsequent decode step.
+        """
+        t = time.time() if now is None else now
+        waits: list[float] = []
+        for request in self.running:
+            if not request.is_prefill_chunk:
+                continue
+            ref = max(
+                request.arrival_time,
+                getattr(request, "_eb_last_prefill_service_time", 0.0),
+            )
+            waits.append(max(t - ref, 0.0))
+        for request in (*self.waiting, *self.skipped_waiting):
+            if request.num_output_tokens == 0:
+                waits.append(max(t - request.arrival_time, 0.0))
+        return max(waits) if waits else 0.0
+
+    def get_deferred_prefill_count(self) -> int:
+        """Prefills the prefill throttle is holding back (EB(0) deferral):
+        waiting with zero output tokens. A prefill that is RUNNING is being
+        served this step (throttling never preempts it), so it does not
+        count. Same population as ``get_oldest_prefill_wait_seconds``."""
+        return sum(
+            1
+            for request in (*self.waiting, *self.skipped_waiting)
+            if request.num_output_tokens == 0
+        )
+
+    def get_oldest_deferred_prefill_id(self) -> str | None:
+        """The deferred prefill with the oldest arrival (P5-1): the waiting
+        request with zero output tokens and the minimum arrival_time — the
+        same deferred population as ``get_deferred_prefill_count`` (running
+        prefill chunks are already being served, so they are not
+        candidates). The eb force-serve step hands this id to
+        ``schedule(eb_forced_prefill_id=...)`` so it is guaranteed to be
+        scheduled that step. None when the deferred population is empty."""
+        oldest: Request | None = None
+        for request in (*self.waiting, *self.skipped_waiting):
+            if request.num_output_tokens != 0:
+                continue
+            if oldest is None or request.arrival_time < oldest.arrival_time:
+                oldest = request
+        if oldest is not None:
+            return oldest.request_id
+        # If no waiting request is deferred, fall back to the running prefill
+        # chunk whose effective EB wait (since arrival or last service) is
+        # oldest, so an aged running chunk is also guaranteed selection on its
+        # force-serve step.
+        oldest_running: Request | None = None
+        oldest_ref = float("inf")
+        for request in self.running:
+            if not request.is_prefill_chunk:
+                continue
+            ref = max(
+                request.arrival_time,
+                getattr(request, "_eb_last_prefill_service_time", 0.0),
+            )
+            if ref < oldest_ref:
+                oldest_ref = ref
+                oldest_running = request
+        return oldest_running.request_id if oldest_running is not None else None
+
+    def get_spec_profitability_stats(self) -> dict[str, object] | None:
+        if self.profitability_aware_min_batch_size is None:
+            return None
+        batches: dict[str, dict[str, float | int | None]] = {}
+        for (batch_size, k), history in sorted(
+            self._spec_profitability_history.items()
+        ):
+            batch = batches.setdefault(str(batch_size), {})
+            batch[f"k{k}_samples"] = len(history)
+            batch[f"k{k}_tokens_per_ms"] = (
+                sum(history) / len(history) if history else None
+            )
+            batch["steps"] = self._spec_profitability_steps[batch_size]
+        return {
+            "last_batch_size": self._last_spec_profitability_batch_size,
+            "last_selected_k": self._last_spec_profitability_selected_k,
+            "last_exploration": self._last_spec_profitability_exploration,
+            "last_acceptance_gated": (
+                self._last_spec_profitability_acceptance_gated
+            ),
+            "recent_k3_acceptance": (
+                sum(self._spec_acceptance_history)
+                / len(self._spec_acceptance_history)
+                if self._spec_acceptance_history
+                else None
+            ),
+            "recent_k3_acceptance_samples": len(self._spec_acceptance_history),
+            "request_k2_tokens_per_ms": (
+                sum(self._spec_request_profitability_history[2])
+                / len(self._spec_request_profitability_history[2])
+                if self._spec_request_profitability_history[2]
+                else None
+            ),
+            "request_k3_tokens_per_ms": (
+                sum(self._spec_request_profitability_history[3])
+                / len(self._spec_request_profitability_history[3])
+                if self._spec_request_profitability_history[3]
+                else None
+            ),
+            "warm_start_batches": self._last_spec_profitability_warm_start_batches,
+            "loaded_samples": self._spec_profitability_loaded_samples,
+            "state_age_seconds": self._spec_profitability_state_age_seconds,
+            "state_fingerprint": self._profitability_state_fingerprint,
+            "state_path": self.profitability_state_path,
+            "batches": batches,
+        }
+
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         return len(self.running), len(self.waiting) + len(self.kv_holding_waiting)
@@ -2798,6 +4051,59 @@ class Scheduler(SchedulerInterface):
 
     def has_request(self, request_id: str) -> bool:
         return request_id in self.requests
+    def _apply_leyline_splice_cache_cap(self, request: Request) -> None:
+        """Set ``request._leyline_max_cacheable_tokens`` (design §2c) at
+        admission, BEFORE any ``allocate_slots`` runs.
+
+        A spliced request's target-suffix KV blocks are a function of the
+        DONOR's context (they are CoW-copied + RoPE-rotated from the donor),
+        so caching them under the TARGET tokens' chained APC hashes would let
+        a later, unrelated request sharing the target suffix falsely hit
+        donor-contaminated KV (wrong output + cross-session pollution). The
+        cap clamps APC registration to ``s + r`` (the clean target prefix plus
+        any freshly-decoded replacement middle); every full block at or past
+        that boundary is donor-contaminated and must stay un-registered.
+
+        This must run at admission (not in ``maybe_apply_leyline_splice``,
+        which fires after ``allocate_slots`` has already cached the suffix).
+        No-op unless the request carries amortize-mode splice directives and
+        the model has a full-attention group (a pure-Mamba model's splice is a
+        no-op, so its Mamba checkpoints stay uncapped).
+        """
+        sp = getattr(request, "sampling_params", None)
+        if sp is None or getattr(sp, "extra_args", None) is None:
+            return
+        if sp.extra_args.get("kv_splice_mode", "off") != "amortize":
+            return
+        directives = getattr(request, "kv_splice_directives", None)
+        if not directives:
+            return
+        # Only full-attention blocks are CoW-copied/rotated from the donor; a
+        # model without a full-attention group applies no splice, so leave its
+        # (Mamba) cache registration uncapped.
+        if not any(
+            not isinstance(g.kv_cache_spec, MambaSpec)
+            for g in self.kv_cache_config.kv_cache_groups
+        ):
+            return
+        max_cacheable = None
+        for item in directives:
+            if isinstance(item, dict):
+                s = int(item.get("span_start", item.get("s", 0)))
+                r = int(item.get("replacement_len", item.get("r", 0)))
+            elif isinstance(item, (list, tuple)) and len(item) >= 4:
+                s, r = int(item[0]), int(item[2])
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                s, r = int(item[0]), int(item[1])
+            else:
+                continue
+            boundary = s + r
+            max_cacheable = boundary if max_cacheable is None else min(
+                max_cacheable, boundary
+            )
+        if max_cacheable is not None:
+            if not self.kv_cache_config.has_mamba_layers:
+                request._leyline_max_cacheable_tokens = max_cacheable
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -2816,6 +4122,11 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            # §2c: clamp APC cache registration for amortize-mode splice
+            # requests BEFORE the request is admitted to the waiting queue (and
+            # therefore before any allocate_slots caches its suffix). No-op for
+            # non-splice / mode-off requests.
+            self._apply_leyline_splice_cache_cap(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
@@ -2906,6 +4217,7 @@ class Scheduler(SchedulerInterface):
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
         self._set_kv_fetch_stage(request, None)
+        self._decode_completion_times.pop(request.request_id, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing

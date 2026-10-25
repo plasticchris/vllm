@@ -342,6 +342,9 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         TritonFp8BlockScaledMMKernel,
         TritonW4A16LinearKernel,
     },
+    "rdna_hybrid": {
+        RDNAHybridW4A16LinearKernel,
+    },
     "deep_gemm": {
         DeepGemmFp8BlockScaledMMKernel,
         DeepGemmMxfp8BmmLinearKernel,
@@ -547,6 +550,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         HummingLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        RDNAHybridW4A16LinearKernel,
         RDNA3W4A16LinearKernel,
         RDNAHybridW4A16LinearKernel,
         TritonW4A16LinearKernel,

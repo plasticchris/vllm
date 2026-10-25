@@ -51,7 +51,11 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
+    def schedule(
+        self,
+        throttle_prefills: bool = False,
+        decode_active_prefill_token_budget: int | None = None,
+    ) -> "SchedulerOutput":
         """Schedule the requests to process in this scheduling step.
 
         The scheduling decision is made at the iteration level. Each scheduling
@@ -243,6 +247,52 @@ class SchedulerInterface(ABC):
         stale vision embeddings are not reused.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def get_max_decode_tokens(self) -> int:
+        """Maximum generated-token count among active decode requests."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_decode_prefill_arrival_gap(self) -> float:
+        """Arrival-time lead of the oldest decode over the oldest prefill."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_kv_cache_block_counts(self) -> tuple[int, int, int, int]:
+        """Return immediate, evictable, pinned, and total GPU KV blocks."""
+        raise NotImplementedError
+
+    def get_kv_cache_token_counts(self) -> tuple[int, int, int, int]:
+        """Return immediate, evictable, pinned, and total GPU KV tokens."""
+        block_size = getattr(self, "block_size", 1)
+        immediate, evictable, pinned, total = self.get_kv_cache_block_counts()
+        return (
+            immediate * block_size,
+            evictable * block_size,
+            pinned * block_size,
+            total * block_size,
+        )
+
+    def get_request_kv_token_counts(self) -> dict[str, int]:
+        """Return scheduler-resident KV tokens keyed by request ID."""
+        return {}
+
+    def get_oldest_prefill_wait_seconds(self) -> float:
+        """Return the age of the oldest active prefill request."""
+        return 0.0
+
+    def has_decode_prefill_overlap(self) -> bool:
+        """Return whether active decode and pending prefill work coexist."""
+        return False
+
+    def get_decode_gap_p99_ms(self) -> float | None:
+        """Return recent P99 time between outputs for individual decodes."""
+        return None
+
+    def get_spec_profitability_stats(self) -> dict[str, object] | None:
+        """Return online speculative-decoding controller telemetry."""
+        return None
 
     @abstractmethod
     def get_request_counts(self) -> tuple[int, int]:

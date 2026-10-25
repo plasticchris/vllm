@@ -48,6 +48,88 @@ from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
 logger = init_logger(__name__)
 
 
+_PLE_CPU_PIPELINE_STAGING: dict[tuple[int, torch.dtype, int, int], dict] = {}
+
+
+def _pipelined_cpu_embedding(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    chunk_rows: int,
+) -> torch.Tensor:
+    """Overlap pinned CPU embedding gathers with the preceding chunk's H2D."""
+    if input_.dim() == 0:
+        return F.embedding(input_.to(device="cpu"), weight).to(
+            device=input_.device, non_blocking=weight.is_pinned()
+        )
+    rows = input_.shape[0]
+    ids_per_row = input_.numel() // max(rows, 1)
+    embedding_dim = weight.shape[1]
+    device_index = input_.device.index or 0
+    key = (device_index, weight.dtype, ids_per_row, embedding_dim)
+    state = _PLE_CPU_PIPELINE_STAGING.get(key)
+    required_ids = input_.numel()
+    required_output = chunk_rows * ids_per_row * embedding_dim
+    if (
+        state is None
+        or state["ids"].numel() < required_ids
+        or state["outputs"][0].numel() < required_output
+    ):
+        state = {
+            "ids": torch.empty(required_ids, dtype=torch.long, pin_memory=True),
+            "outputs": [
+                torch.empty(
+                    required_output,
+                    dtype=weight.dtype,
+                    pin_memory=True,
+                )
+                for _ in range(2)
+            ],
+            "events": [torch.cuda.Event() for _ in range(2)],
+            "used": [False, False],
+            "stream": torch.cuda.Stream(device=input_.device),
+        }
+        _PLE_CPU_PIPELINE_STAGING[key] = state
+
+    ids_cpu = state["ids"][:required_ids]
+    current_stream = torch.cuda.current_stream(input_.device)
+    ids_cpu.copy_(input_.reshape(-1), non_blocking=True)
+    # The CPU gather cannot start until all n-gram IDs have arrived. This is the
+    # only required host synchronization; chunk output copies overlap below.
+    current_stream.synchronize()
+
+    output = torch.empty(
+        (*input_.shape, embedding_dim),
+        dtype=weight.dtype,
+        device=input_.device,
+    )
+    output_flat = output.view(-1, embedding_dim)
+    ids_cpu = ids_cpu.view(rows, ids_per_row)
+    copy_stream = state["stream"]
+    for chunk_index, start in enumerate(range(0, rows, chunk_rows)):
+        end = min(rows, start + chunk_rows)
+        slot = chunk_index & 1
+        if state["used"][slot]:
+            state["events"][slot].synchronize()
+        count = (end - start) * ids_per_row
+        cpu_output = state["outputs"][slot][: count * embedding_dim].view(
+            count, embedding_dim
+        )
+        torch.index_select(
+            weight,
+            0,
+            ids_cpu[start:end].reshape(-1),
+            out=cpu_output,
+        )
+        with torch.cuda.stream(copy_stream):
+            output_flat[start * ids_per_row : end * ids_per_row].copy_(
+                cpu_output, non_blocking=True
+            )
+            state["events"][slot].record(copy_stream)
+        state["used"][slot] = True
+    current_stream.wait_stream(copy_stream)
+    return output
+
+
 class Qwen4ExpPLEGroupedNorm(nn.Module):
     def __init__(
         self,
@@ -79,6 +161,65 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
             variance = grouped.square().mean(dim=-1, keepdim=True)
             normalized = (grouped * torch.rsqrt(variance + self.eps)).flatten(-2)
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
+
+
+class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
+    """FP8 PLE embedding with one global checkpoint scale."""
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size, params_dtype
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        if os.getenv("VLLM_PLE_INPROC_CPU", "0") == "1":
+            with torch.device("cpu"):
+                weight = create_fp8_weight_parameter(
+                    sum(output_partition_sizes), input_size_per_partition, weight_loader
+                )
+            weight.data = weight.data.pin_memory()
+            weight._vllm_keep_cpu = True
+        else:
+            weight = create_fp8_weight_parameter(
+                sum(output_partition_sizes), input_size_per_partition, weight_loader
+            )
+        layer.register_parameter("weight", weight)
+
+        weight_scale = create_fp8_scale_parameter(
+            PerTensorScaleParameter,
+            output_partition_sizes,
+            input_size_per_partition,
+            None,
+            weight_loader,
+            scale_dtype=torch.bfloat16,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("PLE FP8 weights only support embedding lookup")
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if layer.weight.device.type == "cpu":
+            chunk_rows = int(os.getenv("VLLM_PLE_PIPELINE_CHUNK_ROWS", "0"))
+            if chunk_rows > 0 and not torch.cuda.is_current_stream_capturing():
+                return _pipelined_cpu_embedding(input_, layer.weight, chunk_rows)
+            output = F.embedding(input_.to(device="cpu"), layer.weight)
+            return output.to(
+                device=input_.device,
+                non_blocking=layer.weight.is_pinned(),
+            )
+        return F.embedding(input_, layer.weight)
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -493,6 +634,30 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        splitting_op = "vllm::qwen4_exp_amd_ple"
+        if (
+            compilation_config.splitting_ops is not None
+            and splitting_op not in compilation_config.splitting_ops
+        ):
+            compilation_config.splitting_ops.append(splitting_op)
+
+    def _get_embedding_weight_scale(self) -> torch.Tensor | None:
+        embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+        return getattr(embedding, "weight_scale", None)
+
+    def _dequantize_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not is_fp8(embeddings):
+            return embeddings
+        weight_scale = self._get_embedding_weight_scale()
+        if weight_scale is None:
+            raise RuntimeError("FP8 PLE embedding is missing its global scale")
+        if weight_scale.device != embeddings.device:
+            raise RuntimeError("FP8 PLE embedding scale must be on the output device")
+        return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
@@ -806,6 +971,33 @@ def qwen4_exp_amd_ple_ngram_ids(
     )
 
 
+def qwen4_exp_amd_ple(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Run the complete CPU-backed PLE layer outside Inductor graphs."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpPLELayer):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+    result = layer(hidden_states, input_ids, query_start_loc, ngram_context)
+    output.copy_(result)
+
+
+def qwen4_exp_amd_ple_fake(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_amd_ple_ngram_embedding(
     ngram_ids: torch.Tensor,
     output: torch.Tensor,
@@ -881,6 +1073,14 @@ direct_register_custom_op(
 
 
 direct_register_custom_op(
+    op_name="qwen4_exp_amd_ple",
+    op_func=qwen4_exp_amd_ple,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_amd_ple_fake,
+)
+
+
+direct_register_custom_op(
     op_name="qwen4_exp_amd_ple_ngram_embedding",
     op_func=qwen4_exp_amd_ple_ngram_embedding,
     mutates_args=["output"],
@@ -903,6 +1103,7 @@ direct_register_custom_op(
 
 __all__ = [
     "Qwen4ExpNGramEmbedding",
+    "Qwen4ExpPLEFp8EmbeddingMethod",
     "Qwen4ExpPLEGroupedNorm",
     "Qwen4ExpPLELayer",
 ]

@@ -38,6 +38,7 @@ from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.telemetry import KVCacheStats, PrefillControl, StepStats
 from vllm.v1.executor import Executor
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
@@ -123,6 +124,16 @@ class LLMEngine:
         )
         self._profile_session_active = False
 
+        # Per-step telemetry published for the in-process serving layer
+        # (rukhm). These are NamedTuples (vllm/v1/engine/telemetry.py, the
+        # single source of truth for the field set) rather than bare tuples
+        # so the serving layer can read them by field name and a reordering
+        # becomes a type error instead of a silent mislabel.
+        self.last_kv_cache_stats: KVCacheStats | None = None
+        self.last_prefill_control: PrefillControl = PrefillControl()
+        self.last_request_kv_tokens: dict[str, int] = {}
+        self.last_spec_profitability: dict[str, Any] | None = None
+        self.last_step_stats: StepStats | None = None
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
             self.logger_manager = StatLoggerManager(
@@ -325,6 +336,54 @@ class LLMEngine:
         # 1) Get EngineCoreOutput from the EngineCore.
         with record_function_or_nullcontext("llm_engine step: get_output"):
             outputs = self.engine_core.get_output()
+        if (
+            outputs.kv_cache_usage is not None
+            and outputs.kv_cache_free_blocks is not None
+            and outputs.kv_cache_total_blocks is not None
+        ):
+            assert outputs.kv_cache_immediate_free_blocks is not None
+            assert outputs.kv_cache_evictable_blocks is not None
+            assert outputs.kv_cache_pinned_blocks is not None
+            assert outputs.kv_cache_immediate_free_tokens is not None
+            assert outputs.kv_cache_evictable_tokens is not None
+            assert outputs.kv_cache_pinned_tokens is not None
+            assert outputs.kv_cache_total_tokens is not None
+            self.last_kv_cache_stats = KVCacheStats(
+                usage=outputs.kv_cache_usage,
+                immediate_free_blocks=outputs.kv_cache_immediate_free_blocks,
+                evictable_blocks=outputs.kv_cache_evictable_blocks,
+                pinned_blocks=outputs.kv_cache_pinned_blocks,
+                total_blocks=outputs.kv_cache_total_blocks,
+                immediate_free_tokens=outputs.kv_cache_immediate_free_tokens,
+                evictable_tokens=outputs.kv_cache_evictable_tokens,
+                pinned_tokens=outputs.kv_cache_pinned_tokens,
+                total_tokens=outputs.kv_cache_total_tokens,
+            )
+        self.last_request_kv_tokens = outputs.request_kv_tokens or {}
+        self.last_prefill_control = PrefillControl(
+            interval=outputs.prefill_control_interval,
+            token_budget=outputs.prefill_control_token_budget,
+            prefill_step_p99_ms=outputs.prefill_control_p99_ms,
+            decode_step_p99_ms=outputs.prefill_control_decode_p99_ms,
+            prefill_penalty_p99_ms=outputs.prefill_control_penalty_p99_ms,
+            drain_p99_ms=outputs.prefill_control_drain_p99_ms,
+            drain_penalty_p99_ms=outputs.prefill_control_drain_penalty_p99_ms,
+            decode_visible_p99_ms=outputs.prefill_control_slo_p99_ms,
+            oldest_prefill_wait_seconds=outputs.prefill_control_oldest_wait_seconds,
+            deferred_prefill_count=outputs.prefill_control_deferred_count,
+            aging_interval=outputs.prefill_control_aging_interval,
+            aging_token_budget=outputs.prefill_control_aging_token_budget,
+            high_load=outputs.prefill_control_high_load,
+            cold_start=outputs.prefill_control_cold_start,
+            observations=outputs.prefill_control_observations,
+            reset_count=outputs.prefill_control_reset_count,
+            quiet_seconds=outputs.prefill_control_quiet_seconds,
+            tier=outputs.prefill_control_tier,
+            mamba_prefill_subblock_tokens=outputs.mamba_prefill_subblock_tokens,
+            prefill_ms_per_token=outputs.prefill_control_prefill_ms_per_token,
+            decode_gap_p99_ms=outputs.prefill_control_decode_gap_p99_ms,
+        )
+        self.last_spec_profitability = outputs.spec_profitability
 
         # 2) Process EngineCoreOutputs.
         with record_function_or_nullcontext("llm_engine step: process_outputs"):
@@ -346,6 +405,53 @@ class LLMEngine:
                             mm_processor_cache.invalidate(mm_hash)
 
             self.output_processor.update_scheduler_stats(outputs.scheduler_stats)
+            if outputs.scheduler_stats is not None:
+                pc = outputs.scheduler_stats.prefix_cache_stats
+                spec = outputs.scheduler_stats.spec_decoding_stats
+                self.last_step_stats = StepStats(
+                    gen_tokens=(
+                        iteration_stats.num_generation_tokens
+                        if iteration_stats
+                        else 0
+                    ),
+                    prefill_sched_tokens=outputs.step_prefill_tokens,
+                    scheduled_total_tokens=outputs.step_scheduled_tokens,
+                    prompt_computed=(
+                        iteration_stats.prompt_token_stats.computed
+                        if iteration_stats
+                        else 0
+                    ),
+                    prompt_cached=(
+                        iteration_stats.prompt_token_stats.local_cache_hit
+                        if iteration_stats
+                        else 0
+                    ),
+                    preempted_reqs=(
+                        iteration_stats.num_preempted_reqs
+                        if iteration_stats
+                        else 0
+                    ),
+                    prefix_cache_queries=pc.queries,
+                    prefix_cache_hits=pc.hits,
+                    kv_evictions=len(
+                        outputs.scheduler_stats.kv_cache_eviction_events
+                    ),
+                    spec_draft_tokens=spec.num_draft_tokens
+                    if spec is not None
+                    else 0,
+                    spec_accepted_tokens=spec.num_accepted_tokens
+                    if spec is not None
+                    else 0,
+                    running_reqs=outputs.scheduler_stats.num_running_reqs,
+                    waiting_reqs=outputs.scheduler_stats.num_waiting_reqs,
+                )
+            else:
+                # Scheduled but no request outputs (e.g. KV-pressure stall):
+                # still report the scheduler's own bookkeeping for the step.
+                self.last_step_stats = StepStats(
+                    prefill_sched_tokens=outputs.step_prefill_tokens,
+                    scheduled_total_tokens=outputs.step_scheduled_tokens,
+                )
 
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):

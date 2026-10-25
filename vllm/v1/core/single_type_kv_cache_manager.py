@@ -146,6 +146,7 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        self._pending_rope_rotations: list[tuple[int, int, int, int]] = []
         # Boundary-state offload hand-off for external KV connectors. A mamba
         # "align" block table is not append-only (interior states are
         # nulled/freed and speculative blocks relocate in place), so a
@@ -427,6 +428,14 @@ class SingleTypeKVCacheManager(ABC):
         pending_copies = self._pending_cow_copies
         self._pending_cow_copies = []
         return pending_copies
+
+    def take_pending_rope_rotations(
+        self,
+    ) -> list[tuple[int, int, int, int]]:
+        """Drain pending Leyline RoPE delta rotations: (block_id, delta_pos, start_offset, end_offset)."""
+        rotations = self._pending_rope_rotations
+        self._pending_rope_rotations = []
+        return rotations
 
     def take_pending_boundary_state_offloads(
         self,
@@ -1629,6 +1638,23 @@ class MambaManager(SingleTypeKVCacheManager):
         num_prompt_tokens: int | None = None,
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        # In align mode, the tail `num_speculative_blocks` entries of an
+        # already-allocated request are scratch slots that `allocate_new_blocks`
+        # relocates in place across block boundaries. Never null them out here,
+        # even when `processed_computed_tokens` jumps (e.g., a Leyline splice).
+        blocks = self.req_to_blocks.get(request_id)
+        if (
+            self.mamba_cache_mode == "align"
+            and self.num_speculative_blocks > 0
+            and request_id in self._allocated_block_reqs
+            and blocks
+        ):
+            max_freeable_blocks = max(
+                0, len(blocks) - self.num_speculative_blocks - 1
+            )
+            processed_computed_tokens = min(
+                processed_computed_tokens, max_freeable_blocks * self.block_size
+            )
 
         super().remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
@@ -1788,6 +1814,18 @@ class MambaManager(SingleTypeKVCacheManager):
                 new_computed_blocks
             )
             return num_new_blocks + num_evictable_computed_blocks
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        if self.mamba_cache_mode == "align":
+            return
+        super().allocate_external_computed_blocks(
+            request_id, num_local_computed_tokens, num_external_computed_tokens
+        )
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int

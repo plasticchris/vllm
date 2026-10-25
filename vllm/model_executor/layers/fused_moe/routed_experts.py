@@ -241,6 +241,15 @@ class RoutedExperts(PluggableLayer):
         assert isinstance(quant_method, FusedMoEMethodBase)
         return quant_method
 
+    # TODO(bnell): make this a method on quant_method
+    def _needs_intermediate_size_param(self, quant_method: FusedMoEMethodBase) -> bool:
+        return quant_method.__class__.__name__ in (
+            "AutoGPTQMoEMethod",
+            "CompressedTensorsWNA16MoEMethod",
+            "CompressedTensorsWNA16RDNA3MoEMethod",
+            "CompressedTensorsW4A16FlydslMoEMethod",
+        )
+
     def _ensure_moe_quant_config_init(self):
         if self.quant_method.moe_quant_config is None:
             # Note: the moe_quant_config can't be constructed until after

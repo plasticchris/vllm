@@ -345,7 +345,8 @@ class QSAIndexer(nn.Module):
             metadata.seq_lens,
             self.token_topk,
             self.compress_ratio,
-            out,
+            out=out,
+            max_seq_len=metadata.max_seq_len if metadata.compact_indexer else None,
         )
 
     def forward(

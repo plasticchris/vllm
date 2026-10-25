@@ -1130,6 +1130,23 @@ class VllmConfig:
             if fallback_mode == CUDAGraphMode.NONE:
                 compilation_config.max_cudagraph_capture_size = 0
                 compilation_config.cudagraph_capture_sizes = []
+    def _validate_mrv2_dynamic_sd(self) -> None:
+        speculative_config = self.speculative_config
+        if (
+            speculative_config is None
+            or not self.use_v2_model_runner
+            or not speculative_config.uses_dynamic_speculative_decoding()
+        ):
+            return
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "MRV2 dynamic speculative decoding does not support pipeline parallelism"
+            )
+        if speculative_config.use_dflash() or speculative_config.use_dspark():
+            raise ValueError(
+                "MRV2 dynamic speculative decoding currently supports only "
+                "autoregressive draft methods"
+            )
 
     def _post_init_kv_transfer_config(self) -> None:
         """Update KVTransferConfig based on top-level configs in VllmConfig.
@@ -1842,7 +1859,7 @@ class VllmConfig:
             )
 
         self._maybe_disable_dynamic_sd_for_data_parallel()
-        self._maybe_disable_dynamic_sd_for_v1()
+        self._validate_mrv2_dynamic_sd()
         self._maybe_override_dynamic_sd_cudagraph_mode()
 
         if (
@@ -2325,6 +2342,9 @@ class VllmConfig:
         worker is configured to handle.
         """
         if self.speculative_config is not None:
+            scheduled_token_delta = (
+                self.speculative_config.max_num_new_slots_for_drafting
+            )
             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
             if self.scheduler_config.max_num_scheduled_tokens is None:
                 self.scheduler_config.max_num_scheduled_tokens = max_num_batched_tokens
@@ -2338,7 +2358,14 @@ class VllmConfig:
                     " to accommodate the additional draft token slots, or decrease"
                     " num_speculative_tokens."
                 )
-            if self.scheduler_config.max_num_scheduled_tokens < 8192:
+            # Only warn when the spec method actually consumes extra drafting
+            # slots per request (parallel EAGLE/DFlash, draft models). MTP-style
+            # methods add zero slots, so a small max_num_batched_tokens (e.g. the
+            # tuned 6144 prefill budget) is not starving anything.
+            if (
+                self.scheduler_config.max_num_scheduled_tokens < 8192
+                and scheduled_token_delta > 0
+            ):
                 logger.warning_once(
                     "max_num_scheduled_tokens is set to"
                     f" {self.scheduler_config.max_num_scheduled_tokens} based on"

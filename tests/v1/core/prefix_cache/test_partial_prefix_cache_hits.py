@@ -283,6 +283,27 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
     assert split(self=mock, request=req2, num_new_tokens=1000) == 512
 
 
+def test_mamba_decode_active_subblock_retains_partial_state():
+    block_size = 816
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=block_size),
+        use_eagle=False,
+        hash_block_size=block_size,
+        mamba_partial_cache_hit=False,
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+    split = Scheduler._mamba_block_aligned_split
+    req = make_request("subblock", [0] * 4000, block_size, sha256)
+
+    assert split(mock, req, 816, subblock_tokens=408) == 408
+    req.num_computed_tokens = 408
+    assert split(mock, req, 816, subblock_tokens=408) == 408
+    req.num_computed_tokens = 816
+    assert split(mock, req, 816, subblock_tokens=408) == 408
+
+
 def test_mamba_align_split_when_block_exceeds_scheduling_budget():
     """Sub-block chunks make progress only when no step can fit a full block."""
     block_size = 11392

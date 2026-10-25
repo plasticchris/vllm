@@ -509,8 +509,13 @@ def _get_backend_priorities(
             ]
 
     backends = []
-    # Keep ROCM_ATTN disabled for KV connectors until connector transfer
-    # semantics are validated for its asymmetric native K/V cache views.
+    # ROCM_PREFER_TRITON_ATTN=1 front-loads TRITON_ATTN (3D segmented flash-
+    # decoding / split-KV) ahead of ROCM_ATTN, whose decode/prefix kernels
+    # serialize over KV and cliff on long context.
+    if os.environ.get("ROCM_PREFER_TRITON_ATTN") == "1":
+        backends.append(AttentionBackendEnum.TRITON_ATTN)
+    # ROCM_ATTN uses (2, num_blocks, ...) KV cache layout which is
+    # incompatible with KV connectors that require blocks-first layout.
     if not use_kv_connector:
         backends.append(AttentionBackendEnum.ROCM_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
@@ -628,6 +633,7 @@ class RocmPlatform(Platform):
         "awq_marlin",  # will be overwritten with awq
         "gptq",
         "auto_gptq",
+        "inc",  # AutoRound mixed-precision (delegates to gptq/awq kernels)
         "fp8",
         "deepseek_v4_fp8",
         "compressed-tensors",
@@ -1224,8 +1230,10 @@ class RocmPlatform(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
-        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
+        # MI300 series (gfx94/gfx95, XGMI) and RDNA3 dGPUs (gfx11, PCIe P2P).
+        # RDNA3 has no XGMI, so peer access is over PCIe; CustomAllreduce takes
+        # the graph-buffer copy path there for correct cudagraph replay.
+        return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95", "gfx11"])
 
     @classmethod
     def opaque_attention_op(cls) -> bool:

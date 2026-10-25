@@ -15,6 +15,8 @@ transposes tiles in-register). No dual weight storage.
 
 from contextlib import nullcontext
 
+import os
+
 import torch
 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -342,6 +344,114 @@ def _select_skinny_gfx1151_config(
     return block_m, block_n, block_k, num_warps, num_stages, packed_dequant
 
 
+def _triton_w4a16_bigbk_kernel(
+    a_ptr, b_ptr, scales_ptr, zp_ptr, c_ptr,
+    M, N, K, K8, num_groups, group_size,
+    ZP_BIAS: tl.constexpr, HAS_ZP: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """W4A16 GEMM allowing BLOCK_K > group_size by gathering the per-subgroup
+    scale/zp for each K element. Removes the BLOCK_K<=group_size clamp of
+    _triton_w4a16_skinny_fmt_kernel, giving larger K-tiles (fewer iterations,
+    better weight-load throughput) for gfx1100 batched decode. Requires
+    BLOCK_K % group_size == 0."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    exllama_shifts_row = (tl.arange(0, 8) // 2) * 4 + (tl.arange(0, 8) % 2) * 16
+    shifts_1d = tl.reshape(
+        tl.broadcast_to(exllama_shifts_row[None, :], (BLOCK_K // 8, 8)), (BLOCK_K,)
+    )
+    shifts_full = tl.broadcast_to(shifts_1d[None, :], (BLOCK_N, BLOCK_K))
+    gk = tl.arange(0, BLOCK_K) // group_size  # per-k subgroup within tile
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+        a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & mask_k[None, :], other=0.0)
+        offs_k8 = k_start * (BLOCK_K // 8) + tl.arange(0, BLOCK_K // 8)
+        b_ptrs = b_ptr + offs_n[:, None] * K8 + offs_k8[None, :]
+        b_packed = tl.load(
+            b_ptrs, mask=(offs_n[:, None] < N) & (offs_k8[None, :] < K8), other=0
+        )
+        b = tl.interleave(b_packed, b_packed)
+        b = tl.interleave(b, b)
+        b = tl.interleave(b, b)
+        b = (b >> shifts_full) & 0xF
+        g_base = (k_start * BLOCK_K) // group_size
+        s_cols = g_base + gk
+        s_mask = (offs_n[:, None] < N) & (s_cols[None, :] < num_groups)
+        s_ptrs = scales_ptr + offs_n[:, None] * num_groups + s_cols[None, :]
+        scales = tl.load(s_ptrs, mask=s_mask, other=1.0)
+        if HAS_ZP:
+            # zp is the packed 4-bit form [N//8, num_groups] int32 (as in the
+            # skinny kernel); each int32 holds 8 per-nibble zero-points.
+            z_ptrs = zp_ptr + (offs_n[:, None] // 8) * num_groups + s_cols[None, :]
+            zp_word = tl.load(z_ptrs, mask=s_mask, other=0)
+            zp_raw = ((zp_word >> (4 * (offs_n % 8))) & 0xF).to(scales.dtype)
+            b_fp = (b.to(scales.dtype) - zp_raw) * scales
+        else:
+            b_fp = (b - ZP_BIAS).to(scales.dtype) * scales
+        accumulator += tl.dot(a, tl.trans(b_fp), out_dtype=tl.float32)
+    c = accumulator.to(c_ptr.type.element_ty)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+_WMMA_ZP_UNPACK_CACHE: dict[int, torch.Tensor] = {}
+
+
+def _unpack_zp_for_wmma(
+    zp: torch.Tensor, N: int, num_groups: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Unpack packed 4-bit zp [N//8, num_groups] int32 -> [N, num_groups].
+
+    The asgard WMMA C++ op expects per-nibble zero-points (0..15) in
+    ``scales.dtype``. ``zp`` is a weight tensor, identical across decode
+    steps, so the result is cached by ``id(zp)`` (bounded by #layers)."""
+    key = id(zp)
+    hit = _WMMA_ZP_UNPACK_CACHE.get(key)
+    if hit is not None:
+        return hit
+    word = zp.to(torch.int32)  # [N//8, num_groups]
+    shifts = (4 * torch.arange(8, device=zp.device)).view(1, 8, 1)
+    nib = (word.unsqueeze(1) >> shifts) & 0xF  # [N//8, 8, num_groups]
+    out = nib.reshape(N, num_groups).to(dtype)
+    _WMMA_ZP_UNPACK_CACHE[key] = out
+    return out
+
+
+
+def _bigbk_gemm(a, b_q, scales, zp, group_size, zp_bias=8):
+    """gfx1100 batched-decode path (6<=M<=64). BLOCK_K is a multiple of
+    group_size so the big-K kernel gathers scales per subgroup."""
+    M, K = a.shape
+    N = b_q.shape[0]
+    K8 = K // 8
+    num_groups = K // group_size
+    has_zp = zp is not None
+    if M <= 16:
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 16, 64, 128, 4
+    elif M <= 32:
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 32, 32, 128, 4
+    else:
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 4
+    BLOCK_K = min(BLOCK_K, (K // group_size) * group_size)  # keep multiple of gs, <=K
+    if BLOCK_K % group_size != 0 or BLOCK_K < group_size:
+        BLOCK_K = group_size
+    c = torch.empty((M, N), dtype=a.dtype, device=a.device)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _triton_w4a16_bigbk_kernel[grid](
+        a, b_q, scales, zp if has_zp else scales, c,
+        M, N, K, K8, num_groups, group_size,
+        ZP_BIAS=zp_bias, HAS_ZP=has_zp,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=num_warps,
+    )
+    return c
+
+
 def triton_w4a16_skinny_fmt_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
     b_q: torch.Tensor,  # [N, K//8] int32 (ExLlama shuffle packed)
@@ -349,6 +459,7 @@ def triton_w4a16_skinny_fmt_gemm(
     group_size: int,
     zp_bias: int = 8,
     zp: torch.Tensor | None = None,  # [N//8, K//G] int32 zero-points
+    raw_a: torch.Tensor | None = None,  # unpadded [M, K] rows (WMMA gate)
 ) -> torch.Tensor:
     """Fused W4A16 GEMM reading from skinny weight format [N, K//8].
 
@@ -392,6 +503,52 @@ def triton_w4a16_skinny_fmt_gemm(
             f"zp shape mismatch: {zp.shape} vs ({N // 8}, {num_groups})"
         )
     has_zp = zp is not None
+    # asgard gfx1100 WMMA fused int4-dequant GEMM: fastest batched-decode path
+    # for 8<=M<=64 with 64-aligned K. Wins the per-layer GEMM aggregate ~5-13%
+    # vs the bigbk Triton path (down/qkv/o win, gate_up ~parity at M>=24).
+    # Gated so single-stream (skinny, M<=5), prefill, and other GPUs never
+    # reach it. The op wants the unpadded activation (it indexes rows by K).
+    if (
+        8 <= M <= 64
+        and group_size in (32, 64, 128)
+        and K % 64 == 0
+        and N % 16 == 0
+        and _on_gfx1x()
+        and not _on_gfx12x()
+        and not _on_gfx1151()
+        and not _on_gfx115x()
+        and os.environ.get("VLLM_W4A16_NO_WMMA") != "1"
+        and raw_a is not None
+    ):
+        import vllm._custom_ops as _ops
+
+        if hasattr(_ops, "wvSplitK_int4_wmma"):
+            # The C++ op wants the unpacked per-nibble zp [N, ng] (values
+            # 0..15), but the weight now carries the packed 4-bit form
+            # [N//8, ng]. Unpack once and cache by weight identity (the same
+            # tensor object is reused every decode step).
+            zp_u = _unpack_zp_for_wmma(zp, N, num_groups, scales.dtype)
+            # C++ binding order: (weight, activation, scale, zero_points,
+            # bias, group_size). NB: the live pre-rebase tree passed
+            # (..., scales, group_size, zp, None) — group_size/zp swapped —
+            # a latent bug (only harmless while zp was None / symmetric).
+            return _ops.wvSplitK_int4_wmma(
+                b_q, raw_a, scales, zp_u, None, group_size
+            )
+
+    # asgard gfx1100 batched-decode fast path: bigger BLOCK_K (a multiple of
+    # group_size) recovers ~1.15-1.35x vs the skinny-fmt kernel at 6<=M<=64.
+    if (
+        6 <= M <= 64
+        and group_size in (32, 64, 128)
+        and K % group_size == 0
+        and _on_gfx1x()
+        and not _on_gfx12x()
+        and not _on_gfx1151()
+        and not _on_gfx115x()
+    ):
+        return _bigbk_gemm(a, b_q, scales, zp, group_size, zp_bias=zp_bias)
+
 
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 
@@ -616,6 +773,7 @@ def _rdna_hybrid_w4a16_apply_impl(
     with ctx:
         output = triton_w4a16_skinny_fmt_gemm(
             a=_pad_activation_rows(x_2d),
+            raw_a=x_2d,  # asgard WMMA decode gate wants the unpadded rows
             b_q=w_q.view(torch.int32),
             scales=w_s,
             group_size=group_size,

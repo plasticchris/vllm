@@ -361,6 +361,10 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
 
         """
+        # 2c (leyline kv-splice, design §2c): a spliced request carries a donor-contaminated suffix past (s + r) -- its KV past that point belongs to the donor's middle/suffix, not the target's tokens. A later request sharing the target suffix (but a different middle) must NOT hit that donor KV. Clamp APC registration to the cap set at admission (request._leyline_max_cacheable_tokens = s + r) so the clean prefix [0..s) and fresh replacement [s..s+r) still register but the contaminated suffix never does. Mode-off requests carry no cap (getattr -> None) so this is a no-op for the ordinary path.
+        max_cacheable = getattr(request, "_leyline_max_cacheable_tokens", None)
+        if max_cacheable is not None:
+            num_computed_tokens = min(num_computed_tokens, max_cacheable)
         boundaries = replay_boundaries(
             request.num_prompt_tokens,
             self.scheduler_block_size,

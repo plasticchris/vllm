@@ -521,6 +521,46 @@ class SpeculativeConfig:
     Each entry is ``(range_start, range_end, num_speculative_tokens)`` with an
     inclusive batch-size range.
     """
+    long_context_threshold: int | None = Field(default=None, ge=1)
+    """Decode context length where dynamic SD caps K to the long-context value."""
+    long_context_num_speculative_tokens: int | None = Field(default=None, ge=0)
+    """Maximum K at or above ``long_context_threshold``."""
+    greedy_num_speculative_tokens: int | None = Field(default=None, ge=0)
+    """Maximum K for requests using greedy target sampling."""
+
+    profitability_aware_min_batch_size: int | None = Field(default=None, ge=1)
+    """Minimum dynamic-schedule batch size eligible for online K=2/K=3
+    profitability selection. ``None`` disables the controller."""
+
+    profitability_window: int = Field(default=16, ge=4)
+    """Recent decode-only throughput observations retained per batch size and K."""
+
+    profitability_min_samples: int = Field(default=4, ge=1)
+    """Observations required for both K values before exploitation."""
+
+    profitability_exploration_interval: int = Field(default=32, ge=2)
+    """Selections between probes of the currently slower K value."""
+
+    profitability_hysteresis: float = Field(default=0.03, ge=0.0, le=0.5)
+    """Required committed-token throughput advantage before switching to K=2."""
+
+    profitability_acceptance_threshold: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    """Optional recent K=3 draft acceptance floor. Below this value the
+    controller temporarily uses K=2, with periodic K=3 probes for recovery."""
+
+    profitability_acceptance_window: int = Field(default=8, ge=2)
+    """Per-active-request K=3 acceptance observations used by the content gate."""
+
+    profitability_state_path: str | None = None
+    """Optional JSON file used to warm-start online profitability history."""
+
+    profitability_state_save_interval: int = Field(default=16, ge=1)
+    """New profitability observations between atomic state checkpoints."""
+
+    profitability_state_ttl_seconds: float = Field(default=86400.0, gt=0.0)
+    """Maximum age of compatible persisted profitability observations."""
 
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -1201,6 +1241,30 @@ class SpeculativeConfig:
         return len(parts) >= 2 and all(part.isidentifier() for part in parts)
 
     def __post_init__(self):
+        if (self.long_context_threshold is None) != (
+            self.long_context_num_speculative_tokens is None
+        ):
+            raise ValueError(
+                "long_context_threshold and long_context_num_speculative_tokens "
+                "must be configured together"
+            )
+        if (
+            self.long_context_threshold is not None
+            and self.num_speculative_tokens_per_batch_size is None
+        ):
+            raise ValueError(
+                "long-context K requires num_speculative_tokens_per_batch_size "
+                "so every runtime K has a captured graph"
+            )
+        if (
+            self.greedy_num_speculative_tokens is not None
+            and self.num_speculative_tokens_per_batch_size is None
+        ):
+            raise ValueError(
+                "greedy K requires num_speculative_tokens_per_batch_size so "
+                "every runtime K has a captured graph"
+            )
+
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -1891,6 +1955,12 @@ class SpeculativeConfig:
             return AttentionBackendEnum[value.upper()]
         return value
 
+    profitability_state_half_life_seconds: float = Field(default=21600.0, gt=0.0)
+    """Age-based half-life for persisted profitability sample counts."""
+
+    profitability_neighbor_batch_radius: int = Field(default=2, ge=0)
+    """Nearby batch-size radius used to warm-start sparse profitability data."""
+
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
         if self.tensor_parallel_size is not None:
@@ -1924,6 +1994,14 @@ class SpeculativeConfig:
             raise ValueError(
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
+            )
+
+        if (
+            self.profitability_aware_min_batch_size is not None
+            and self.profitability_min_samples > self.profitability_window
+        ):
+            raise ValueError(
+                "profitability_min_samples cannot exceed profitability_window"
             )
 
         if self.rejection_sample_method == "synthetic":
