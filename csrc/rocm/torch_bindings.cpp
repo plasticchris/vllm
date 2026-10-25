@@ -38,6 +38,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int group_size) -> Tensor");
   rocm_ops.impl("wvSplitK_int4_g", torch::kCUDA, &wvSplitK_int4_g);
 
+  // W8A16 (RDNA3): fp8 e4m3fn weights, fp32 group scales, no zero points.
+  rocm_ops.def(
+      "wvSplitK_fp8_g(Tensor in_a, Tensor in_b, Tensor in_scale, "
+      "Tensor? in_bias, int CuCount, int group_size) -> Tensor");
+  rocm_ops.impl("wvSplitK_fp8_g", torch::kCUDA, &wvSplitK_fp8_g);
+
   // W4A16 fused int4-dequant WMMA GEMM for gfx1100 batched decode (M=8..64)
   rocm_ops.def(
       "wvSplitK_int4_wmma(Tensor weight, Tensor activation, Tensor scale, "

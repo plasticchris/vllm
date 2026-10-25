@@ -15,6 +15,14 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
                               const std::optional<at::Tensor>& in_bias,
                               const int64_t CuCount, const int64_t group_size);
 
+// W8A16 (RDNA3): fp8 e4m3fn weights, fp32 group scales.
+// in_a: [M, K] fp8, in_b: [N, K] fp16/bf16, in_scale: [M, K/group_size] fp32.
+// Returns C[N, M]. No zero points (fp8 is signed/symmetric).
+torch::Tensor wvSplitK_fp8_g(const at::Tensor& in_a, const at::Tensor& in_b,
+                             const at::Tensor& in_scale,
+                             const std::optional<at::Tensor>& in_bias,
+                             const int64_t CuCount, const int64_t group_size);
+
 torch::Tensor wvSplitK_int4_wmma(const at::Tensor& weight, const at::Tensor& activation,
                                 const at::Tensor& scale,
                                 const std::optional<at::Tensor>& zero_points,
