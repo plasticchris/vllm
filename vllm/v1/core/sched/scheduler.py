@@ -284,6 +284,11 @@ class Scheduler(SchedulerInterface):
             ) from e
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
+        # requests skipped in waiting flow due async deps or constraints.
+        # (asgard short-prefill-priority scans it; upstream's refactored
+        # scheduler puts scan-skipped requests back at the front of waiting at
+        # end of step, so this stays empty and waiting carries them)
+        self.skipped_waiting = create_request_queue(self.policy)
         # Waiting requests that hold KV blocks are always drained before
         # self.waiting: a block-holder must never sit behind a request whose
         # failed allocation would stop the scheduling scan.
@@ -741,32 +746,13 @@ class Scheduler(SchedulerInterface):
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
-        ckpt_block_size = (
-            self.hash_block_size if self.mamba_partial_cache_hit else self.block_size
-        )
-        last_cache_position = get_mamba_prefill_checkpoint_position(
-            request.num_tokens,
-            block_size,
-            self.use_eagle_block_drop,
-        )
+        last_cache_position = request.num_tokens - request.num_tokens % block_size
+        if self.use_eagle:
+            last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
-        checkpoint_position = get_mamba_prefill_checkpoint_position(
-            prefill_end,
-            ckpt_block_size,
-            drop_eagle_block=self.use_eagle_block_drop,
-        )
         use_internal_checkpoint = (
-            self.mamba_has_prefill_checkpoint_blocks
-            and end >= prefill_end
-            and is_mamba_prefill_checkpoint_valid(
-                query_start=start,
-                query_end=end,
-                checkpoint_position=checkpoint_position,
-                hash_block_size=self.hash_block_size,
-                mamba_block_size=block_size,
-                checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
-            )
+            self.mamba_has_prefill_checkpoint_blocks and start % block_size == 0
         )
         if use_internal_checkpoint:
             last_cache_position = 0
@@ -790,38 +776,26 @@ class Scheduler(SchedulerInterface):
 
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
-            get_mamba_prefill_checkpoint_position(
-                request.num_prompt_tokens,
-                self.hash_block_size,
-                self.use_eagle_block_drop,
-            )
-            if self.mamba_partial_cache_hit and not use_internal_checkpoint
+            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+            if self.mamba_partial_cache_hit
             else 0
-        )
-        junction = request.shared_prefix_boundary
-        # Block-floored: a sub-block junction's state is not separately cacheable.
-        block_floored = start + (junction - start) // block_size * block_size
-        # Past the prompt the manager writes nothing, so fall back to the
-        # block-floored stop rather than dropping it: a resumed request replaying
-        # output tokens can still observe a junction there.
-        junction_stop = (
-            junction
-            if self.mamba_shared_prefix_checkpoint
-            and junction <= request.num_prompt_tokens
-            else block_floored
         )
         stops = (
             # A chunk starting mid-block must stop at the next boundary.
             next_block_boundary if start % block_size != 0 else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
-            # Stop at the prompt checkpoint unless the backend saves it internally.
+            # Fine-grained hits: the prompt's partial-tail entry can only be
+            # registered by a chunk ending exactly at its last hash boundary.
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
-            # Marconi shared-prefix junction: cache its state so sibling
-            # requests sharing the prefix can reuse it.
-            junction_stop if start < junction < end else 0,
+            # Marconi shared-prefix junction, block-floored (a sub-block
+            # junction's state is not separately cacheable): cache its state
+            # so sibling requests sharing the prefix can reuse it.
+            start + (request.shared_prefix_boundary - start) // block_size * block_size
+            if start < request.shared_prefix_boundary < end
+            else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
@@ -1489,6 +1463,14 @@ class Scheduler(SchedulerInterface):
             long_prefill_token_threshold = max(
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
+        # Rebase note: asgard's raw `long_prefill_threshold` cap (both loops)
+        # intentionally differs from upstream's refined cap: it fires even for
+        # a lone request (no alone-exemption) and has no adaptive fair-share
+        # floor. test_short_prefill_preempts_running_long_prefill_chunk
+        # depends on that. The two upstream tests of the pre-asgard behavior
+        # (test_long_prefill_threshold_ignored_when_alone / _floored_by_fair_
+        # share) therefore fail here by design (documented in the rebase plan;
+        # asgard deliberately capped a lone in-flight long prefill).
 
         # Local prefill cadence: hold prefill until the interval since the last
         # prefill-carrying step has elapsed, so decode runs in longer
@@ -2385,10 +2367,16 @@ class Scheduler(SchedulerInterface):
                         )
                     self._inflight_prefills.add(request)
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
-                    skip_request(request_queue)
+                    # `request` was already popped above (asgard prefix-trace
+                    # admission): re-queue it here instead of popping again
+                    # (the double pop dropped every admitted request).
+                    self.deferred_waiting.add(request)
+                    if self._holds_kv_blocks(request):
+                        step_skipped_kv_holding.appendleft(request)
+                    else:
+                        step_skipped_waiting.appendleft(request)
                     continue
 
-                request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
                 self.running.append(request)
                 if num_external_computed_tokens > 0:
@@ -3335,6 +3323,9 @@ class Scheduler(SchedulerInterface):
             ec_transfer_params = None
             prefill_stats = None
             status_before_stop = request.status
+            # asgard decode-gap telemetry: capture the pre-step output length
+            # (dropped by the rebase union; the gap sampling below needs it).
+            num_output_tokens_before = len(request._output_token_ids)
 
             # Check for stop and update request status.
             if new_token_ids:

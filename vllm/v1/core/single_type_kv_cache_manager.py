@@ -1820,11 +1820,15 @@ class MambaManager(SingleTypeKVCacheManager):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
         if self.mamba_cache_mode == "align":
             return
         super().allocate_external_computed_blocks(
-            request_id, num_local_computed_tokens, num_external_computed_tokens
+            request_id,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+            record_for_zeroing,
         )
 
     def allocate_new_blocks(

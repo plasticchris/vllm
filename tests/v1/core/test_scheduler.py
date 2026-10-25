@@ -4308,10 +4308,10 @@ def test_spec_decode_padding_dropped_when_recurrent_alignment_clips(
     scheduler.need_mamba_block_aligned_split = True
     original_split = scheduler._mamba_block_aligned_split
 
-    def align_prompt_tail(request, num_new_tokens, *args):
+    def align_prompt_tail(request, num_new_tokens, *args, **kwargs):
         if request is r2:
             return aligned_tokens
-        return original_split(request, num_new_tokens, *args)
+        return original_split(request, num_new_tokens, *args, **kwargs)
 
     scheduler._mamba_block_aligned_split = align_prompt_tail
     scheduler.add_request(r2)
@@ -9220,7 +9220,7 @@ def _create_hybrid_mamba_connector_scheduler(
         ],
     )
     register_all_kvcache_specs(vllm_config)
-    return Scheduler(
+    scheduler = Scheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         structured_output_manager=StructuredOutputManager(vllm_config),
@@ -9228,6 +9228,12 @@ def _create_hybrid_mamba_connector_scheduler(
         hash_block_size=block_size,
         log_stats=True,
     )
+    # Rebase port: asgard's original fixture ran under mamba_cache_mode="all"
+    # (no aligned prefill splits). Upstream dropped the "all" literal (now
+    # align|none), so emulate it: keep the "align" spec (valid literal) but
+    # disable the aligned-split behavior that "all" never had.
+    scheduler.need_mamba_block_aligned_split = False
+    return scheduler
 
 
 def _seed_hybrid_prefix(
