@@ -266,6 +266,15 @@ def _draft_qsa_metadata(
         logical_positions=torch.tensor(logical_positions, dtype=torch.int64),
         k_work_metadata=torch.empty(0, 2, dtype=torch.int32),
         num_actual_tokens=num_tokens,
+        # Rebase (upstream) QSAForwardMetadata requires the pre/post-decode
+        # split fields; the draft-update path under test does not read them.
+        visible_blocks=torch.empty(0, 1, dtype=torch.int32),
+        num_decodes=len(seq_lens),
+        num_decode_tokens=num_tokens,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        max_query_len=1,  # one query token per request (query_start_loc is arange)
+        decode_query_len=1,
         max_seq_len=max(seq_lens),
         compact_indexer=False,
         storage_block_size=storage_block_size,

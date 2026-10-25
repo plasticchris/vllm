@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -21,8 +22,13 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
+    QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    create_fp8_scale_parameter,
+    create_fp8_weight_parameter,
+    is_fp8,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
