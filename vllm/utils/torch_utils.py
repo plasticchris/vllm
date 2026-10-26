@@ -354,6 +354,19 @@ def get_dtype_size(dtype: torch.dtype) -> int:
     return torch.tensor([], dtype=dtype).element_size()
 
 
+def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
+    """Whether a kv_cache_dtype string denotes a quantized KV cache.
+
+    Re-export of vllm.v1.kv_cache_interface.is_quantized_kv_cache for
+    callers that cannot import it there (import cycle: kv_cache_interface
+    imports torch_utils). Live in kv_cache_interface so the definition
+    stays single-sourced.
+    """
+    from vllm.v1.kv_cache_interface import is_quantized_kv_cache as _iqkc
+
+    return _iqkc(kv_cache_dtype)
+
+
 # bool = 0, int = 1, float = 2, complex = 3
 def _get_precision_level(dtype: torch.dtype) -> int:
     # NOTE: Complex dtypes return `is_floating_point=False`
