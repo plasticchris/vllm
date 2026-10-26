@@ -2142,6 +2142,41 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g
         )
 
 
+def wvSplitK_int8_g(
+    weight: torch.Tensor,
+    activation: torch.Tensor,
+    scale: torch.Tensor,
+    cu_count: int,
+    group_size: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # NOTE: the kernel is weight-major; `weight` is the INT8 operand
+    # (in_a, [out_features, K], one signed byte per value) and `activation`
+    # is in_b ([num_tokens, K]). `scale` is fp32 [out_features, K/group_size].
+    # Returns [num_tokens, out_features].
+    return torch.ops._rocm_C.wvSplitK_int8_g(
+        weight, activation, scale, bias, cu_count, group_size
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int8_g"):
+
+    @register_fake("_rocm_C::wvSplitK_int8_g")
+    def _wvSplitK_int8_g_fake(
+        in_a: torch.Tensor,  # int8 weight [out_features, K]
+        in_b: torch.Tensor,  # activation [num_tokens, K]
+        in_scale: torch.Tensor,
+        in_bias: torch.Tensor | None,
+        CuCount: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        num_tokens = in_b.size(0)
+        out_features = in_a.size(0)
+        return torch.empty(
+            (num_tokens, out_features), dtype=in_b.dtype, device=in_b.device
+        )
+
+
 def mxfp4_w4a8_gemv_rdna3(
     a: torch.Tensor,
     b_q: torch.Tensor,

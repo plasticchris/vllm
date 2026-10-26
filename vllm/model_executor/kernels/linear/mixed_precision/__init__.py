@@ -35,6 +35,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
 from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
     RDNAHybridW4A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w8a16 import (
+    RDNAHybridW8A16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
@@ -59,6 +62,7 @@ __all__ = [
     "MarlinLinearKernel",
     "RDNA3W4A16LinearKernel",
     "RDNAHybridW4A16LinearKernel",
+    "RDNAHybridW8A16LinearKernel",
     "TritonW4A16LinearKernel",
     "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",
