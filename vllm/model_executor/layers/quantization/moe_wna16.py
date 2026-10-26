@@ -513,9 +513,10 @@ class MoeWNA16Method(FusedMoEMethodBase):
         def repack(weight: torch.Tensor) -> torch.Tensor:
             assert weight.dtype == torch.uint8 and weight.is_contiguous()
             packed = weight.view(torch.int32).transpose(1, 2).contiguous()
-            empty_g_idx = torch.empty(0, dtype=torch.int32, device=weight.device)
             for expert in range(packed.shape[0]):
-                ops.gptq_shuffle(packed[expert], empty_g_idx, 4)
+                # Upstream's gptq_shuffle is 2-arg (no g_idx); the identity
+                # shuffle (empty perm) is what the native kernel wants.
+                ops.gptq_shuffle(packed[expert], 4)
             return packed
 
         w13_qweight = repack(layer.w13_qweight.data)

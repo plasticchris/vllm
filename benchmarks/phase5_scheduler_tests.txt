@@ -1,0 +1,15 @@
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/core/test_scheduler.py::test_long_prefill_threshold_ignored_when_alone
+FAILED tests/v1/core/test_scheduler.py::test_long_prefill_threshold_floored_by_fair_share
+FAILED tests/v1/core/test_scheduler.py::test_spec_decode_padding_dropped_when_recurrent_alignment_clips[2]
+FAILED tests/v1/core/test_scheduler.py::test_spec_decode_padding_dropped_when_recurrent_alignment_clips[3]
+FAILED tests/v1/core/test_scheduler.py::test_mamba_align_encoder_cache_cap_makes_progress
+FAILED tests/v1/core/test_scheduler.py::test_hybrid_splice_mode_off_leaves_ordinary_prefill_unchanged
+FAILED tests/v1/core/test_scheduler.py::test_hybrid_splice_mode_on_emits_splices_and_transplant
+FAILED tests/v1/core/test_scheduler.py::test_hybrid_splice_mode_on_no_pin_leak
+FAILED tests/v1/core/test_scheduler.py::test_hybrid_splice_unaligned_replacement_and_multi_block_skip
+FAILED tests/v1/core/test_scheduler.py::test_hybrid_splice_qsa_flash_next_topology_and_rope_splices
+10 failed, 295 passed, 16 warnings in 125.65s (0:02:05)
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
