@@ -316,7 +316,7 @@ class RDNAHybridW8A16LinearKernel(MPLinearKernel):
         from vllm.utils.platform_utils import num_compute_units
 
         c = self.config
-        w_q, w_s, _, _ = self._get_weight_params(layer)
+        w_q, w_s, _ = self._get_weight_params(layer)
 
         x_2d = x.reshape(-1, x.shape[-1])
         N = w_q.shape[0]
