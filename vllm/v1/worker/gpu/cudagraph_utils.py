@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import itertools
+import os
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Sequence
 from contextlib import ExitStack
@@ -182,6 +183,11 @@ class CudaGraphManager:
 
         self._graphs_captured = False
 
+        # [asgard 2026-11-08] per-instance state for the dispatch-miss logger
+        # (several managers exist per worker: target + speculator prefill/decode,
+        # so class-level state would be clobbered by the last constructor).
+        self._cg_debug = {"captured": False, "misses": {}}
+
         # Profiling hooks, set only by profile_cudagraph_memory() below: cap
         # FULL-mode capture at the N largest descriptors and record each
         # captured FULL graph's memory delta for extrapolation.
@@ -199,6 +205,19 @@ class CudaGraphManager:
         self.breakable_cg_runner: BreakableCUDAGraphWrapper | None = None
 
         self._init_candidates()
+        # [asgard 2026-11-08] publish candidate tables for the miss logger.
+        self._cg_debug["cand"] = self._candidates
+        self._cg_debug["capture_descs"] = {
+            str(m): [d.num_tokens for d in ds]
+            for m, ds in self._capture_descs.items()
+        }
+        logger.info(
+            "[asgard-cg] manager init: mode=%s decode_query_len=%d capture_descs=%s "
+            "num_candidates=%d",
+            self.cudagraph_mode, self.decode_query_len,
+            self._cg_debug["capture_descs"],
+            len(self._candidates),
+        )
 
     def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
         """Precompute actual num_active_loras -> effective captured case.
@@ -513,6 +532,12 @@ class CudaGraphManager:
                         compilation_counter.num_cudagraph_captured += 1
 
         self._graphs_captured = True
+        self._cg_debug["captured"] = True
+        logger.info(
+            "[asgard-cg] capture done: %d graphs; FULL sizes=%s", len(self.graphs),
+            sorted({d.num_tokens for d in self.graphs
+                    if d.cg_mode == CUDAGraphMode.FULL}),
+        )
 
     def captured_token_counts(self) -> list[int]:
         """Sorted token counts with a captured graph, ignoring LoRA variants."""
@@ -544,12 +569,53 @@ class CudaGraphManager:
                     num_ubatches,
                 ):
                     return desc
+        if os.getenv("VLLM_CG_DISPATCH_DEBUG", "1") not in ("0", "false", "no"):
+            self._log_dispatch_miss(
+                key, num_reqs, num_tokens, uniform_token_count, max_query_len,
+            )
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_active_loras=effective_loras,
             num_ubatches=num_ubatches,
+        )
+
+    def _log_dispatch_miss(
+        self,
+        key: tuple[int, int],
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        max_query_len: int | None,
+    ) -> None:
+        """[asgard 2026-11-08] Diagnose silent FULL-graph -> NONE (eager) fallbacks.
+
+        The INT8 Qwen3.8-27B MTP server ran every decode step eager (1,227 host
+        launches/step, 3.8us flat gap, zero replay bursts — rocprofv3 live attach)
+        despite captured FULL decode graphs, and dispatch() logged nothing. This
+        records WHY a dispatch fell through, throttled to the first sighting of
+        each distinct shape (plus one reminder every 4096th) so it cannot spam a
+        ~40 step/s decode loop. Set VLLM_CG_DISPATCH_DEBUG=0 to silence.
+        """
+        # Prefill/mixed shapes are eager by design under *_DECODE_ONLY modes;
+        # only shapes that could have matched a decode graph are interesting.
+        if self.cudagraph_mode.decode_mode() == CUDAGraphMode.NONE:
+            return
+        if num_tokens > self.max_num_reqs * self.decode_query_len:
+            return
+        shape = (num_reqs, num_tokens, uniform_token_count, max_query_len)
+        misses = self._cg_debug["misses"]
+        n = misses.get(shape, 0) + 1
+        misses[shape] = n
+        if n > 1 and n % 4096 != 0:
+            return
+        logger.info(
+            "[asgard-cg] dispatch MISS #%d: reqs=%d toks=%d uni=%s mql=%s -> NONE "
+            "(eager); captured=%s key_candidates=%s", n, num_reqs, num_tokens,
+            uniform_token_count, max_query_len,
+            self._cg_debug["captured"],
+            self._cg_debug["cand"].get(key, "<absent>"),
         )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
