@@ -11,6 +11,7 @@
 
 #include "../core/cuda_compat.h"
 #include "dispatch_utils.h"
+#include "skinny_gemms_int8_dispatch.h"
 
 // Combined RDNA macro (gfx11 + gfx12) - both use 32-wide wavefronts
 #if defined(__GFX11__) || defined(__GFX12__)
@@ -508,7 +509,7 @@ static int mindiv_int8(int N, int div1, int div2) {
 // in_bias: optional output bias (fp16/bf16)
 // group_size: 32, 64, or 128
 
-torch::Tensor wvSplitK_int8_g(const at::Tensor& in_a, const at::Tensor& in_b,
+torch::Tensor WV_INT8_ENTRY(const at::Tensor& in_a, const at::Tensor& in_b,
                              const at::Tensor& in_scale,
                              const std::optional<at::Tensor>& in_bias,
                              const int64_t CuCount, const int64_t group_size) {
@@ -553,6 +554,18 @@ torch::Tensor wvSplitK_int8_g(const at::Tensor& in_a, const at::Tensor& in_b,
   const int max_lds_len = get_lds_size_int8() / 2;
   TORCH_CHECK(K_in * N_in <= (int64_t)(max_lds_len * 3),
               "K*N exceeds LDS capacity (medium limit). K=", K_in, " N=", N_in);
+
+#if WV_INT8_DISPATCH_SHARD == 0
+  // Delegate to separate compilation units without duplicating GPU kernels.
+  if (N_in > 2 && N_in <= 12) {
+    auto helper = N_in <= 4 ? wvSplitK_int8_g_3_4
+                : N_in <= 6 ? wvSplitK_int8_g_5_6
+                : N_in <= 8 ? wvSplitK_int8_g_7_8
+                : N_in <= 10 ? wvSplitK_int8_g_9_10
+                            : wvSplitK_int8_g_11_12;
+    return helper(in_a, in_b, in_scale, in_bias, CuCount, group_size);
+  }
+#endif
 
   auto out_c = torch::empty(
       {N_in, M_in},
@@ -615,7 +628,10 @@ torch::Tensor wvSplitK_int8_g(const at::Tensor& in_a, const at::Tensor& in_b,
 #define WVSPLIT_INT8G_TILE(_sYT, __N)                                    \
   {                                                                     \
     if (_int8g_fY > 0 && _int8g_fU > 0) { WVSPLIT_INT8G_FORCE(__N) } else  \
-    if (__N >= 7 && M_in % 8 == 0) {                                    \
+    if (__N >= 9) {                                                   \
+      /* N*YTILE register pressure: 8-row tiles spill at N=12. */       \
+      WVSPLIT_INT8G_GS(4, 1, __N)                                     \
+    } else if (__N >= 7 && M_in % 8 == 0) {                                    \
       /* speculative-decode batch: the wider tile amortizes the weight  \
          read across more output rows */                                \
       WVSPLIT_INT8G_GS(8, 1, __N)                                        \
@@ -636,22 +652,7 @@ torch::Tensor wvSplitK_int8_g(const at::Tensor& in_a, const at::Tensor& in_b,
   {                           \
     int sYT = (M_in + CuCount * 4 - 1) / (CuCount * 4);                \
     switch (N_in) {                                                    \
-      case 1:                                                          \
-        WVSPLIT_INT8G_TILE(sYT, 1) break;                               \
-      case 2:                                                          \
-        WVSPLIT_INT8G_TILE(sYT, 2) break;                               \
-      case 3:                                                          \
-        WVSPLIT_INT8G_TILE(sYT, 3) break;                               \
-      case 4:                                                          \
-        WVSPLIT_INT8G_TILE(sYT, 4) break;                               \
-      case 5:                                                          \
-        WVSPLIT_INT8G_TILE(sYT, 5) break;                               \
-      case 6:                                                          \
-        WVSPLIT_INT8G_TILE(sYT, 6) break;                               \
-      case 7:                                                          \
-        WVSPLIT_INT8G_TILE(sYT, 7) break;                               \
-      case 8:                                                          \
-        WVSPLIT_INT8G_TILE(sYT, 8) break;                               \
+      WV_INT8_CASES                                                    \
       default:                                                         \
         throw std::runtime_error("Unsupported N value: " +            \
                                  std::to_string(N_in));                \

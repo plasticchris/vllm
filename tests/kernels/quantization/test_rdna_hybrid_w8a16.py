@@ -38,6 +38,15 @@ SUPPORTED_GROUP_SIZES = hybrid_module.SUPPORTED_GROUP_SIZES
 MAX_SKINNY_BATCH_SIZE = hybrid_module.MAX_SKINNY_BATCH_SIZE
 
 
+@pytest.fixture(autouse=True)
+def single_rank_parameters(monkeypatch):
+    # Parameter metadata only; these local GEMMs perform no distributed ops.
+    # Avoid the global dist_init fixture's unrelated OpenAI-server dependencies.
+    import vllm.model_executor.parameter as parameter
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+
+
 # ---------------------------------------------------------------------------
 # Reference: exact int8 dequant then matmul in float32, cast back.
 # w_int8: int8 [N, K] (one signed byte per value), scales: [N, K/G] fp32
@@ -150,7 +159,7 @@ def _make_kernel(N, K, G, dtype):
 @pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("group_size", SUPPORTED_GROUP_SIZES)
-def test_w8a16_process_weights_layout(group_size, dtype, dist_init):
+def test_w8a16_process_weights_layout(group_size, dtype):
     """process_weights_after_loading leaves int8 [N,K] weights + fp32 scales."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA/HIP device not available")
@@ -178,10 +187,10 @@ def test_w8a16_process_weights_layout(group_size, dtype, dist_init):
 @pytest.mark.parametrize("group_size", [128])
 @pytest.mark.parametrize(
     "M",
-    [1, 2, MAX_SKINNY_BATCH_SIZE, MAX_SKINNY_BATCH_SIZE + 1, 64],
-    ids=["M1", "M2", "decode", "prefill", "M64"],
+    [1, 2, 3, 6, 8, 9, 10, 11, MAX_SKINNY_BATCH_SIZE,
+     MAX_SKINNY_BATCH_SIZE + 1, 64],
 )
-def test_w8a16_apply_matches_reference(group_size, dtype, M, dist_init):
+def test_w8a16_apply_matches_reference(group_size, dtype, M):
     """Full apply_weights (skinny decode + Triton prefill) matches the reference."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA/HIP device not available")
@@ -198,6 +207,37 @@ def test_w8a16_apply_matches_reference(group_size, dtype, M, dist_init):
     ref = _w8a16_reference(x, w_int8_nk, scales_ckpt_nkg.to(torch.float32), G, bias)
     assert out.shape == (M, N)
     assert_w8a16_close(out, ref)
+
+
+@pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
+@pytest.mark.parametrize("M", [9, 12])
+@pytest.mark.parametrize("N,K", [(1536, 2048), (1280, 5120), (1024, 8192), (1030, 2048)])
+def test_w8a16_mtp_wide_shapes_and_replay(M, N, K):
+    """C3/C4 verification: small/medium LDS paths, output tails and replay."""
+    dtype, G = torch.bfloat16, 128
+    w, scales = _make_weights(N, K, G, dtype)
+    layer = _build_dummy_layer(w, scales)
+    kernel, _ = _make_kernel(N, K, G, dtype)
+    kernel.process_weights_after_loading(layer)
+    x = (0.25 * torch.randn((M, K), device=device)).to(dtype)
+    bias = (0.05 * torch.randn(N, device=device)).to(dtype)
+    out = kernel.apply_weights(layer, x, bias)
+    torch.cuda.synchronize()
+    assert_w8a16_close(out, _w8a16_reference(x, w, scales.float(), G, bias))
+    # Warm on a side stream before capture; replay must use refreshed inputs.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            kernel.apply_weights(layer, x, bias)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = kernel.apply_weights(layer, x, bias)
+    x.mul_(0.5)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_w8a16_close(captured, _w8a16_reference(x, w, scales.float(), G, bias))
 
 
 @pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
