@@ -624,6 +624,15 @@ class CudaGraphManager:
             f"Expected FULL mode, got {desc.cg_mode}"
         )
         assert desc in self.graphs, f"No cudagraph for {desc}"
+        # [asgard 2026-11-08] confirm replays actually happen, throttled per desc.
+        if os.getenv("VLLM_CG_DISPATCH_DEBUG", "1") not in ("0", "false", "no"):
+            n = self._cg_debug["misses"].get(("replay", desc.num_tokens), 0) + 1
+            self._cg_debug["misses"][("replay", desc.num_tokens)] = n
+            if n == 1 or n % 4096 == 0:
+                logger.info(
+                    "[asgard-cg] REPLAY #%d FULL graph toks=%d reqs=%d (graphs=%d)",
+                    n, desc.num_tokens, desc.num_reqs, len(self.graphs),
+                )
         # Sync offloader before replay - needed when transitioning from
         # eager/piecewise to full cudagraph (e.g., prefill → decode).
         # The previous eager iteration's start_prefetch may have queued

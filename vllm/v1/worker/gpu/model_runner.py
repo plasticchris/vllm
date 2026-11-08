@@ -2142,6 +2142,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        # [asgard 2026-11-08] Which execution mode does the step actually take?
+        # Dispatch hit FULL (no misses logged) yet the live kernel trace is 100%
+        # eager, so log the mode at the decision point, throttled per shape.
+        if not dummy_run and os.getenv("VLLM_CG_DISPATCH_DEBUG", "1") not in (
+            "0", "false", "no"
+        ):
+            _shape = (batch_desc.cg_mode, batch_desc.num_tokens, batch_desc.num_reqs)
+            _counts = getattr(self, "_cg_run_counts", None)
+            if _counts is None:
+                self._cg_run_counts = _counts = {}
+            _n = _counts.get(_shape, 0) + 1
+            _counts[_shape] = _n
+            if _n == 1 or _n % 4096 == 0:
+                logger.info(
+                    "[asgard-cg] run step #%d: mode=%s toks=%d reqs=%d uniform=%s "
+                    "(dummy=%s profile=%s)",
+                    _n, batch_desc.cg_mode, batch_desc.num_tokens,
+                    batch_desc.num_reqs, uniform_tok_count,
+                    dummy_run, is_profile,
+                )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
