@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
