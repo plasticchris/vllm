@@ -336,6 +336,11 @@ class LLMEngine:
         # 1) Get EngineCoreOutput from the EngineCore.
         with record_function_or_nullcontext("llm_engine step: get_output"):
             outputs = self.engine_core.get_output()
+            if self.dp_group is not None and not getattr(
+                self.engine_core, "last_step_model_executed", True
+            ):
+                # Match one forward's DP synchronization even on an idle step.
+                self.engine_core.execute_dummy_batch()
         if (
             outputs.kv_cache_usage is not None
             and outputs.kv_cache_free_blocks is not None
@@ -410,9 +415,7 @@ class LLMEngine:
                 spec = outputs.scheduler_stats.spec_decoding_stats
                 self.last_step_stats = StepStats(
                     gen_tokens=(
-                        iteration_stats.num_generation_tokens
-                        if iteration_stats
-                        else 0
+                        iteration_stats.num_generation_tokens if iteration_stats else 0
                     ),
                     prefill_sched_tokens=outputs.step_prefill_tokens,
                     scheduled_total_tokens=outputs.step_scheduled_tokens,
@@ -427,18 +430,12 @@ class LLMEngine:
                         else 0
                     ),
                     preempted_reqs=(
-                        iteration_stats.num_preempted_reqs
-                        if iteration_stats
-                        else 0
+                        iteration_stats.num_preempted_reqs if iteration_stats else 0
                     ),
                     prefix_cache_queries=pc.queries,
                     prefix_cache_hits=pc.hits,
-                    kv_evictions=len(
-                        outputs.scheduler_stats.kv_cache_eviction_events
-                    ),
-                    spec_draft_tokens=spec.num_draft_tokens
-                    if spec is not None
-                    else 0,
+                    kv_evictions=len(outputs.scheduler_stats.kv_cache_eviction_events),
+                    spec_draft_tokens=spec.num_draft_tokens if spec is not None else 0,
                     spec_accepted_tokens=spec.num_accepted_tokens
                     if spec is not None
                     else 0,
@@ -523,17 +520,19 @@ class LLMEngine:
         """
         self.engine_core.reset_encoder_cache()
 
-    def sleep(self, level: int = 1, mode: PauseMode = "abort"):
+    def sleep(
+        self, level: int = 1, mode: PauseMode = "abort", reset_connector: bool = True
+    ):
         if level >= 1:
             self.renderer.clear_mm_cache()
-        self.engine_core.sleep(level, mode)
+        self.engine_core.sleep(level, mode, reset_connector)
 
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(1, level)
 
-    def release_kv_cache_memory(self) -> None:
+    def release_kv_cache_memory(self, reset_connector: bool = True) -> None:
         self.renderer.clear_mm_cache()
-        self.engine_core.release_kv_cache_memory()
+        self.engine_core.release_kv_cache_memory(reset_connector)
 
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(1, 0)

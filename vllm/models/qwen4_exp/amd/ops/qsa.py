@@ -883,8 +883,7 @@ def qsa_sparse_paged_attention(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 or FP8-E4M3 K/V caches."""
-
+    """Run sparse GQA over paged BF16 or scaled FP8-E4M3 K/V caches."""
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires a GPU and Triton")
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
@@ -903,8 +902,12 @@ def qsa_sparse_paged_attention(
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
-    use_fp8 = k_cache.dtype == torch.float8_e4m3fn
-    if k_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+    use_fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if k_cache.dtype not in (
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
         raise ValueError("QSA K/V cache must be BF16 or FP8-E4M3")
     if use_fp8:
         if k_scale is None or v_scale is None:
