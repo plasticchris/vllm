@@ -13,6 +13,12 @@ WV_INT8_DECLARE(wvSplitK_int8_g_5_6)
 WV_INT8_DECLARE(wvSplitK_int8_g_7_8)
 WV_INT8_DECLARE(wvSplitK_int8_g_9_10)
 WV_INT8_DECLARE(wvSplitK_int8_g_11_12)
+WV_INT8_DECLARE(wvSplitK_int8_g_13_14)
+WV_INT8_DECLARE(wvSplitK_int8_g_15_16)
+WV_INT8_DECLARE(wvSplitK_int8_g_17_18)
+WV_INT8_DECLARE(wvSplitK_int8_g_19_20)
+WV_INT8_DECLARE(wvSplitK_int8_g_21_22)
+WV_INT8_DECLARE(wvSplitK_int8_g_23_24)
 #undef WV_INT8_DECLARE
 
 #define WV_INT8_CASE(n) case n: WVSPLIT_INT8G_TILE(sYT, n) break;
@@ -34,6 +40,24 @@ WV_INT8_DECLARE(wvSplitK_int8_g_11_12)
 #elif WV_INT8_DISPATCH_SHARD == 5
 #define WV_INT8_ENTRY wvSplitK_int8_g_11_12
 #define WV_INT8_CASES WV_INT8_CASE(11) WV_INT8_CASE(12)
+#elif WV_INT8_DISPATCH_SHARD == 6
+#define WV_INT8_ENTRY wvSplitK_int8_g_13_14
+#define WV_INT8_CASES WV_INT8_CASE(13) WV_INT8_CASE(14)
+#elif WV_INT8_DISPATCH_SHARD == 7
+#define WV_INT8_ENTRY wvSplitK_int8_g_15_16
+#define WV_INT8_CASES WV_INT8_CASE(15) WV_INT8_CASE(16)
+#elif WV_INT8_DISPATCH_SHARD == 8
+#define WV_INT8_ENTRY wvSplitK_int8_g_17_18
+#define WV_INT8_CASES WV_INT8_CASE(17) WV_INT8_CASE(18)
+#elif WV_INT8_DISPATCH_SHARD == 9
+#define WV_INT8_ENTRY wvSplitK_int8_g_19_20
+#define WV_INT8_CASES WV_INT8_CASE(19) WV_INT8_CASE(20)
+#elif WV_INT8_DISPATCH_SHARD == 10
+#define WV_INT8_ENTRY wvSplitK_int8_g_21_22
+#define WV_INT8_CASES WV_INT8_CASE(21) WV_INT8_CASE(22)
+#elif WV_INT8_DISPATCH_SHARD == 11
+#define WV_INT8_ENTRY wvSplitK_int8_g_23_24
+#define WV_INT8_CASES WV_INT8_CASE(23) WV_INT8_CASE(24)
 #else
 #error Invalid INT8 dispatch shard
 #endif

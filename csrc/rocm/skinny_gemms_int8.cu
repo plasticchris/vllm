@@ -557,12 +557,18 @@ torch::Tensor WV_INT8_ENTRY(const at::Tensor& in_a, const at::Tensor& in_b,
 
 #if WV_INT8_DISPATCH_SHARD == 0
   // Delegate to separate compilation units without duplicating GPU kernels.
-  if (N_in > 2 && N_in <= 12) {
+  if (N_in > 2 && N_in <= 24) {
     auto helper = N_in <= 4 ? wvSplitK_int8_g_3_4
                 : N_in <= 6 ? wvSplitK_int8_g_5_6
                 : N_in <= 8 ? wvSplitK_int8_g_7_8
                 : N_in <= 10 ? wvSplitK_int8_g_9_10
-                            : wvSplitK_int8_g_11_12;
+                : N_in <= 12 ? wvSplitK_int8_g_11_12
+                : N_in <= 14 ? wvSplitK_int8_g_13_14
+                : N_in <= 16 ? wvSplitK_int8_g_15_16
+                : N_in <= 18 ? wvSplitK_int8_g_17_18
+                : N_in <= 20 ? wvSplitK_int8_g_19_20
+                : N_in <= 22 ? wvSplitK_int8_g_21_22
+                            : wvSplitK_int8_g_23_24;
     return helper(in_a, in_b, in_scale, in_bias, CuCount, group_size);
   }
 #endif

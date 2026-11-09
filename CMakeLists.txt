@@ -1622,7 +1622,13 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/skinny_gemms_int8_5_6.cu"
       "csrc/rocm/skinny_gemms_int8_7_8.cu"
       "csrc/rocm/skinny_gemms_int8_9_10.cu"
-      "csrc/rocm/skinny_gemms_int8_11_12.cu")
+      "csrc/rocm/skinny_gemms_int8_11_12.cu"
+      "csrc/rocm/skinny_gemms_int8_13_14.cu"
+      "csrc/rocm/skinny_gemms_int8_15_16.cu"
+      "csrc/rocm/skinny_gemms_int8_17_18.cu"
+      "csrc/rocm/skinny_gemms_int8_19_20.cu"
+      "csrc/rocm/skinny_gemms_int8_21_22.cu"
+      "csrc/rocm/skinny_gemms_int8_23_24.cu")
     hipify_sources_target(VLLM_SKINNY_HIP_SRCS _rocm_C_skinny "${VLLM_SKINNY_SRC}")
     unset(_VLLM_LAST_HIPIFY_TARGET)
     add_library(_rocm_C_skinny OBJECT ${VLLM_SKINNY_HIP_SRCS})
