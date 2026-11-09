@@ -37,7 +37,7 @@ SUPPORTED_GROUP_SIZES = [32, 64, 128]
 # MTP K=2 verifies three rows/request: C3/C4 require native M=9/12.
 # Keep this in sync with the N_in switch in skinny_gemms_int8.cu. Larger
 # K*M shapes must still use Triton: the native medium kernel has an LDS bound.
-MAX_SKINNY_BATCH_SIZE = 12
+MAX_SKINNY_BATCH_SIZE = 24
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
 
