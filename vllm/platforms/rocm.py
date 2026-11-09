@@ -769,11 +769,14 @@ class RocmPlatform(Platform):
         # TODO: Make this explicit in the selector in a future PR.
         if is_encoder_decoder and AttentionBackendEnum.ROCM_ATTN in backend_priorities:
             backend_priorities.remove(AttentionBackendEnum.ROCM_ATTN)
-        # On gfx1201 and gfx1100, prefer TRITON_ATTN over ROCM_ATTN. An
-        # fp8_e5m2 KV cache keeps ROCM_ATTN: Attention rejects fp8_e5m2 for
-        # backends that take an fp8 query, as TRITON_ATTN does on gfx1201.
+        # Keep gfx1100 on ROCM_ATTN by default: promoting TRITON_ATTN
+        # regressed the Asgard Qwen hybrid long-context production workload
+        # (short-prompt canaries did not catch it). Explicit backend selection
+        # and ROCM_PREFER_TRITON_ATTN=1 still opt in through the existing paths.
+        # Preserve upstream's gfx1201 preference. An fp8_e5m2 KV cache keeps
+        # ROCM_ATTN because TRITON_ATTN takes an fp8 query on gfx1201.
         if (
-            (on_gfx1201() or on_gfx1100())
+            on_gfx1201()
             and AttentionBackendEnum.ROCM_ATTN in backend_priorities
             and AttentionBackendEnum.TRITON_ATTN in backend_priorities
             and attn_selector_config.kv_cache_dtype != "fp8_e5m2"

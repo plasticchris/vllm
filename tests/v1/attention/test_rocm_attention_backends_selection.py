@@ -443,8 +443,8 @@ def test_standard_attention_backend_selection(
     monkeypatch,
 ):
     """Standard ROCm backends remain selectable without DCP and reject DCP."""
-    # These cases describe vLLM's default order; gfx1201 and gfx1100 swap
-    # ROCM_ATTN and TRITON_ATTN (covered by test_rdna_prefers_triton_attn).
+    # These cases describe vLLM's default order; gfx1201 swaps ROCM_ATTN
+    # and TRITON_ATTN (covered by test_rdna_prefers_triton_attn).
     import vllm.platforms.rocm as rocm
 
     monkeypatch.setattr(rocm, "on_gfx1201", lambda: False)
@@ -500,14 +500,13 @@ _AUTO_KV = dict(
 @pytest.mark.parametrize(
     "arch, selector_kwargs, selected_backend, expected_backend",
     [
-        # gfx1201 and gfx1100: TRITON_ATTN, including where ROCM_ATTN would use its
-        # HIP paged-attention decode kernel (head 128, block 16, bf16, `auto` KV).
+        # gfx1201 keeps upstream's Triton preference; gfx1100 preserves the
+        # ROCM_ATTN production default after the long-context regression.
         ("gfx1201", {}, None, AttentionBackendEnum.TRITON_ATTN),
-        ("gfx1100", {}, None, AttentionBackendEnum.TRITON_ATTN),
-        # An fp8 cache is swapped too; fp8_e5m2 keeps ROCM_ATTN (see
-        # get_valid_backends()).
+        ("gfx1100", {}, None, AttentionBackendEnum.ROCM_ATTN),
+        # An fp8 cache is swapped on gfx1201 too; fp8_e5m2 keeps ROCM_ATTN.
         ("gfx1201", {"kv_cache_dtype": "fp8"}, None, AttentionBackendEnum.TRITON_ATTN),
-        ("gfx1100", {"kv_cache_dtype": "fp8"}, None, AttentionBackendEnum.TRITON_ATTN),
+        ("gfx1100", {"kv_cache_dtype": "fp8"}, None, AttentionBackendEnum.ROCM_ATTN),
         (
             "gfx1201",
             {"kv_cache_dtype": "fp8_e5m2"},
@@ -526,6 +525,12 @@ _AUTO_KV = dict(
             {},
             AttentionBackendEnum.ROCM_ATTN,
             AttentionBackendEnum.ROCM_ATTN,
+        ),
+        (
+            "gfx1100",
+            {},
+            AttentionBackendEnum.TRITON_ATTN,
+            AttentionBackendEnum.TRITON_ATTN,
         ),
         # Other RDNA archs keep vLLM's default order (ROCM_ATTN first).
         ("gfx1200", {}, None, AttentionBackendEnum.ROCM_ATTN),
