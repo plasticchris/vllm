@@ -274,6 +274,7 @@ class Request:
                 self.block_hashes = saved_hashes
 
         self.prefix_cache_hit_limit = self.get_prefix_cache_hit_limit()
+        self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
         # Used for streaming
         self.resumable = resumable
@@ -391,6 +392,19 @@ class Request:
         # KV connector hits are not bounded by prefix_cache_hit_limit, so a
         # bounded request reuses only the local prefix cache.
         return self.prefix_cache_hit_limit is not None
+
+    def get_skip_reading_prefix_cache(self) -> bool:
+        if (
+            self.sampling_params is not None
+            and self.sampling_params.skip_reading_prefix_cache is not None
+        ):
+            return self.sampling_params.skip_reading_prefix_cache
+        elif (
+            self.pooling_params is not None
+            and self.pooling_params.skip_reading_prefix_cache is not None
+        ):
+            return self.pooling_params.skip_reading_prefix_cache
+        return False
 
     def get_prefix_cache_hit_limit(self) -> int | None:
         """Number of leading tokens that may be read from the prefix cache:
