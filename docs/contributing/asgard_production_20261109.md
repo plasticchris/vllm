@@ -22,6 +22,7 @@ at those forks and its gitlinks pin the commits shown.
 | torchvision | `plasticchris/vision`, `integrate/vision-0.29-20261109` | `230957624c30adba69ecd119fe8e9b5b1b867439` |
 | RCCL | `plasticchris/rccl`, `integrate/rccl-develop-20261109` | `826ec54b0ded66433bd6827ee8971f01ab198d22` |
 | ROCr | `plasticchris/rocm-systems`, `integrate/rocr-develop-20261109` | `0900204aed48b04e20cc435d8673ed99ca57605d` |
+| FlashAttention | `plasticchris/flash-attention`, `integrate/triton-3.9-20261109` | `121d5541f3b0b4e5d65edf2eee095ad2d659a45b` |
 | Serving launcher | `plasticchris/rukhm`, `main` | `5d0534104e2e62fb1882b794acc2283ce5e3fcd3` |
 
 AITER `plasticchris/aiter`, branch `integrate/aiter-20261109`, commit
@@ -79,11 +80,15 @@ unknown build:
 - Production patched file: `df0a8f973e216f5a3c6f19603ee8fcc68e69695916b249d7d595ee49a99c96e4`
 - Patch: `04b35fc0cb33de54be36e13c9849e26d092cb051c1931078e5d91d9b64c71137`
 
-The local `flash_attn` copy came from `venv-dsv41`, not from a source fork or a
-recorded reproducible wheel. Its Python package files were compared: this was
-the only modified `.py` file. Its top-level import requires a CUDA extension
-that was not built; **do not claim a complete FlashAttention installation or
-backward-kernel GPU qualification** from the production serving test.
+The local `flash_attn` copy came from `venv-dsv41`, not a recorded reproducible
+wheel. All 85 installed Python files in the original local package were
+byte-identical to upstream `v2.8.3` (`060c9188beec3a8b62b33a3bfa6d5d2d44975fab`).
+The new personal fork branch at `121d5541f3b0b4e5d65edf2eee095ad2d659a45b`
+contains the same patch; its modified file is byte-identical to production.
+The fork's AMD Triton modules pass CPU-only import with Triton 3.9, while the
+unpatched source fails as the negative control. Its top-level import requires
+a CUDA extension that was not built; **do not claim a complete FlashAttention
+installation or backward-kernel GPU qualification** from the serving test.
 
 ## Qualification and rollback
 
