@@ -268,6 +268,20 @@ class SchedulerConfig:
     steps. This protects inter-token latency on a single engine and aligns
     prefill work across ranks in data-parallel deployments."""
 
+    prefill_schedule_auto_hold_share: float = Field(default=0.0, ge=0.0, le=4.0)
+    """Measurement-sized prefill hold (0.0 = off). After a step that carried
+    prefill, prefill is held for as many executed steps as fit in this
+    fraction of that step's measured wall time at a decode-only step's (running
+    means of both, from step wall times; at most
+    ``prefill_schedule_auto_hold_max_steps``; 1 until a decode step has been
+    timed). A fixed interval is wrong both ways: a fixed number of
+    decode-only steps costs the prefill whatever N decode steps cost, which
+    grows with the number of decoders, and is too few where decode steps are
+    cheap. Sizing the hold from measured step times adapts to both."""
+
+    prefill_schedule_auto_hold_max_steps: int = Field(default=64, ge=1)
+    """Upper bound on the auto-sized prefill hold, in executed steps."""
+
     decode_active_prefill_token_budget: int | None = Field(default=None, ge=1)
     """Maximum prefill tokens per step while decode requests are active."""
 

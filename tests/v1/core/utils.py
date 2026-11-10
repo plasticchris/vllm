@@ -89,6 +89,8 @@ def create_scheduler(
     cache_aware_admission_window: int = 0,
     cache_aware_admission_threshold: float = 0.5,
     prefill_schedule_interval: int = 1,
+    prefill_schedule_auto_hold_share: float = 0.0,
+    prefill_schedule_auto_hold_max_steps: int = 64,
     scheduling_policy: SchedulerPolicy = "fcfs",
     diffusion_canvas_length: int | None = None,
     scheduler_cls: type[Scheduler] | None = None,
@@ -147,6 +149,8 @@ def create_scheduler(
         cache_aware_admission_window=cache_aware_admission_window,
         cache_aware_admission_threshold=cache_aware_admission_threshold,
         prefill_schedule_interval=prefill_schedule_interval,
+        prefill_schedule_auto_hold_share=prefill_schedule_auto_hold_share,
+        prefill_schedule_auto_hold_max_steps=prefill_schedule_auto_hold_max_steps,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
         policy=scheduling_policy,

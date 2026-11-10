@@ -1291,6 +1291,129 @@ def test_prefill_cadence_counts_executed_steps_not_schedule_calls():
     assert scheduler.current_step > scheduler.num_executed_steps
 
 
+def test_prefill_auto_hold_share_is_off_by_default():
+    """With the share unset, a waiting prefill is admitted on the very next
+    step regardless of the last prefill-carrying step.
+    """
+    scheduler = create_scheduler()
+    assert scheduler.prefill_auto_hold_share == 0.0
+    _start_decoding(scheduler)
+
+    (new_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["new0"])
+    scheduler.add_request(new_req)
+    output = scheduler.schedule()
+    assert "new0" in output.num_scheduled_tokens
+
+
+def test_prefill_auto_hold_sizes_the_hold_from_measured_step_times():
+    """The hold is SHARE times a chunk step's time at a decode step's: a
+    0.25 share with a 4x chunk costs four decode steps; the cap binds at
+    ``max_steps``; 1 until a decode step has been timed; never 0."""
+    scheduler = create_scheduler(prefill_schedule_auto_hold_share=0.25)
+    assert scheduler._prefill_auto_hold_ema_chunk_s == 0.0
+    assert scheduler._prefill_auto_hold_steps() == 1
+
+    scheduler._prefill_auto_hold_ema_decode_s = 1.0
+    scheduler._prefill_auto_hold_ema_chunk_s = 4.0
+    assert scheduler._prefill_auto_hold_steps() == 1
+    # 0.25 * 4.0 / 1.0 = 1.0 -> int(1.0) = 1; make the ratio land above 1.
+    scheduler._prefill_auto_hold_ema_chunk_s = 16.0
+    assert scheduler._prefill_auto_hold_steps() == 4
+
+    scheduler.prefill_auto_hold_max_steps = 2
+    assert scheduler._prefill_auto_hold_steps() == 2
+
+    scheduler.prefill_auto_hold_share = 4.0
+    assert scheduler._prefill_auto_hold_steps() == 2
+
+    # Fold step wall times the way update_from_output does: exponential means.
+    scheduler2 = create_scheduler(prefill_schedule_auto_hold_share=0.25)
+    scheduler2._prefill_auto_hold_note_step(0.4, carried_prefill=True)
+    assert scheduler2._prefill_auto_hold_ema_chunk_s == pytest.approx(0.4)
+    scheduler2._prefill_auto_hold_note_step(0.4, carried_prefill=True)
+    assert scheduler2._prefill_auto_hold_ema_chunk_s == pytest.approx(0.4)
+    scheduler2._prefill_auto_hold_note_step(0.1, carried_prefill=False)
+    assert scheduler2._prefill_auto_hold_ema_decode_s == pytest.approx(0.1)
+    # 0.25 * 0.4 / 0.1 = 1.0 -> 1 step.
+    assert scheduler2._prefill_auto_hold_steps() == 1
+
+
+def test_prefill_auto_hold_holds_prefill_then_admits():
+    """A waiting prefill is held for the measured number of decode-only steps
+    after a prefill-carrying step, then admitted, and its admission restarts
+    the hold."""
+    scheduler = create_scheduler(prefill_schedule_auto_hold_share=0.25)
+    _start_decoding(scheduler)
+    # Seed the means so the hold is 4 decode steps: 0.25 * 16 / 1, and mark
+    # setup's prefill-carrying step far enough back that its hold has elapsed.
+    scheduler._prefill_auto_hold_ema_chunk_s = 16.0
+    scheduler._prefill_auto_hold_ema_decode_s = 1.0
+    scheduler.last_prefill_step = scheduler.num_executed_steps - 4
+
+    # This prefill-carrying step stamps last_prefill_step. Large enough to
+    # span several blocks, so it decodes with an in-flight chunk beside run0
+    # and the hold has real decode steps to run beside. The harness's wall
+    # times are noise, so its pending record is rewritten to the seeded 16 s
+    # chunk before its update folds it.
+    (new_req,) = create_requests(num_requests=1, num_tokens=64, req_ids=["new0"])
+    scheduler.add_request(new_req)
+    out0 = scheduler.schedule()
+    assert "new0" in out0.num_scheduled_tokens
+    assert scheduler.last_prefill_step == scheduler.num_executed_steps
+    # Fold this prefill-carrying step as the seeded 16 s chunk, and sample
+    # the batch so it keeps decoding.
+    scheduler._prefill_auto_hold_pending[0] = (
+        time.monotonic() - 16.0,
+        scheduler._prefill_auto_hold_pending[0][1],
+    )
+    _decode_one(scheduler, out0, ["run0", "new0"])
+
+    # The decode-only steps that follow hold any further prefill, and the
+    # next call after the hold releases it: with a hold of 4, the
+    # prefill-carrying step counts as step 1 of the interval, so three
+    # decode-only steps are held before the fourth carries prefill (the same
+    # convention as `test_local_prefill_interval_holds_prefill_between_bursts`).
+    # The harness's folded wall times are microseconds, so reset the seeded
+    # means after each update to keep the hold at 4.
+    (next_req,) = create_requests(
+        num_requests=1, num_tokens=64, req_ids=["next0"]
+    )
+    scheduler.add_request(next_req)
+    for i in range(3):
+        out = scheduler.schedule()
+        assert "next0" not in out.num_scheduled_tokens, i
+        # Sample one token per continuing decode; the sampled new0 token is
+        # inert (its prompt is fully computed) and keeps the batch decoding.
+        _decode_one(scheduler, out, ["run0", "new0"])
+        scheduler._prefill_auto_hold_ema_chunk_s = 16.0
+        scheduler._prefill_auto_hold_ema_decode_s = 1.0
+
+    # The fourth call is the release: the hold has elapsed and the prefill
+    # goes, and its admission restarts the hold.
+    out = scheduler.schedule()
+    assert "next0" in out.num_scheduled_tokens
+    assert scheduler.last_prefill_step == scheduler.num_executed_steps
+
+
+def test_prefill_auto_hold_never_idles_the_model():
+    """With nothing running to decode in prefill's place, the hold must not
+    hold prefill back, or the step would be wasted entirely.
+    """
+    scheduler = create_scheduler(prefill_schedule_auto_hold_share=4.0)
+    _start_decoding(scheduler)
+    scheduler._prefill_auto_hold_ema_chunk_s = 16.0
+    scheduler._prefill_auto_hold_ema_decode_s = 1.0
+
+    # Finish the only running request, leaving nothing to decode.
+    scheduler.finish_requests("run0", RequestStatus.FINISHED_ABORTED)
+    assert not scheduler.running
+
+    (new_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["new0"])
+    scheduler.add_request(new_req)
+    output = scheduler.schedule()
+    assert "new0" in output.num_scheduled_tokens
+
+
 def test_local_prefill_interval_defaults_to_no_gating():
     """The default interval of 1 leaves admission exactly as it was: a waiting
     prefill is admitted on the very next step.

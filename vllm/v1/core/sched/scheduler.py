@@ -575,6 +575,33 @@ class Scheduler(SchedulerInterface):
         # schedule() call including empty ones, so it would expire the hold
         # early; it keeps its own meaning (next_decode_eligible_step).
         self.num_executed_steps = 0
+        # Measurement-sized prefill hold (`prefill_schedule_auto_hold_share`):
+        # running means of the wall times of steps that carried prefill
+        # (chunks and fresh admissions) and of decode-only steps, and the
+        # per-step records pending their output so the wall time can be taken
+        # from schedule() to update_from_output().
+        self.prefill_auto_hold_share = (
+            self.scheduler_config.prefill_schedule_auto_hold_share
+        )
+        self.prefill_auto_hold_max_steps = (
+            self.scheduler_config.prefill_schedule_auto_hold_max_steps
+        )
+        # Steps whose wall times are pending their output, oldest first:
+        # (schedule() monotonic, carried prefill). The next update_from_output
+        # folds in the oldest record, which is this step's.
+        self._prefill_auto_hold_pending: deque[tuple[float, bool]] = deque()
+        self._prefill_auto_hold_ema_chunk_s = 0.0
+        self._prefill_auto_hold_ema_decode_s = 0.0
+        if self.prefill_auto_hold_share > 0:
+            logger.info_once(
+                "Prefill cadence: auto hold -- after a step that carried "
+                "prefill, prefill is held for as many executed steps as fit "
+                "in %g of that step's measured wall time at a decode-only "
+                "step's (at most %d steps; 1 until a decode step has been "
+                "timed).",
+                self.prefill_auto_hold_share,
+                self.prefill_auto_hold_max_steps,
+            )
         self._prefill_rr_cursor = 0
         self._idle_prefill_rr_cursor = 0
         self._short_prefill_priority_streak = 0
@@ -1294,6 +1321,47 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _prefill_auto_hold_steps(self) -> int:
+        """The measurement-sized prefill hold: as many decode-only steps as fit
+        in ``prefill_auto_hold_share`` of a prefill-carrying step's time at a
+        decode-only step's. 1 until a decode step has been timed (never 0: a
+        hold of zero would busy the engine at no benefit), capped at
+        ``prefill_auto_hold_max_steps``."""
+        if self._prefill_auto_hold_ema_decode_s <= 0.0:
+            return 1
+        n = (
+            self.prefill_auto_hold_share
+            * self._prefill_auto_hold_ema_chunk_s
+            / self._prefill_auto_hold_ema_decode_s
+        )
+        if n >= float(self.prefill_auto_hold_max_steps):
+            return self.prefill_auto_hold_max_steps
+        return max(1, int(n))
+
+    def _prefill_auto_hold_note_step(
+        self, seconds: float, carried_prefill: bool
+    ) -> None:
+        """Fold a finished step's wall time into the two running means
+        (exponential, alpha 0.2, matching the cadence's own windowing).
+        A step with no decodable work is not a decode-step sample."""
+        if seconds <= 0.0:
+            return
+        alpha = 0.2
+        if carried_prefill:
+            if self._prefill_auto_hold_ema_chunk_s <= 0.0:
+                self._prefill_auto_hold_ema_chunk_s = seconds
+            else:
+                self._prefill_auto_hold_ema_chunk_s += alpha * (
+                    seconds - self._prefill_auto_hold_ema_chunk_s
+                )
+        else:
+            if self._prefill_auto_hold_ema_decode_s <= 0.0:
+                self._prefill_auto_hold_ema_decode_s = seconds
+            else:
+                self._prefill_auto_hold_ema_decode_s += alpha * (
+                    seconds - self._prefill_auto_hold_ema_decode_s
+                )
+
     def schedule(
         self,
         throttle_prefills: bool = False,
@@ -1534,6 +1602,14 @@ class Scheduler(SchedulerInterface):
             # convention below.
             and (self.num_executed_steps + 1) - self.last_prefill_step
             < self.local_prefill_interval
+            and any(not r.is_prefill_chunk for r in self.running)
+        ) or (
+            not defer_prefills
+            and self.prefill_auto_hold_share > 0.0
+            and self._prefill_auto_hold_ema_chunk_s > 0.0
+            and not self.prefill_capacity_bound
+            and (self.num_executed_steps + 1) - self.last_prefill_step
+            < self._prefill_auto_hold_steps()
             and any(not r.is_prefill_chunk for r in self.running)
         ):
             defer_prefills = True
@@ -2606,10 +2682,26 @@ class Scheduler(SchedulerInterface):
         if total_num_scheduled_tokens > 0:
             self.num_executed_steps += 1
 
-        # Restart the cadence interval from any step that carried prefill,
-        # whether a new admission or a running chunk.
-        if self.local_prefill_interval > 1 and (prefill_scheduled or prefill_admitted):
+        # Restart the cadence from any step that carried prefill, whether a
+        # new admission or a running chunk. The stamp is shared by the fixed
+        # interval and the auto hold, so it runs whenever either is on.
+        if (prefill_scheduled or prefill_admitted) and (
+            self.local_prefill_interval > 1 or self.prefill_auto_hold_share > 0.0
+        ):
             self.last_prefill_step = self.num_executed_steps
+
+        # Record this step for the measurement-sized hold: the wall time is
+        # taken in update_from_output(), from schedule() to output. A step
+        # carries prefill when it ran an in-flight chunk or admitted a
+        # request with prompt left to compute; anything else scheduled is
+        # decode. Empty steps record nothing and keep the means.
+        if (
+            self.prefill_auto_hold_share > 0.0
+            and total_num_scheduled_tokens > 0
+        ):
+            self._prefill_auto_hold_pending.append(
+                (scheduled_timestamp, prefill_scheduled or prefill_admitted)
+            )
 
         assert token_budget >= 0
         assert input_budget >= 0
@@ -3292,6 +3384,25 @@ class Scheduler(SchedulerInterface):
             self.processed_step_seq += 1
             self._drain_deferred_frees()
             self._drain_deferred_loads()
+
+        # Measurement-sized prefill hold: fold this step's wall time (schedule
+        # to output) into the running means. update_from_output is called once
+        # per scheduled step in FIFO order, and a step records its pending
+        # entry at the end of its schedule() call, so the oldest pending
+        # record is this step's; anything left behind (a step that never
+        # produced an output) would bias the mean and is dropped.
+        auto_hold_pending = getattr(self, "_prefill_auto_hold_pending", None)
+        if (
+            getattr(self, "prefill_auto_hold_share", 0.0) > 0.0
+            and auto_hold_pending is not None
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            while auto_hold_pending:
+                pending = auto_hold_pending.popleft()
+                self._prefill_auto_hold_note_step(
+                    time.monotonic() - pending[0], pending[1]
+                )
+                break
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
