@@ -2802,6 +2802,66 @@ def test_prefix_cache_query_not_inflated_by_connector_defer():
     assert stats.queries == request.num_tokens
 
 
+def test_preempted_request_resumes_from_its_cached_prefix():
+    """A preempted request's prefix blocks stay in the prefix cache (vLLM
+    frees them back to the pool, which retains them under caching), so its
+    resume adopts them (num_computed_tokens > 0) instead of recomputing from
+    its first token. The preempted request also keeps its place: it is
+    prepended to the waiting queue, ahead of anything queued behind it, so
+    the room it made for its own re-admission cannot go to a queued request.
+    """
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2,
+        max_num_batched_tokens=200,
+        num_blocks=5,
+        block_size=16,
+        enable_prefix_caching=True,
+        use_kv_connector=True,
+    )
+    low = create_requests_with_priority(
+        num_requests=1, priorities=[1], arrival_times=[0.0], num_tokens=30, starting_idx=0,
+    )[0]
+    high = create_requests_with_priority(
+        num_requests=1, priorities=[0], arrival_times=[1.0], num_tokens=32, starting_idx=1,
+    )[0]
+    scheduler.add_request(low)
+    o = scheduler.schedule()
+    mo = ModelRunnerOutput(
+        req_ids=[low.request_id], sampled_token_ids=[[100]], logprobs=None,
+        prompt_logprobs_dict={}, pooler_output=[],
+    )
+    scheduler.update_from_output(o, mo)
+
+    scheduler.add_request(high)
+    o = scheduler.schedule()
+    mo = ModelRunnerOutput(
+        req_ids=[low.request_id, high.request_id], sampled_token_ids=[[100], [100]],
+        logprobs=None, prompt_logprobs_dict={}, pooler_output=[],
+    )
+    scheduler.update_from_output(o, mo)
+
+    o = scheduler.schedule()
+    assert scheduler.requests[low.request_id].status == RequestStatus.PREEMPTED
+    # The preempted request keeps its place ahead of the waiting queue.
+    assert list(scheduler.waiting) == [low]
+
+    mo = ModelRunnerOutput(
+        req_ids=[low.request_id, high.request_id], sampled_token_ids=[[], [100]],
+        logprobs=None, prompt_logprobs_dict={}, pooler_output=[],
+    )
+    scheduler.update_from_output(o, mo)
+    scheduler.finish_requests(high.request_id, RequestStatus.FINISHED_STOPPED)
+
+    o = scheduler.schedule()
+    assert len(o.scheduled_new_reqs) == 1
+    new_req = o.scheduled_new_reqs[0]
+    assert new_req.req_id == low.request_id
+    # Its resume adopts its own cached prefix blocks instead of recomputing
+    # from its first token: its full prompt block (16 tokens) is taken from
+    # the cache.
+    assert new_req.num_computed_tokens >= 16, new_req.num_computed_tokens
+
+
 def test_preemption_re_records_prefix_cache_query():
     """A preempted request re-enters the lookup on resume, so its recomputation
     is counted again into the preempted stats."""
