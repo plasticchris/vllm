@@ -957,6 +957,11 @@ def qsa_select_paged_tokens(
             token_topk,
             out[row_slice],
         )
+        # Drop each score tile before allocating the next. Rebinding in the
+        # next iteration evaluates the new allocation before releasing the old
+        # tensors, doubling live logits at chunk boundaries. GPU work uses the
+        # current stream, so the caching allocator handles reuse ordering.
+        del logits, visible_blocks
     return out
 
 
