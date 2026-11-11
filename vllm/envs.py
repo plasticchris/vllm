@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
     VLLM_ROCM_QSA_ALL_BLOCKS: bool = True
     VLLM_ROCM_QSA_PREFILL_TUNED: bool = False
+    VLLM_ROCM_QSA_LOGITS_WORKSPACE_MIB: int = 128
     VLLM_WORKER_MEMORY_FRACTION: float = 1.0
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
@@ -809,6 +810,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_QSA_PREFILL_TUNED": lambda: (
         os.getenv("VLLM_ROCM_QSA_PREFILL_TUNED", "0") == "1"
+    ),
+    "VLLM_ROCM_QSA_LOGITS_WORKSPACE_MIB": lambda: int(
+        os.getenv("VLLM_ROCM_QSA_LOGITS_WORKSPACE_MIB", "128")
     ),
     "VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE": lambda: int(
         os.environ.get("VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE", "256")
