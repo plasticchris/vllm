@@ -1324,9 +1324,10 @@ class Scheduler(SchedulerInterface):
     def _prefill_auto_hold_steps(self) -> int:
         """The measurement-sized prefill hold: as many decode-only steps as fit
         in ``prefill_auto_hold_share`` of a prefill-carrying step's time at a
-        decode-only step's. 1 until a decode step has been timed (never 0: a
-        hold of zero would busy the engine at no benefit), capped at
-        ``prefill_auto_hold_max_steps``."""
+        decode-only step's. 1 until a decode step has been timed; once measured,
+        0 is valid when no decode step fits in the allotted share. Capped at
+        ``prefill_auto_hold_max_steps``. This counts decode-only steps, not the
+        prefill-carrying step itself (unlike the fixed interval)."""
         if self._prefill_auto_hold_ema_decode_s <= 0.0:
             return 1
         n = (
@@ -1336,7 +1337,7 @@ class Scheduler(SchedulerInterface):
         )
         if n >= float(self.prefill_auto_hold_max_steps):
             return self.prefill_auto_hold_max_steps
-        return max(1, int(n))
+        return max(0, int(n))
 
     def _prefill_auto_hold_note_step(
         self, seconds: float, carried_prefill: bool
@@ -1609,7 +1610,9 @@ class Scheduler(SchedulerInterface):
             and self._prefill_auto_hold_ema_chunk_s > 0.0
             and not self.prefill_capacity_bound
             and (self.num_executed_steps + 1) - self.last_prefill_step
-            < self._prefill_auto_hold_steps()
+            # Auto sizing returns N decode-only steps owed AFTER the prefill;
+            # a fixed interval includes the prefill itself and uses < above.
+            <= self._prefill_auto_hold_steps()
             and any(not r.is_prefill_chunk for r in self.running)
         ):
             defer_prefills = True

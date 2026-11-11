@@ -270,11 +270,12 @@ class SchedulerConfig:
 
     prefill_schedule_auto_hold_share: float = Field(default=0.0, ge=0.0, le=4.0)
     """Measurement-sized prefill hold (0.0 = off). After a step that carried
-    prefill, prefill is held for as many executed steps as fit in this
+    prefill, prefill is held for as many decode-only executed steps as fit in this
     fraction of that step's measured wall time at a decode-only step's (running
     means of both, from step wall times; at most
     ``prefill_schedule_auto_hold_max_steps``; 1 until a decode step has been
-    timed). A fixed interval is wrong both ways: a fixed number of
+    timed, then possibly 0 when no decode step fits). The prefill-carrying step
+    itself is not counted in this hold. A fixed interval is wrong both ways: a fixed number of
     decode-only steps costs the prefill whatever N decode steps cost, which
     grows with the number of decoders, and is too few where decode steps are
     cheap. Sizing the hold from measured step times adapts to both."""
