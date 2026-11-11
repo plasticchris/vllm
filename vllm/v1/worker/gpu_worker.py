@@ -212,6 +212,15 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+def _set_worker_allocator_budget(device: torch.device) -> None:
+    fraction = envs.VLLM_WORKER_MEMORY_FRACTION
+    if not 0 < fraction <= 1:
+        raise ValueError("VLLM_WORKER_MEMORY_FRACTION must be finite and in (0, 1]")
+    if fraction < 1:
+        torch.cuda.set_per_process_memory_fraction(fraction, device)
+        logger.info("Worker allocator fraction %.3f on %s", fraction, device)
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -495,6 +504,7 @@ class Worker(WorkerBase):
             )
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
+            _set_worker_allocator_budget(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
