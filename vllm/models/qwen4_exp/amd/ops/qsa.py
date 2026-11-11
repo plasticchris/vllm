@@ -29,14 +29,19 @@ def _torch_top_k_per_row_decode(
     visible_blocks: torch.Tensor,
     indices: torch.Tensor,
     topk: int,
+    *,
+    already_masked: bool = False,
 ) -> None:
     """Stable gfx1100 replacement for the native ragged-row top-k.
 
-    Masks ``logits`` in place.
+    Unless ``already_masked``, masks ``logits`` in place. The paged scorer
+    already writes -inf outside each row's visible history: its caller can
+    avoid a redundant full score-plane mask (and its broadcast workspace).
+    Other callers retain the original masking contract by default.
     """
     num_rows, width = logits.shape
     k = min(topk, width)
-    columns = torch.arange(width, device=logits.device)
+    columns = None if already_masked else torch.arange(width, device=logits.device)
     ranks = torch.arange(k, device=logits.device)
     rows_per_slice = max(1, _TORCH_TOPK_SLICE_BYTES // max(width, 1))
     indices[:num_rows].fill_(-1)
@@ -44,7 +49,8 @@ def _torch_top_k_per_row_decode(
         end = min(start + rows_per_slice, num_rows)
         row_ends = visible_blocks[start:end].to(torch.int64).clamp_(min=0, max=width)
         rows = logits[start:end]
-        rows.masked_fill_(columns >= row_ends.unsqueeze(1), float("-inf"))
+        if columns is not None:
+            rows.masked_fill_(columns >= row_ends.unsqueeze(1), float("-inf"))
         selected = rows.topk(k, dim=-1, sorted=True).indices
         selected.masked_fill_(ranks >= row_ends.clamp(max=k).unsqueeze(1), -1)
         indices[start:end, :k].copy_(selected)
@@ -830,6 +836,7 @@ def qsa_select_paged_tokens(
                 visible_blocks,
                 blocks,
                 block_topk,
+                already_masked=True,
             )
         elif use_cooperative_topk:
             torch.ops._C.cooperative_topk(

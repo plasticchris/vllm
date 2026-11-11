@@ -326,6 +326,39 @@ def test_qsa_torch_topk_masks_ragged_rows() -> None:
     assert output.tolist() == [[0, 1, -1, -1], [3, 2, 1, 0]]
 
 
+@pytest.mark.parametrize("width", [1, 5, 512, 2048])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("ties", [False, True])
+def test_qsa_torch_topk_reuses_scorer_mask(width: int, device: str, ties: bool) -> None:
+    # The paged scorer masks every non-visible column to -inf. Reusing its
+    # mask must preserve exact indices for unique scores and the top-k law
+    # for ties (ROCm torch.topk itself does not promise stable tie indices).
+    generator = torch.Generator(device=device).manual_seed(7)
+    logits = torch.randint(0, 4, (7, width), device=device, generator=generator).float()
+    if not ties:
+        logits = logits.argsort(dim=-1).float()
+    visible = torch.tensor([0, 1, 2, width // 2, width - 1, width, width + 1],
+                           dtype=torch.int32, device=device)
+    logits.masked_fill_(torch.arange(width, device=device) >= visible[:, None],
+                        float("-inf"))
+    expected = torch.empty((7, 512), dtype=torch.int32, device=device)
+    actual = torch.empty_like(expected)
+    qsa_ops._torch_top_k_per_row_decode(logits.clone(), visible, expected, 512)
+    qsa_ops._torch_top_k_per_row_decode(
+        logits, visible, actual, 512, already_masked=True,
+    )
+    if not ties:
+        assert torch.equal(actual, expected)
+    else:
+        assert torch.equal(actual >= 0, expected >= 0)
+        actual_scores = logits.gather(1, actual.clamp(min=0).long())
+        expected_scores = logits.gather(1, expected.clamp(min=0).long())
+        assert torch.equal(actual_scores, expected_scores)
+        for row in actual:
+            valid = row[row >= 0]
+            assert valid.unique().numel() == valid.numel()
+
+
 def test_qsa_torch_topk_fits_beside_long_prefill_tile() -> None:
     # One 2,048-token chunk at ~60k context, the shape that ran a TP rank out
     # of VRAM when the fallback copied the whole tile.
