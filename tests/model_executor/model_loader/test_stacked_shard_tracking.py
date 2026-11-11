@@ -18,6 +18,9 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
 )
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.models.qwen4_exp.amd.hyperconnection import GatedResidual
+from vllm.models.qwen4_exp.common.hyperconnection import HyperConnectionConfig
 
 HIDDEN = 8
 HEAD = 2
@@ -96,6 +99,44 @@ def test_merged_column_tuple_shard_is_one_span():
         layer, ("weight", shard((8, HIDDEN), (0, 1))), ("weight", shard((4, HIDDEN), 2))
     )
     assert layer.pop_missing_shards() == []
+
+
+@pytest.mark.parametrize("missing_injection", [False, True])
+def test_hc_padding_is_initialized_without_hiding_real_missing_weights(
+    missing_injection,
+):
+    cfg = HyperConnectionConfig(
+        hidden_size=4,
+        hc_count=4,
+        hc_lowrank=8,
+        params_dtype=torch.float32,
+        hc_per_branch_norm=True,
+    )
+    layer = GatedResidual(cfg)
+    projection = layer.input_mix_weight_down_block_inject
+    projection.weight.data.fill_(float("nan"))
+    weights = [
+        ("hc_norm.weight", torch.zeros(16)),
+        ("input_mix_weight_up.weight", torch.ones(16, 8)),
+        ("input_mix_weight_down_block_inject.weight", shard((8, 16), 0)),
+    ]
+    if not missing_injection:
+        weights.append(("input_mix_weight_down_block_inject.weight", shard((4, 16), 1)))
+    loaded = AutoWeightsLoader(layer).load_weights(iter(weights))
+    tracker = DefaultModelLoader(LoadConfig())
+    if missing_injection:
+        with pytest.raises(ValueError, match=r"weight\.1"):
+            tracker.track_weights_loading(layer, loaded, quantized=True)
+    else:
+        tracker.track_weights_loading(layer, loaded, quantized=True)
+        assert torch.equal(projection.weight[:12], torch.ones(12, 16))
+        assert torch.count_nonzero(projection.weight[12:]) == 0
+        # A second load must initialize padding again, not inherit the first
+        # load's tracking record or an accidentally overwritten padding row.
+        projection.weight.data[12:].fill_(float("nan"))
+        loaded = AutoWeightsLoader(layer).load_weights(iter(weights))
+        tracker.track_weights_loading(layer, loaded, quantized=True)
+        assert torch.count_nonzero(projection.weight[12:]) == 0
 
 
 def test_minimax_m3_qkv_with_indexer_loads_all_shards():

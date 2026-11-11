@@ -104,6 +104,10 @@ class GatedResidual(nn.Module):
                 return_bias=False,
                 disable_tp=True,
             )
+            if self.pad_size:
+                weight = self.input_mix_weight_down_block_inject.weight
+                self._down_inject_loader = weight.weight_loader
+                weight.weight_loader = self._load_down_inject_with_padding
         else:
             self.input_mix_weight_down = ReplicatedLinear(
                 self.hyper_hidden_size,
@@ -123,6 +127,15 @@ class GatedResidual(nn.Module):
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
+
+    def _load_down_inject_with_padding(self, param, loaded_weight, shard_id=None):
+        self._down_inject_loader(param, loaded_weight, shard_id)
+        if shard_id != 2:
+            # This third shard is alignment storage, not a checkpoint tensor.
+            # Load real zeros through the normal loader so every load records
+            # its initialization without exempting either real projection.
+            padding = param.new_zeros((self.pad_size, self.hyper_hidden_size))
+            self._down_inject_loader(param, padding, 2)
 
     def mix(
         self, hidden_states: torch.Tensor
