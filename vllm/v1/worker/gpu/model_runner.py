@@ -2157,7 +2157,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _counts[_shape] = _n
             if _n == 1 or _n % 4096 == 0:
                 logger.info(
-                    "[asgard-cg] run step #%d: mode=%s toks=%d reqs=%d uniform=%s "
+                    "[asgard-cg] run step #%d: mode=%s toks=%d reqs=%s uniform=%s "
                     "(dummy=%s profile=%s)",
                     _n, batch_desc.cg_mode, batch_desc.num_tokens,
                     batch_desc.num_reqs, uniform_tok_count,
