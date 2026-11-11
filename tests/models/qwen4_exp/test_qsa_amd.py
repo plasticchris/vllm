@@ -314,10 +314,10 @@ def test_fused_pre_indexer_gate_is_config_shaped(overrides, expected) -> None:
         )
         is expected
     )
+
+
 def test_qsa_torch_topk_masks_ragged_rows() -> None:
-    logits = torch.tensor(
-        [[9.0, 8.0, 7.0, 6.0, 5.0], [1.0, 2.0, 3.0, 4.0, 5.0]]
-    )
+    logits = torch.tensor([[9.0, 8.0, 7.0, 6.0, 5.0], [1.0, 2.0, 3.0, 4.0, 5.0]])
     visible_blocks = torch.tensor([2, 4], dtype=torch.int32)
     output = torch.full((2, 4), 99, dtype=torch.int32)
 
@@ -337,15 +337,23 @@ def test_qsa_torch_topk_reuses_scorer_mask(width: int, device: str, ties: bool) 
     logits = torch.randint(0, 4, (7, width), device=device, generator=generator).float()
     if not ties:
         logits = logits.argsort(dim=-1).float()
-    visible = torch.tensor([0, 1, 2, width // 2, width - 1, width, width + 1],
-                           dtype=torch.int32, device=device)
-    logits.masked_fill_(torch.arange(width, device=device) >= visible[:, None],
-                        float("-inf"))
+    visible = torch.tensor(
+        [0, 1, 2, width // 2, width - 1, width, width + 1],
+        dtype=torch.int32,
+        device=device,
+    )
+    logits.masked_fill_(
+        torch.arange(width, device=device) >= visible[:, None], float("-inf")
+    )
     expected = torch.empty((7, 512), dtype=torch.int32, device=device)
     actual = torch.empty_like(expected)
     qsa_ops._torch_top_k_per_row_decode(logits.clone(), visible, expected, 512)
     qsa_ops._torch_top_k_per_row_decode(
-        logits, visible, actual, 512, already_masked=True,
+        logits,
+        visible,
+        actual,
+        512,
+        already_masked=True,
     )
     if not ties:
         assert torch.equal(actual, expected)
