@@ -10,15 +10,25 @@ import os
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx1100
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.ops.triton_unified_attention import _cast_kv_tile
 
-# Bound the per-layer score matrix; long prefills are tiled below without
-# changing selected indices. Production reserves another 95.4 MiB/GPU by
-# lowering its KV-cache budget before restoring this larger tile.
-_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+def _qsa_logits_workspace_bytes(mib: int) -> int:
+    if not 1 <= mib <= 128:
+        raise ValueError("VLLM_ROCM_QSA_LOGITS_WORKSPACE_MIB must be in [1, 128]")
+    return mib * 1024 * 1024
+
+
+# Long prefills are row-tiled without changing selected indices. For very long
+# contexts one row can itself exceed this budget; do not claim a hard bound.
+# Default remains the historical 128MiB. A smaller value is opt-in.
+_LOGITS_WORKSPACE_BYTES = _qsa_logits_workspace_bytes(
+    envs.VLLM_ROCM_QSA_LOGITS_WORKSPACE_MIB
+)
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 # The gfx1100 torch top-k runs beside a full logits tile, so its temporaries
 # must fit the same small VRAM reserve as the native kernel's workspace.

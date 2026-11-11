@@ -7,8 +7,27 @@ import weakref
 import pytest
 import torch
 
+from vllm import envs
 from vllm.models.qwen4_exp.amd.ops import qsa
 from vllm.platforms.rocm import on_gfx1100
+
+
+@pytest.mark.parametrize("value", [1, 16, 32, 128])
+def test_score_workspace_registry_and_valid_values(value, monkeypatch):
+    monkeypatch.setenv("VLLM_ROCM_QSA_LOGITS_WORKSPACE_MIB", str(value))
+    assert value == envs.VLLM_ROCM_QSA_LOGITS_WORKSPACE_MIB
+    assert qsa._qsa_logits_workspace_bytes(value) == value * 1024**2
+
+
+@pytest.mark.parametrize("value", [0, -1, 129, 10**30])
+def test_score_workspace_rejects_out_of_range(value):
+    with pytest.raises(ValueError, match="in \\[1, 128\\]"):
+        qsa._qsa_logits_workspace_bytes(value)
+
+
+def test_score_workspace_default(monkeypatch):
+    monkeypatch.delenv("VLLM_ROCM_QSA_LOGITS_WORKSPACE_MIB", raising=False)
+    assert envs.VLLM_ROCM_QSA_LOGITS_WORKSPACE_MIB == 128
 
 
 def test_previous_score_tile_is_released_before_next_allocation(monkeypatch):
