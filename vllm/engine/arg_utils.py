@@ -738,6 +738,12 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
+    prefill_schedule_auto_hold_share: float = (
+        SchedulerConfig.prefill_schedule_auto_hold_share
+    )
+    prefill_schedule_auto_hold_max_steps: int = (
+        SchedulerConfig.prefill_schedule_auto_hold_max_steps
+    )
     decode_active_prefill_token_budget: int | None = (
         SchedulerConfig.decode_active_prefill_token_budget
     )
@@ -1904,6 +1910,14 @@ class EngineArgs:
             **scheduler_kwargs["prefill_schedule_interval"],
         )
         scheduler_group.add_argument(
+            "--prefill-schedule-auto-hold-share",
+            **scheduler_kwargs["prefill_schedule_auto_hold_share"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-auto-hold-max-steps",
+            **scheduler_kwargs["prefill_schedule_auto_hold_max_steps"],
+        )
+        scheduler_group.add_argument(
             "--decode-active-prefill-token-budget",
             **scheduler_kwargs["decode_active_prefill_token_budget"],
         )
@@ -2864,6 +2878,12 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            prefill_schedule_auto_hold_share=(
+                self.prefill_schedule_auto_hold_share
+            ),
+            prefill_schedule_auto_hold_max_steps=(
+                self.prefill_schedule_auto_hold_max_steps
+            ),
             decode_active_prefill_token_budget=(
                 self.decode_active_prefill_token_budget
             ),
