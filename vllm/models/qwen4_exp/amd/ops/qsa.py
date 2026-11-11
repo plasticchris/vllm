@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -22,6 +23,11 @@ _TOPK_WORKSPACE_BYTES = 1024 * 1024
 # The gfx1100 torch top-k runs beside a full logits tile, so its temporaries
 # must fit the same small VRAM reserve as the native kernel's workspace.
 _TORCH_TOPK_SLICE_BYTES = 8 * 1024 * 1024
+# Short-context selection is a set-preserving fast path, not a smaller budget.
+# Retain a rollback switch because accumulation order can change roundoff.
+_QSA_ALL_BLOCKS_ENABLED = os.getenv("VLLM_ROCM_QSA_ALL_BLOCKS", "1") == "1"
+_QSA_RDNA3_PREFILL_TUNED = os.getenv("VLLM_ROCM_QSA_PREFILL_TUNED", "0") == "1"
+_QSA_PREFILL_ROWS = 128
 
 
 def _torch_top_k_per_row_decode(
@@ -29,14 +35,19 @@ def _torch_top_k_per_row_decode(
     visible_blocks: torch.Tensor,
     indices: torch.Tensor,
     topk: int,
+    *,
+    already_masked: bool = False,
 ) -> None:
     """Stable gfx1100 replacement for the native ragged-row top-k.
 
-    Masks ``logits`` in place.
+    Unless `already_masked`, masks `logits` in place. The paged scorer
+    already writes -inf outside each row's visible history: its caller can
+    avoid a redundant full score-plane mask (and its broadcast workspace).
+    Other callers retain the original masking contract by default.
     """
     num_rows, width = logits.shape
     k = min(topk, width)
-    columns = torch.arange(width, device=logits.device)
+    columns = None if already_masked else torch.arange(width, device=logits.device)
     ranks = torch.arange(k, device=logits.device)
     rows_per_slice = max(1, _TORCH_TOPK_SLICE_BYTES // max(width, 1))
     indices[:num_rows].fill_(-1)
@@ -44,7 +55,8 @@ def _torch_top_k_per_row_decode(
         end = min(start + rows_per_slice, num_rows)
         row_ends = visible_blocks[start:end].to(torch.int64).clamp_(min=0, max=width)
         rows = logits[start:end]
-        rows.masked_fill_(columns >= row_ends.unsqueeze(1), float("-inf"))
+        if columns is not None:
+            rows.masked_fill_(columns >= row_ends.unsqueeze(1), float("-inf"))
         selected = rows.topk(k, dim=-1, sorted=True).indices
         selected.masked_fill_(ranks >= row_ends.clamp(max=k).unsqueeze(1), -1)
         indices[start:end, :k].copy_(selected)
@@ -763,6 +775,47 @@ def expand_qsa_block_indices_cuda(
     return out
 
 
+@triton.jit
+def _qsa_all_blocks_kernel(
+    positions,
+    lengths,
+    requests,
+    out,
+    stride_out_row,
+    stride_out_col,
+    NUM_REQUESTS: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    RATIO: tl.constexpr,
+    WIDTH: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    column = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    req = tl.load(requests + row)
+    pos = tl.load(positions + row)
+    req_valid = (req >= 0) & (req < NUM_REQUESTS)
+    length = tl.load(
+        lengths + tl.maximum(0, tl.minimum(req, NUM_REQUESTS - 1)),
+        mask=req_valid,
+        other=0,
+    )
+    complete = tl.minimum(tl.minimum((pos + 1) // RATIO, length // RATIO), BLOCK_TOPK)
+    expanded = complete * RATIO
+    tail_start = ((pos + 1) // RATIO) * RATIO
+    tail_offset = column - expanded
+    is_full = column < expanded
+    is_tail = (column >= expanded) & (tail_offset < (pos + 1) % RATIO)
+    token = tl.where(is_full, column, tail_start + tail_offset)
+    valid = (
+        req_valid & (pos >= 0) & (is_full | is_tail) & (token >= 0) & (token < length)
+    )
+    tl.store(
+        out + row * stride_out_row + column * stride_out_col,
+        tl.where(valid, token, -1),
+        mask=column < WIDTH,
+    )
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -774,8 +827,16 @@ def qsa_select_paged_tokens(
     compress_ratio: int,
     out: torch.Tensor | None = None,
     max_seq_len: int | None = None,
+    *,
+    allow_all_blocks: bool = True,
 ) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization."""
+    """Score, select, and expand QSA indices without host synchronization.
+
+    `max_seq_len` must bound every query's visible history, including MTP
+    verify rows. Below budget+ratio-1 every complete block is selected: emit
+    that set directly, without reading Q/K or allocating a score plane. The
+    caller still updates compressed keys and recurrent tails BEFORE selection.
+    """
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
     if out is None:
@@ -785,7 +846,33 @@ def qsa_select_paged_tokens(
     if not rows:
         return out
 
+    if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
+        raise ValueError("QSA requires a positive block-aligned token budget")
     block_topk = token_topk // compress_ratio
+    if (
+        allow_all_blocks
+        and _QSA_ALL_BLOCKS_ENABLED
+        and on_gfx1100()
+        and max_seq_len is not None
+        and 0 <= max_seq_len <= token_topk + compress_ratio - 1
+    ):
+        if sequence_lengths.ndim != 1 or sequence_lengths.numel() == 0:
+            raise ValueError("QSA selection requires request lengths")
+        _qsa_all_blocks_kernel[(rows, triton.cdiv(output_width, 256))](
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            out,
+            out.stride(0),
+            out.stride(1),
+            NUM_REQUESTS=sequence_lengths.numel(),
+            BLOCK_TOPK=block_topk,
+            RATIO=compress_ratio,
+            WIDTH=output_width,
+            TILE=256,
+            num_warps=4,
+        )
+        return out
     capacity = page_table.shape[1] * k_cache.shape[1]
     columns = capacity
     if max_seq_len is not None:
@@ -830,6 +917,7 @@ def qsa_select_paged_tokens(
                 visible_blocks,
                 blocks,
                 block_topk,
+                already_masked=True,
             )
         elif use_cooperative_topk:
             torch.ops._C.cooperative_topk(
@@ -870,6 +958,41 @@ def qsa_select_paged_tokens(
             out[row_slice],
         )
     return out
+
+
+def _qsa_attention_launch_config(
+    group_size: int,
+    base_programs: int,
+    use_fp8: bool,
+) -> tuple[int, int, int, int]:
+    """Return tile width, target splits, warps and stages for sparse GQA.
+
+    Keep launch policy separate from the kernel so bounded tuning can compare
+    configurations without changing cache layout or attention arithmetic.
+    """
+    if (
+        _QSA_RDNA3_PREFILL_TUNED
+        and on_gfx1100()
+        and group_size == 6
+        and 32 <= base_programs <= _QSA_PREFILL_ROWS
+    ):
+        return 16, 16, 2, 1
+    block_m = triton.next_power_of_2(group_size)
+    small_profile_limit = 8 if block_m <= 8 else 4
+    if base_programs <= small_profile_limit:
+        block_n, target_splits, partial_warps = 16, 64, 4
+    elif base_programs < 32:
+        block_n, target_splits, partial_warps = 16, 32, 4
+    elif base_programs <= 256:
+        block_n, target_splits, partial_warps = 64, 8, 2
+    elif base_programs <= 512:
+        block_n, target_splits, partial_warps = 64, 4, 2
+    else:
+        block_n, target_splits, partial_warps = 64, 1, 2
+    if use_fp8:
+        block_n = max(16, block_n // 2)
+    partial_stages = 1 if current_platform.is_rocm() else 2
+    return block_n, target_splits, partial_warps, partial_stages
 
 
 def qsa_sparse_paged_attention(
@@ -934,29 +1057,35 @@ def qsa_sparse_paged_attention(
         return out
 
     group_size = q.shape[1] // k_cache.shape[2]
+    if (
+        _QSA_RDNA3_PREFILL_TUNED
+        and on_gfx1100()
+        and q.shape[1] == 6
+        and k_cache.shape[2] == 1
+        and q.shape[0] > _QSA_PREFILL_ROWS
+    ):
+        # A full 2048-row split16 launch needs ~192MiB of partials, too much
+        # beside the long-context cache. Window rows so scratch stays below
+        # 16MiB; each query still sees its entire original selected history.
+        for start in range(0, q.shape[0], _QSA_PREFILL_ROWS):
+            end = min(start + _QSA_PREFILL_ROWS, q.shape[0])
+            qsa_sparse_paged_attention(
+                q[start:end],
+                k_cache,
+                v_cache,
+                logical_indices[start:end],
+                block_table,
+                token_to_req[start:end],
+                out=out[start:end],
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        return out
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
-    small_profile_limit = 8 if block_m <= 8 else 4
-
-    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
-    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
-    if base_programs <= small_profile_limit:
-        block_n, target_splits, partial_warps = 16, 64, 4
-    elif base_programs < 32:
-        block_n, target_splits, partial_warps = 16, 32, 4
-    elif base_programs <= 256:
-        block_n, target_splits, partial_warps = 64, 8, 2
-    elif base_programs <= 512:
-        block_n, target_splits, partial_warps = 64, 4, 2
-    else:
-        block_n, target_splits, partial_warps = 64, 1, 2
-    # FP8 dequantization materializes K/V tiles at query precision. Keep the
-    # wide profile within RDNA/CDNA LDS by halving it; decode already uses 16.
-    if use_fp8:
-        block_n = max(16, block_n // 2)
-    # gfx942/gfx950 and RDNA3 have tight LDS limits. One software-pipelining
-    # stage keeps the wide tile within the shared-memory budget.
-    partial_stages = 1 if current_platform.is_rocm() else 2
+    block_n, target_splits, partial_warps, partial_stages = (
+        _qsa_attention_launch_config(group_size, base_programs, use_fp8)
+    )
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
