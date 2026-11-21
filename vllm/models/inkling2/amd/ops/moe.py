@@ -4,12 +4,15 @@ Weights stay in their checkpoint encoding. Dequantization is tile-local;
 there is no model-sized BF16 copy and no cross-token atomic accumulation.
 """
 
+import os
 import torch
 from vllm.triton_utils import tl, triton
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
 from .tuning import OPTIMIZED, expert_launch_config
+
+INTEGER_FP4 = os.environ.get("INKLING_INTEGER_FP4", "0") == "1"
 
 
 @triton.jit
@@ -87,6 +90,17 @@ def _e8m0_bits(x):
 
 
 @triton.jit
+def _e2m1_bf16_bits(x):
+    bits = x.to(tl.uint32)
+    magnitude = bits & 7
+    encoded = (magnitude + 252) << 6
+    encoded = tl.where(magnitude == 1, 0x3F00, encoded)
+    encoded = tl.where(magnitude == 0, 0, encoded)
+    encoded = encoded | ((bits & 8) << 12)
+    return encoded.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
 def _expert_gemm(
     A,
     W,
@@ -105,6 +119,7 @@ def _expert_gemm(
     BN: tl.constexpr,
     BK: tl.constexpr,
     FAST_DECODE: tl.constexpr = False,
+    INTEGER_DECODE: tl.constexpr = False,
 ):
     tile = tl.program_id(0)
     if tile * BM >= tl.load(Padded):
@@ -142,7 +157,10 @@ def _expert_gemm(
         )
         if NVFP4:
             code = (raw >> ((k[:, None] % 2) * 4)) & 15
-            vals = _e2m1_bits(code) if FAST_DECODE else _e2m1(code)
+            if INTEGER_DECODE:
+                vals = _e2m1_bf16_bits(code)
+            else:
+                vals = _e2m1_bits(code) if FAST_DECODE else _e2m1(code)
             scale = (_e4m3_bits(scales) if FAST_DECODE else _e4m3(scales)) * glob
         else:
             vals = _e4m3_bits(raw) if FAST_DECODE else _e4m3(raw)
@@ -205,6 +223,7 @@ def expert_gemm(
             bn,
             bk,
             FAST_DECODE=fast_decode,
+            INTEGER_DECODE=INTEGER_FP4,
             num_warps=4,
             num_stages=1,
         )

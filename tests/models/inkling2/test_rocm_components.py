@@ -174,6 +174,72 @@ class Components(unittest.TestCase):
                 torch.testing.assert_close(got, ref, atol=0, rtol=0)
                 self.assertEqual(torch.count_nonzero(got[ids.flatten() < 0]).item(), 0)
 
+    def test_integer_fp4_decode_exact(self):
+        from vllm.triton_utils import triton, tl
+        from vllm.models.inkling2.amd.ops.moe import (
+            _e2m1_bf16_bits,
+            _e2m1_bits,
+            _expert_gemm,
+        )
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        @triton.jit
+        def decode(X, Y, Z):
+            c = tl.arange(0, 16)
+            bits = tl.load(X + c)
+            tl.store(Y + c, _e2m1_bf16_bits(bits))
+            tl.store(Z + c, _e2m1_bits(bits))
+
+        codes = torch.arange(16, device=DEVICE, dtype=torch.uint8)
+        y = torch.empty(16, device=DEVICE)
+        z = torch.empty_like(y)
+        decode[(1,)](codes, y, z)
+        self.assertTrue(torch.equal(y, z))
+        self.assertTrue(torch.equal(torch.signbit(y), torch.signbit(z)))
+        for t in (1, 8, 32):
+            ids = torch.randint(-1, 4, (t, 8), device=DEVICE, dtype=torch.int32)
+            ids[0, 0] = -1
+            x = self.rand(t, 256, dtype=torch.bfloat16) * 0.2
+            w = torch.randint(0, 256, (4, 128, 128), device=DEVICE, dtype=torch.uint8)
+            s = (torch.rand(4, 128, 16, device=DEVICE) * 0.5 + 0.25).to(
+                torch.float8_e4m3fn
+            )
+            g = torch.tensor([0.317, 0.7121, 1.231, 2.013], device=DEVICE)
+            si, ei, pad = moe_align_block_size(ids, 16, 4, ignore_invalid_experts=True)
+            outputs = []
+            for fast in (False, True):
+                out = torch.zeros((ids.numel(), 128), device=DEVICE, dtype=x.dtype)
+                _expert_gemm[(triton.cdiv(si.numel(), 16), 2)](
+                    x,
+                    w,
+                    s,
+                    g,
+                    si,
+                    ei,
+                    pad,
+                    out,
+                    ids.numel(),
+                    128,
+                    256,
+                    8,
+                    True,
+                    16,
+                    64,
+                    128,
+                    FAST_DECODE=True,
+                    INTEGER_DECODE=fast,
+                    num_warps=4,
+                    num_stages=1,
+                )
+                outputs.append(out)
+            self.assertTrue(torch.equal(*outputs))
+            self.assertEqual(
+                torch.count_nonzero(outputs[1][ids.flatten() < 0]).item(), 0
+            )
+        self.assertFalse(torch.equal(y + 1, z), "incorrect lookup must be rejected")
+
     def test_norm(self):
         for t in (1, 8, 128):
             x, w = (
