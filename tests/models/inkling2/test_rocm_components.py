@@ -98,6 +98,82 @@ class Components(unittest.TestCase):
                 reference[s // 64, :, s % 64, 128:] = v[i]
         self.assertTrue(torch.equal(parent, reference))
 
+    def test_fused_expert_combine(self):
+        from vllm.models.inkling2.amd.ops.combine import combine_experts
+
+        for t in (0, 1, 8, 128, 513, 2048):
+            for kind in ("normal", "exponent", "cancellation"):
+                x = self.rand(t, 8, 2304, dtype=torch.bfloat16)
+                if kind == "exponent":
+                    x = (
+                        x.float()
+                        * torch.exp2(
+                            torch.randint(-30, 31, x.shape, device=DEVICE).float()
+                        )
+                    ).bfloat16()
+                if kind == "cancellation":
+                    x[:, :4] *= 1e5
+                    x[:, 4:] = -x[:, :4]
+                    x[:, 7, :] += torch.tensor(0.01, device=DEVICE, dtype=x.dtype)
+                ref = x.float().sum(1).bfloat16()
+                torch.testing.assert_close(
+                    combine_experts(x), ref, atol=0, rtol=0, equal_nan=True
+                )
+        self.assertFalse(
+            torch.equal(combine_experts(x) + 1, ref), "injected wrong combine must fail"
+        )
+
+    def test_combine_special_values(self):
+        from vllm.models.inkling2.amd.ops.combine import combine_experts
+
+        x = torch.full((8, 8, 2304), -0.0, device=DEVICE, dtype=torch.bfloat16)
+        x[1, :, 0] = float("inf")
+        x[2, :, 0] = -float("inf")
+        x[3, 0, 0] = float("inf")
+        x[3, 1, 0] = -float("inf")
+        x[4, 0, 0] = float("nan")
+        y = combine_experts(x)
+        ref = x.float().sum(1).bfloat16()
+        torch.testing.assert_close(y, ref, atol=0, rtol=0, equal_nan=True)
+        mask = ref == 0
+        self.assertTrue(
+            torch.equal(torch.signbit(y[mask]), torch.signbit(ref[mask])),
+            "signed-zero reduction semantics differ",
+        )
+
+    def test_staged_experts(self):
+        from vllm.models.inkling2.amd.ops.staged_experts import staged_expert_gemm
+        from vllm.models.inkling2.amd.ops.moe import expert_gemm
+
+        for nv in (True, False):
+            for div in (1, 8):
+                ids = torch.randint(-1, 4, (7, 8), device=DEVICE, dtype=torch.int32)
+                ids[0, 0] = -1
+                x = self.rand(56 // div, 256, dtype=torch.bfloat16) * 0.2
+                w = (
+                    torch.randint(
+                        0, 256, (4, 128, 128), device=DEVICE, dtype=torch.uint8
+                    )
+                    if nv
+                    else (self.rand(4, 128, 256) * 0.2).to(torch.float8_e4m3fn)
+                )
+                scale = (
+                    (torch.rand(4, 128, 16, device=DEVICE) * 0.5 + 0.25).to(
+                        torch.float8_e4m3fn
+                    )
+                    if nv
+                    else torch.full((4, 128, 8), 127, device=DEVICE, dtype=torch.uint8)
+                )
+                glob = (
+                    torch.tensor([0.317, 0.7121, 1.231, 2.013], device=DEVICE)
+                    if nv
+                    else None
+                )
+                ref, layout = expert_gemm(x, w, scale, glob, ids, div, nv)
+                got, _ = staged_expert_gemm(x, w, scale, glob, ids, div, nv, layout)
+                torch.testing.assert_close(got, ref, atol=0, rtol=0)
+                self.assertEqual(torch.count_nonzero(got[ids.flatten() < 0]).item(), 0)
+
     def test_norm(self):
         for t in (1, 8, 128):
             x, w = (

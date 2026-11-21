@@ -4,6 +4,7 @@ This follows the upstream Hopper weight-only path, not native Blackwell
 activation quantization. No precision mode is silently relabeled.
 """
 
+import os
 from typing import Literal
 import torch
 from torch import nn
@@ -16,6 +17,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from .ops.linear import linear_k_groups
 from .ops.moe import expert_gemm, situ
+from .ops.combine import combine_experts
+from .ops.staged_experts import staged_expert_gemm
+
+FUSED_COMBINE = os.environ.get("INKLING_FUSED_COMBINE", "0") == "1"
+STAGE_EXPERTS = os.environ.get("INKLING_STAGE_EXPERTS", "off")
 
 QuantFormat = Literal["nvfp4", "mxfp8"]
 
@@ -115,7 +121,11 @@ class Inkling2Experts(nn.Module):
         local = torch.where((local >= 0) & (local < self.num_experts), local, -1)
 
         def project(inp, name, divisor, layout=None):
-            return expert_gemm(
+            stage = x.shape[0] >= 2048 and (
+                STAGE_EXPERTS == "all" or (STAGE_EXPERTS == "mx" and not self.nvfp4)
+            )
+            implementation = staged_expert_gemm if stage else expert_gemm
+            return implementation(
                 inp,
                 getattr(self, name + "_weight"),
                 getattr(self, name + "_weight_scale"),
@@ -129,7 +139,15 @@ class Inkling2Experts(nn.Module):
         up, layout = project(x, "w13", self.topk)
         activated = situ(up, weights.reshape(-1), self.gate_cap, self.up_cap)
         down, _ = project(activated, "w2", 1, layout)
-        return down.view(x.shape[0], self.topk, x.shape[-1]).float().sum(1).to(x.dtype)
+        outputs = down.view(x.shape[0], self.topk, x.shape[-1])
+        if (
+            FUSED_COMBINE
+            and self.topk == 8
+            and x.shape[-1] == 2304
+            and x.dtype == torch.bfloat16
+        ):
+            return combine_experts(outputs)
+        return outputs.float().sum(1).to(x.dtype)
 
 
 class Inkling2MoE(nn.Module):
