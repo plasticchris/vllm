@@ -175,6 +175,14 @@ _TEXT_GENERATION_MODELS = {
         "vllm.models.inkling",
         "InklingForConditionalGeneration",
     ),
+    "Inkling2LoopForConditionalGeneration": (
+        "vllm.models.inkling2",
+        "Inkling2LoopForConditionalGeneration",
+    ),
+    "Inkling2ForConditionalGeneration": (
+        "vllm.models.inkling2",
+        "Inkling2ForConditionalGeneration",
+    ),
     "Ministral3ForCausalLM": ("mistral", "MistralForCausalLM"),
     "MistralForCausalLM": ("mistral", "MistralForCausalLM"),
     "MistralLarge3ForCausalLM": ("mistral_large_3", "MistralLarge3ForCausalLM"),

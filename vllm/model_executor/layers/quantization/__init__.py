@@ -30,6 +30,7 @@ QuantizationMethods = Literal[
     "compressed-tensors",
     "experts_int8",
     "quark",
+    "inkling2",
     "moe_wna16",
     "torchao",
     "inc",
@@ -116,6 +117,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.config.quantization import _ONLINE_SHORTHANDS
+    from vllm.models.inkling2.quant_config import Inkling2QuantConfig
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 
     if current_platform.is_cuda() or current_platform.is_rocm():
@@ -171,6 +173,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "compressed-tensors": CompressedTensorsConfig,
         "experts_int8": ExpertsInt8Config,
         "quark": QuarkConfig,
+        "inkling2": Inkling2QuantConfig,
         "moe_wna16": MoeWNA16Config,
         "torchao": TorchAOConfig,
         "inc": INCConfig,
