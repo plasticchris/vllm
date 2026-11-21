@@ -155,7 +155,7 @@ class InklingRenderer(BaseRenderer[HfTokenizer]):
                     self._inkling_tokenizer,
                     tools=kwargs.get("tools"),
                     tool_choice=params.tool_choice,
-                    parallel_tool_calls=params.parallel_tool_calls,
+                    parallel_tool_calls=getattr(params, "parallel_tool_calls", None),
                     reasoning_effort=_resolve_inkling2_reasoning_effort(
                         kwargs.get("reasoning_effort")
                     ),

@@ -289,8 +289,10 @@ def get_quant_config(
         if (
             model_config.quantization == "modelopt_mixed"
             and "quantized_layers" not in hf_quant_config
+        ) or (
+            model_config.quantization == "inkling2" and "model" not in hf_quant_config
         ):
-            pass  # fall through to file-based loading below
+            pass  # fall through to per-tensor file-based metadata below
         else:
             return make_checkpoint_config(hf_quant_config)
 

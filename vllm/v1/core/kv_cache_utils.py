@@ -281,6 +281,10 @@ class KVCacheBlockSplice(NamedTuple):
     dst_start: int
     dst_end: int
     delta_pos: int
+    # Optional group routing; legacy rotary operations predate this field.
+    kv_cache_group_id: int | None = None
+    # A splice jump must update the GPU token counter even without Mamba.
+    req_id: str | None = None
 
 
 class MambaStateTransplant(NamedTuple):

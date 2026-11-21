@@ -1016,8 +1016,9 @@ class KVCacheManager:
             return 0
         if not directives or not donor_hashes or not self.enable_caching:
             return 0
-        if self.kv_cache_config.has_mamba_layers:
-            # Hybrid jumps are planned BEFORE allocation and committed atomically.
+        from vllm.v1.core.leyline_relative import has_relative_cache_groups
+        if self.kv_cache_config.has_mamba_layers or has_relative_cache_groups(self.kv_cache_config):
+            # Hybrid/relative jumps are planned BEFORE allocation and committed atomically.
             # Never enter the legacy post-allocation copy/advance path.
             return 0
 

@@ -698,6 +698,7 @@ class RocmPlatform(Platform):
         "modelopt",
         "modelopt_fp4",
         "modelopt_mxfp8",
+        "inkling2",  # Dedicated checkpoint-packed ROCm implementation.
         "modelopt_mixed",
         "fp8_per_tensor",
         "fp8_per_block",

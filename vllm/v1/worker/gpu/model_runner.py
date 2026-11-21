@@ -1330,9 +1330,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
-        jump_requests = {
-            op.req_id for op in (scheduler_output.mamba_state_transplants or ())
-        }
+        from vllm.v1.attention.ops.leyline_relative import splice_jump_request_ids
+        jump_requests = splice_jump_request_ids(scheduler_output)
         staged_jump = False
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
@@ -1400,10 +1399,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # KV and the transplanted recurrent state. Only set when
         # kv_splice_mode == "amortize"; off by default.
         if getattr(scheduler_output, "kv_cache_block_splices", None):
-            inv_freq, is_neox = self._resolve_rope_inv_freq()
-            if inv_freq is None:
-                raise RuntimeError("Hybrid splice requires resolvable RoPE frequencies")
-            if inv_freq is not None:
+            from vllm.v1.core.leyline_relative import is_relative_topology
+            if is_relative_topology(self.kv_cache_config):
+                from vllm.v1.attention.ops.leyline_relative import apply_relative_splices
+                apply_relative_splices(
+                    self.compilation_config.static_forward_context,
+                    self.kv_cache_config, scheduler_output.kv_cache_block_splices)
+            else:
+                inv_freq, is_neox = self._resolve_rope_inv_freq()
+                if inv_freq is None:
+                    raise RuntimeError("Hybrid splice requires resolvable RoPE frequencies")
                 from vllm.v1.attention.ops.leyline_rope import (
                     apply_kv_cache_block_splices_inplace,
                 )

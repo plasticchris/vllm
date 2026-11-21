@@ -18,6 +18,18 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        if name == "Inkling2LoopForConditionalGeneration":
+            from .amd.loop import Inkling2LoopForConditionalGeneration
+            return Inkling2LoopForConditionalGeneration
+        if name == "Inkling2ForConditionalGeneration":
+            from .amd.model import Inkling2ForConditionalGeneration
+            return Inkling2ForConditionalGeneration
+        if name == "Inkling2DSparkModel":
+            from .amd.dspark import Inkling2DSparkModel
+            return Inkling2DSparkModel
     if name == "Inkling2DSparkModel":
         from .nvidia import dspark
 

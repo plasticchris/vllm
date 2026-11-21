@@ -76,7 +76,14 @@ def prepare_splice(
     extra = (params.extra_args or {}) if params is not None else {}
     if extra.get("kv_splice_mode", "off") != "amortize":
         return None
-    if not manager.kv_cache_config.has_mamba_layers:
+    from vllm.v1.core.leyline_relative import (
+        has_relative_cache_groups, is_relative_topology, prepare_relative_splice,
+    )
+    relative = is_relative_topology(manager.kv_cache_config)
+    if has_relative_cache_groups(manager.kv_cache_config) and not relative:
+        _fallback(request, "unsupported_relative_cache_topology")
+        return None
+    if not manager.kv_cache_config.has_mamba_layers and not relative:
         return None
     directives = request.kv_splice_directives
     if not directives:
@@ -124,6 +131,9 @@ def prepare_splice(
     ):
         _fallback(request, "token_mismatch_or_invalid_span")
         return None
+
+    if relative:
+        return prepare_relative_splice(manager, request, s, e, r, length)
 
     groups = manager.kv_cache_config.kv_cache_groups
     managers = manager.coordinator.single_type_managers
@@ -299,6 +309,8 @@ def commit_splice(
                     offset,
                     offset + count,
                     plan.delta,
+                    kv_cache_group_id=gid,
+                    req_id=request.request_id,
                 )
             )
             destinations.append(dst)
