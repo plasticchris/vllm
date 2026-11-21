@@ -36,6 +36,68 @@ class Components(unittest.TestCase):
             actual.float(), expected.float(), atol=atol, rtol=rtol
         )
 
+    def test_sharded_argmax(self):
+        from vllm.models.inkling2.amd.ops.argmax import (
+            local_argmax_pair,
+            gathered_argmax,
+        )
+        from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
+
+        width = 50304
+        vocab = 4 * width - 192
+        for dtype in (torch.float32, torch.bfloat16):
+            for rows in (8, 128):
+                x = self.rand(rows, 4 * width + 16, dtype=dtype)[:, : 4 * width]
+                x[0, :] = float("nan")
+                x[1, :] = -float("inf")
+                x[2, :] = 0
+                x[2, 123] = 30
+                x[2, 2 * width + 17] = 30
+                x[3, :] = 0
+                x[3, 2 * width + 5] = float("inf")
+                x[3, 3 * width + 4] = float("inf")
+                x[4, vocab:] = 10000  # padding may never win
+                expected = greedy_argmax(x[:, :vocab])
+                pairs = torch.cat(
+                    [
+                        local_argmax_pair(
+                            x[:, r * width : (r + 1) * width],
+                            r * width,
+                            max(0, min(width, vocab - r * width)),
+                        )
+                        for r in range(4)
+                    ],
+                    dim=-1,
+                )
+                actual = gathered_argmax(pairs)
+                self.assertTrue(torch.equal(actual, expected), (actual, expected))
+                self.assertFalse(
+                    torch.equal(actual + 1, expected), "injected wrong IDs must fail"
+                )
+        empty = local_argmax_pair(x[:0, :width], 0, width)
+        self.assertEqual(gathered_argmax(empty).numel(), 0)
+
+    def test_draft_strided_cache_writer(self):
+        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+            triton_reshape_and_cache_flash,
+        )
+
+        parent = torch.full((5, 2, 64, 256), -17.0, dtype=torch.bfloat16, device=DEVICE)
+        reference = parent.clone()
+        keys, values = parent.transpose(1, 2).split(128, dim=-1)
+        slots = torch.tensor([0, 5, 81, -1, 150, 319], device=DEVICE, dtype=torch.int64)
+        k = self.rand(6, 3, 2, 128, dtype=torch.bfloat16)[:, 1]
+        v = self.rand(6, 3, 2, 128, dtype=torch.bfloat16)[:, 1]
+        scale = torch.ones((), dtype=torch.float32, device=DEVICE)
+        triton_reshape_and_cache_flash(
+            k, v, keys, values, slots, "bfloat16", scale, scale
+        )
+        for i, s in enumerate([0, 5, 81, -1, 150, 319]):
+            if s >= 0:
+                reference[s // 64, :, s % 64, :128] = k[i]
+                reference[s // 64, :, s % 64, 128:] = v[i]
+        self.assertTrue(torch.equal(parent, reference))
+
     def test_norm(self):
         for t in (1, 8, 128):
             x, w = (

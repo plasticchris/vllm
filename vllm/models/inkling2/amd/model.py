@@ -1,7 +1,8 @@
 """Experimental ROCm Inkling2, ordinary collectives and unfused conv/mix.
 
-Speculation, LoRA and encoder graphs are deliberately not advertised. The
+DSpark is implemented separately; vision/LoRA remain unqualified. The
 checkpoint loader and the loop's bf16/fp32 rounding boundaries are retained.
+Decode can use bounded breakable capture, with dynamic attention eager breaks.
 """
 
 from collections import Counter

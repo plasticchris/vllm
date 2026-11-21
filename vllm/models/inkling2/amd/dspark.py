@@ -5,6 +5,7 @@ through a small dense transformer over DFlare-mixed target-feature K/V, then a
 recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
 implementation's draft (flashinfer RMSNorms, bf16 logits)."""
 
+import os
 from collections.abc import Iterable
 from typing import cast
 
@@ -31,10 +32,12 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
-    FlashAttentionImpl,
     FlashAttentionMetadata,
 )
 from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash,
+)
 
 from ..configs import Inkling2DSparkConfig
 from ..speculator_config import Inkling2DSparkSpeculatorConfig
@@ -160,8 +163,20 @@ class Inkling2DraftSelfAttention(nn.Module):
     def _write_kv(
         self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor
     ) -> None:
-        impl = cast(FlashAttentionImpl, self.attn.impl)
-        impl.do_kv_cache_update(self.attn, k, v, self.attn.kv_cache, slot_mapping)
+        # The Flash backend describes this cache's layout, not its execution
+        # backend. Its cache writer can be unavailable on ROCm (notably in
+        # profiling/dummy forwards), so use the platform's strided Triton op.
+        keys, values = self.attn.kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
+        triton_reshape_and_cache_flash(
+            k,
+            v,
+            keys,
+            values,
+            slot_mapping,
+            self.attn.kv_cache_dtype,
+            self.attn._k_scale,
+            self.attn._v_scale,
+        )
 
     def forward(
         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
@@ -556,7 +571,19 @@ class Inkling2DSparkModel(nn.Module):
         self, base_logits: torch.Tensor, bias: torch.Tensor
     ) -> torch.Tensor:
         """`markov_logits(...).argmax(-1)`, NaN as -inf."""
-        return greedy_argmax(self.markov_logits(base_logits, bias))
+        if os.environ.get("INKLING_FAST_DRAFT_ARGMAX", "0") != "1":
+            return greedy_argmax(self.markov_logits(base_logits, bias))
+        from .ops.argmax import gathered_argmax, local_argmax_pair
+
+        # Apply the SAME bf16 softcap before choosing maxima: taking argmax
+        # before this rounding would change tie behavior at saturation.
+        logits = add_softcap(base_logits, bias, self.config.final_logit_softcapping)
+        width = logits.shape[-1]
+        offset = get_tp_group().rank_in_group * width
+        valid = max(0, min(width, self.config.vocab_size - offset))
+        pairs = local_argmax_pair(logits, offset, valid)
+        pairs = tensor_model_parallel_all_gather(pairs, dim=-1)
+        return gathered_argmax(pairs)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
