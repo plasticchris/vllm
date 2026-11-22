@@ -240,6 +240,56 @@ class Components(unittest.TestCase):
             )
         self.assertFalse(torch.equal(y + 1, z), "incorrect lookup must be rejected")
 
+    def test_mxfp8_compiled_codebook(self):
+        from vllm.models.inkling2.amd.ops.codebook import build_mx_codebook
+        from vllm.models.inkling2.amd.ops.moe import _e4m3, expert_gemm
+        from vllm.triton_utils import triton, tl
+
+        @triton.jit
+        def reference(Y, B: tl.constexpr):
+            i = tl.program_id(0) * B + tl.arange(0, B)
+            raw = (i % 256).to(tl.uint8)
+            scale = i // 256
+            value = _e4m3(raw) * tl.exp2(scale.to(tl.float32) - 127.0)
+            tl.store(Y + i, value.to(tl.bfloat16))
+
+        table = build_mx_codebook(DEVICE)
+        ref = torch.empty_like(table)
+        reference[(64,)](ref, 1024, num_warps=4)
+        torch.testing.assert_close(table, ref, atol=0, rtol=0, equal_nan=True)
+        zeros = ref == 0
+        self.assertTrue(
+            torch.equal(torch.signbit(table[zeros]), torch.signbit(ref[zeros]))
+        )
+        raw = torch.arange(256, device=DEVICE, dtype=torch.int32)
+        e = (raw >> 3) & 15
+        m = raw & 7
+        values = torch.where(
+            e == 0, m.float() * 2**-9, (1 + m.float() / 8) * torch.exp2(e.float() - 7)
+        )
+        values = torch.where((raw & 128) != 0, -values, values)
+        independent = (
+            values[None, :]
+            * torch.exp2(torch.arange(256, device=DEVICE).float()[:, None] - 127)
+        ).bfloat16()
+        torch.testing.assert_close(
+            table[1:], independent[1:], atol=0, rtol=0, equal_nan=True
+        )
+        for div in (1, 8):
+            ids = torch.randint(-1, 4, (7, 8), device=DEVICE, dtype=torch.int32)
+            ids[0, 0] = -1
+            x = self.rand(56 // div, 256, dtype=torch.bfloat16) * 0.2
+            w = (self.rand(4, 128, 256) * 0.2).to(torch.float8_e4m3fn)
+            scales = torch.randint(
+                124, 130, (4, 128, 8), device=DEVICE, dtype=torch.uint8
+            )
+            expected, _ = expert_gemm(x, w, scales, None, ids, div, False)
+            actual, _ = expert_gemm(x, w, scales, None, ids, div, False, codebook=table)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        self.assertFalse(
+            torch.equal(actual + 1, expected), "corrupted lookup output must fail"
+        )
+
     def test_norm(self):
         for t in (1, 8, 128):
             x, w = (

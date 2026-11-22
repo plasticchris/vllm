@@ -19,9 +19,11 @@ from .ops.linear import linear_k_groups
 from .ops.moe import expert_gemm, situ
 from .ops.combine import combine_experts
 from .ops.staged_experts import staged_expert_gemm
+from .ops.codebook import build_mx_codebook
 
 FUSED_COMBINE = os.environ.get("INKLING_FUSED_COMBINE", "0") == "1"
 STAGE_EXPERTS = os.environ.get("INKLING_STAGE_EXPERTS", "off")
+MX_CODEBOOK = os.environ.get("INKLING_MX_CODEBOOK", "0") == "1"
 
 QuantFormat = Literal["nvfp4", "mxfp8"]
 
@@ -63,6 +65,7 @@ class Inkling2Experts(nn.Module):
         assert config.n_routed_experts % self.ep_size == 0
         self.num_experts = config.n_routed_experts // self.ep_size
         self.nvfp4 = quant_format == "nvfp4"
+        self.register_buffer("mx_codebook", None, persistent=False)
         self.topk = config.num_experts_per_tok
         self.gate_cap, self.up_cap = config.mlp_gate_softcap, config.mlp_up_softcap
         h, i = config.hidden_size, config.intermediate_size
@@ -115,6 +118,8 @@ class Inkling2Experts(nn.Module):
                 amax = getattr(self, name + "_weight_amax")
                 denominator = getattr(self, name + "_weight_outer_scale_denominator")
                 self.global_scales[name] = amax / denominator
+        elif MX_CODEBOOK:
+            self.mx_codebook = build_mx_codebook(self.w13_weight.device)
 
     def forward(self, x, ids, weights):
         local = ids - self.ep_rank * self.num_experts
@@ -125,6 +130,7 @@ class Inkling2Experts(nn.Module):
                 STAGE_EXPERTS == "all" or (STAGE_EXPERTS == "mx" and not self.nvfp4)
             )
             implementation = staged_expert_gemm if stage else expert_gemm
+            extra = {} if stage else {"codebook": self.mx_codebook}
             return implementation(
                 inp,
                 getattr(self, name + "_weight"),
@@ -134,6 +140,7 @@ class Inkling2Experts(nn.Module):
                 divisor,
                 self.nvfp4,
                 layout,
+                **extra,
             )
 
         up, layout = project(x, "w13", self.topk)

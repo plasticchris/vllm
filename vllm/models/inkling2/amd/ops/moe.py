@@ -120,6 +120,8 @@ def _expert_gemm(
     BK: tl.constexpr,
     FAST_DECODE: tl.constexpr = False,
     INTEGER_DECODE: tl.constexpr = False,
+    Codebook=None,
+    MX_CODEBOOK: tl.constexpr = False,
 ):
     tile = tl.program_id(0)
     if tile * BM >= tl.load(Padded):
@@ -163,13 +165,17 @@ def _expert_gemm(
                 vals = _e2m1_bits(code) if FAST_DECODE else _e2m1(code)
             scale = (_e4m3_bits(scales) if FAST_DECODE else _e4m3(scales)) * glob
         else:
-            vals = _e4m3_bits(raw) if FAST_DECODE else _e4m3(raw)
-            scale = (
-                _e8m0_bits(scales)
-                if FAST_DECODE
-                else tl.exp2(scales.to(tl.float32) - 127.0)
-            )
-        bv = (vals * scale).to(av.dtype)
+            if MX_CODEBOOK:
+                bv = tl.load(Codebook + scales.to(tl.int32) * 256 + raw.to(tl.int32))
+            else:
+                vals = _e4m3_bits(raw) if FAST_DECODE else _e4m3(raw)
+                scale = (
+                    _e8m0_bits(scales)
+                    if FAST_DECODE
+                    else tl.exp2(scales.to(tl.float32) - 127.0)
+                )
+        if NVFP4 or not MX_CODEBOOK:
+            bv = (vals * scale).to(av.dtype)
         acc = tl.dot(av, bv, acc)
     tl.store(
         Out + rows[:, None] * N + cols[None, :],
@@ -189,10 +195,23 @@ def expert_gemm(
     layout=None,
     launch_config=None,
     fast_decode=False,
+    codebook=None,
 ):
     if launch_config is None and OPTIMIZED:
         k = weight.shape[2] * (2 if nvfp4 else 1)
         launch_config, fast_decode = expert_launch_config(ids.shape[0], k, nvfp4)
+    if codebook is not None:
+        if (
+            nvfp4
+            or fast_decode
+            or codebook.shape != (256, 256)
+            or codebook.dtype != torch.bfloat16
+            or codebook.device != x.device
+            or not codebook.is_contiguous()
+        ):
+            raise ValueError(
+                "MX codebook requires the qualified BF16 table and reference MX decoder path"
+            )
     bm, bn, bk = (16, 32, 64) if launch_config is None else launch_config
     assert bm in (16, 32, 64) and bn in (32, 64) and bk in (64, 128)
     rows = ids.numel()
@@ -224,6 +243,8 @@ def expert_gemm(
             bk,
             FAST_DECODE=fast_decode,
             INTEGER_DECODE=INTEGER_FP4,
+            Codebook=codebook,
+            MX_CODEBOOK=codebook is not None and not nvfp4,
             num_warps=4,
             num_stages=1,
         )
