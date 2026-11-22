@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from .tuning import OPTIMIZED, expert_launch_config
 
 INTEGER_FP4 = os.environ.get("INKLING_INTEGER_FP4", "0") == "1"
+PACKED_LOAD_REUSE = os.environ.get("INKLING_PACKED_LOAD_REUSE", "0") == "1"
 
 
 @triton.jit
@@ -122,6 +123,7 @@ def _expert_gemm(
     INTEGER_DECODE: tl.constexpr = False,
     Codebook=None,
     MX_CODEBOOK: tl.constexpr = False,
+    REUSE: tl.constexpr = False,
 ):
     tile = tl.program_id(0)
     if tile * BM >= tl.load(Padded):
@@ -143,27 +145,46 @@ def _expert_gemm(
             (rows[:, None] < ROWS) & (k[None, :] < K),
             other=0,
         )
-        raw = tl.load(
-            W.to(tl.pointer_type(tl.uint8))
-            + (expert * N + cols[None, :]) * (K // PACK)
-            + k[:, None] // PACK,
-            (cols[None, :] < N) & (k[:, None] < K),
-            other=0,
-        )
-        scales = tl.load(
-            S.to(tl.pointer_type(tl.uint8))
-            + (expert * N + cols[None, :]) * (K // GROUP)
-            + k[:, None] // GROUP,
-            (cols[None, :] < N) & (k[:, None] < K),
-            other=0,
-        )
+        w_base = W.to(tl.pointer_type(tl.uint8)) + (expert * N + cols[None, :]) * (K // PACK)
+        s_base = S.to(tl.pointer_type(tl.uint8)) + (expert * N + cols[None, :]) * (K // GROUP)
+        if REUSE:
+            # NVFP4: load bytes, not duplicated K elements; restore the
+            # original low/high nibble sequence before the identical dot.
+            byte = first * (BK // 2) + tl.arange(0, BK // 2)
+            packed = tl.load(
+                w_base + byte[:, None],
+                (cols[None, :] < N) & (byte[:, None] < K // 2),
+                other=0,
+            )
+            code = tl.interleave(tl.trans(packed & 15), tl.trans(packed >> 4)).T
+        else:
+            raw = tl.load(w_base + k[:, None] // PACK,
+                          (cols[None, :] < N) & (k[:, None] < K), other=0)
+            if NVFP4:
+                code = (raw >> ((k[:, None] % 2) * 4)) & 15
+        if REUSE:
+            group = first * (BK // 16) + tl.arange(0, BK // 16)
+            sg = tl.load(
+                s_base + group[:, None],
+                (cols[None, :] < N) & (group[:, None] < K // 16),
+                other=0,
+            )
+            # Each group has one E4M3 scale. Keep the FP32 product with the
+            # outer scale and the original per-weight BF16 rounding below.
+            scaled = _e4m3_bits(sg) * glob
+            scale = tl.reshape(
+                tl.broadcast_to(scaled[:, None, :], (BK // 16, 16, BN)), (BK, BN)
+            )
+        else:
+            scales = tl.load(s_base + k[:, None] // GROUP,
+                             (cols[None, :] < N) & (k[:, None] < K), other=0)
         if NVFP4:
-            code = (raw >> ((k[:, None] % 2) * 4)) & 15
             if INTEGER_DECODE:
                 vals = _e2m1_bf16_bits(code)
             else:
                 vals = _e2m1_bits(code) if FAST_DECODE else _e2m1(code)
-            scale = (_e4m3_bits(scales) if FAST_DECODE else _e4m3(scales)) * glob
+            if not REUSE:
+                scale = (_e4m3_bits(scales) if FAST_DECODE else _e4m3(scales)) * glob
         else:
             if MX_CODEBOOK:
                 bv = tl.load(Codebook + scales.to(tl.int32) * 256 + raw.to(tl.int32))
@@ -249,6 +270,13 @@ def expert_gemm(
             INTEGER_DECODE=INTEGER_FP4,
             Codebook=codebook,
             MX_CODEBOOK=codebook is not None and not nvfp4,
+            # Scope the served optimization to the qualified gfx1100 Q8
+            # projection shapes. Q32, MXFP8 and prefill retain their paths.
+            REUSE=(
+                PACKED_LOAD_REUSE and nvfp4 and fast_decode and INTEGER_FP4
+                and ids.shape == (8, 8) and n == 2304 and k in (1152, 2304)
+                and (bm, bn, bk) == (16, 64, 128)
+            ),
             num_warps=4,
             num_stages=1,
         )
