@@ -46,6 +46,22 @@ LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 # ---------------------------------------------------------------------------
 
 
+def _w8a16_prefill_config(M: int, N: int, K: int, gfx1100: bool):
+    """Return BM, BN, BK, warps, stages for the W8A16 launch."""
+    if M <= 128:
+        return (64, 64 if K >= N else 128, 32, 4, 2)
+    if M <= 1024:
+        return (64, 128, 32, 8, 3)
+    # Triton 3.9 regresses the old BM128/BN128 configuration on gfx1100.
+    # Measured 4800x4352x5120: 12.58ms -> 4.61ms with BM64/BN128,
+    # matching the old stack (4.49ms). Five more model shapes and an
+    # independent float32 reference passed. Other architectures keep upstream
+    # launch parameters; end-to-end performance still requires qualification.
+    if gfx1100:
+        return (64, 128, 32, 4, 2)
+    return (128, 128, 32, 4, 2)
+
+
 @triton.jit
 def _triton_w8a16_gemm_kernel(
     a_ptr,  # [M, K] bf16/fp16 activations
@@ -118,23 +134,14 @@ def triton_w8a16_gemm(
 
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
-    # gfx1100 prefill heuristic, tuned 2026-10-25 (/tmp/pf_tune.py, GPU3):
-    #   M<=128: legacy W4A16-style config (0.81-1.00x bf16 GEMM, unchanged)
-    #   128<M<=1024: BM64/BN128/BK32 w8 s3 -> 0.84-1.14x bf16 (old config was
-    #                1.2-1.5x; this is the prod prefill-chunk range)
-    #   M>1024: BM128/BN128/BK32 w4 s2 (tuned config regresses at M~2832:
-    #           1.44x vs 1.28x bf16; huge chunks are rare)
-    if M <= 128:
-        num_warps = 4
-        if K >= N:  # tall K (down_proj)
-            BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
-        else:
-            BLOCK_M, BLOCK_N, BLOCK_K = 64, 128, 32
-        num_stages = 2
-    elif M <= 1024:
-        BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = 64, 128, 32, 8, 3
-    else:
-        BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = 128, 128, 32, 4, 2
+    is_gfx1100 = False
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1100
+
+        is_gfx1100 = on_gfx1100()
+    BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = _w8a16_prefill_config(
+        M, N, K, is_gfx1100
+    )
 
     BLOCK_K = min(BLOCK_K, group_size)
 

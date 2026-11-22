@@ -1,0 +1,38 @@
+--- a/flash_attn/flash_attn_triton_amd/bwd_prefill_onekernel.py
++++ b/flash_attn/flash_attn_triton_amd/bwd_prefill_onekernel.py
+@@ -28,4 +28 @@
+-            preprocess_autotune_keys = [
+-                "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K",
+-                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+-            ]
++            preprocess_autotune_keys = ["PRE_BLOCK", "HEAD_DIM", "ACTUAL_HEAD_DIM", "IS_VARLEN", "IS_FP8"]
+@@ -38,4 +35 @@
+-            causal_autotune_keys = [
+-                "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K",
+-                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+-            ]
++            causal_autotune_keys = ["HQ", "HK", "dropout_p", "HEAD_DIM", "ACTUAL_HEAD_DIM", "IS_VARLEN", "ENABLE_DROPOUT", "USE_EXP2"]
+@@ -48,4 +42 @@
+-            noncausal_autotune_keys = [
+-                "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K",
+-                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+-            ]
++            noncausal_autotune_keys = ["HQ", "HK", "dropout_p", "HEAD_DIM", "ACTUAL_HEAD_DIM", "IS_VARLEN", "ENABLE_DROPOUT", "USE_EXP2"]
+@@ -71,4 +62 @@
+-        preprocess_autotune_keys = [
+-            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K",
+-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+-        ]
++        preprocess_autotune_keys = ["PRE_BLOCK", "HEAD_DIM", "ACTUAL_HEAD_DIM", "IS_VARLEN", "IS_FP8"]
+@@ -78,4 +66 @@
+-        causal_autotune_keys = [
+-            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K",
+-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+-        ]
++        causal_autotune_keys = ["HQ", "HK", "dropout_p", "HEAD_DIM", "ACTUAL_HEAD_DIM", "IS_VARLEN", "ENABLE_DROPOUT", "USE_EXP2"]
+@@ -85,4 +70 @@
+-        noncausal_autotune_keys = [
+-            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K",
+-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+-        ]
++        noncausal_autotune_keys = ["HQ", "HK", "dropout_p", "HEAD_DIM", "ACTUAL_HEAD_DIM", "IS_VARLEN", "ENABLE_DROPOUT", "USE_EXP2"]

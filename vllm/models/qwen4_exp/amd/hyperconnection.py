@@ -5,10 +5,10 @@
 Implements the HyperConnection residual scheme proposed in
 "HyperConnections" (https://arxiv.org/abs/2409.19606). This AMD variant
 delays each HC combine to the following HC mix boundary. HC glue kernels,
-including fused combine+RMSNorm, live in ``ops/hc.py``; projections remain
+including fused combine+RMSNorm, live in `ops/hc.py`; projections remain
 standard vLLM Linear modules.
 
-Hidden states between layers have shape ``[..., HC*HS]`` with HS inner
+Hidden states between layers have shape `[..., HC*HS]` with HS inner
 (HC outer, HS inner — checkpoint-native layout).
 
 Typical usage inside a transformer decoder layer::
@@ -50,11 +50,11 @@ from .ops.hc import (
 class GatedResidual(nn.Module):
     """Gated HyperConnection with learnable low-rank mixing and injection.
 
-    ``combine_and_mix()`` runs the pre pipeline (grouped GemmaRMSNorm -> merged
+    `combine_and_mix()` runs the pre pipeline (grouped GemmaRMSNorm -> merged
     low-rank down+inject GEMM -> silu -> up GEMM -> sigmoid -> gated mean
     over the HC streams). When passed a pending block output and an injection,
     it fuses their residual combine with the RMSNorm. Final mixers use
-    ``use_combine=False`` and do not produce a new injection.
+    `use_combine=False` and do not produce a new injection.
 
     Weights: the norm owns the grouped GemmaRMSNorm affine; the projections
     are vLLM Linear modules (merged replicated linear for down+inject), so
@@ -104,6 +104,10 @@ class GatedResidual(nn.Module):
                 return_bias=False,
                 disable_tp=True,
             )
+            if self.pad_size:
+                weight = self.input_mix_weight_down_block_inject.weight
+                self._down_inject_loader = weight.weight_loader
+                weight.weight_loader = self._load_down_inject_with_padding
         else:
             self.input_mix_weight_down = ReplicatedLinear(
                 self.hyper_hidden_size,
@@ -123,6 +127,15 @@ class GatedResidual(nn.Module):
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
+
+    def _load_down_inject_with_padding(self, param, loaded_weight, shard_id=None):
+        self._down_inject_loader(param, loaded_weight, shard_id)
+        if shard_id != 2:
+            # This third shard is alignment storage, not a checkpoint tensor.
+            # Load real zeros through the normal loader so every load records
+            # its initialization without exempting either real projection.
+            padding = param.new_zeros((self.pad_size, self.hyper_hidden_size))
+            self._down_inject_loader(param, padding, 2)
 
     def mix(
         self, hidden_states: torch.Tensor
@@ -157,8 +170,8 @@ class GatedResidual(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Consume a pending combine, then prepare the next block input.
 
-        ``hidden_states`` is the multi-stream state from before the pending
-        block's mix. Its combine with ``block_output`` is fused with this
+        `hidden_states` is the multi-stream state from before the pending
+        block's mix. Its combine with `block_output` is fused with this
         module's input RMSNorm.
         """
         hidden_states, xn = hc_combine_norm(

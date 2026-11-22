@@ -16,8 +16,8 @@ QuantizationMethods = Literal[
     "awq",
     "auto_awq",
     "fp8",
+    "w4afp8",
     "fbgemm_fp8",
-    "fp_quant",
     "modelopt",
     "modelopt_fp4",
     "modelopt_mxfp8",
@@ -30,6 +30,7 @@ QuantizationMethods = Literal[
     "compressed-tensors",
     "experts_int8",
     "quark",
+    "inkling2",
     "moe_wna16",
     "torchao",
     "inc",
@@ -46,12 +47,13 @@ QuantizationMethods = Literal[
     "int8_per_channel_weight_only",
     "nvfp4_per_token",
     "mxfp8",
+    "lut_b_moe",
+    "mxfp4_hadamard32",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 DEPRECATED_QUANTIZATION_METHODS = [
     "fbgemm_fp8",
-    "fp_quant",
 ]
 
 # The customized quantization methods which will be added to this dict.
@@ -115,6 +117,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.config.quantization import _ONLINE_SHORTHANDS
+    from vllm.models.inkling2.quant_config import Inkling2QuantConfig
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 
     if current_platform.is_cuda() or current_platform.is_rocm():
@@ -139,7 +142,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
-    from .fp_quant import FPQuantConfig
     from .humming import HummingConfig
     from .inc import INCConfig
     from .modelopt import (
@@ -152,14 +154,15 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
     from .online.base import OnlineQuantizationConfig
     from .torchao import TorchAOConfig
+    from .w4afp8 import W4AFP8Config
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "awq": AutoAWQConfig,
         "awq_marlin": AutoAWQConfig,
         "auto_awq": AutoAWQConfig,
         "fp8": Fp8Config,
+        "w4afp8": W4AFP8Config,
         "fbgemm_fp8": FBGEMMFp8Config,
-        "fp_quant": FPQuantConfig,
         "modelopt": ModelOptFp8Config,
         "modelopt_fp4": ModelOptNvFp4Config,
         "modelopt_mxfp8": ModelOptMxFp8Config,
@@ -170,6 +173,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "compressed-tensors": CompressedTensorsConfig,
         "experts_int8": ExpertsInt8Config,
         "quark": QuarkConfig,
+        "inkling2": Inkling2QuantConfig,
         "moe_wna16": MoeWNA16Config,
         "torchao": TorchAOConfig,
         "inc": INCConfig,

@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# Probe (asgard 2026-11-08): the INT8 Qwen3.8-27B MTP K=2 server runs decode
-# 100% eager despite FULL_DECODE_ONLY + captured FULL graphs (1,227 host
-# launches/step at a flat 3.8us gap, zero graph-replay bursts — live
-# rocprofv3 attach). This test reconstructs the production config on CPU and
-# verifies the decode path resolves to FULL and dispatch() maps live shapes
-# onto FULL replays.
+# CPU regression for the INT8 Qwen3.8-27B MTP K=2 graph dispatch ladder.
+# The original eager-only diagnosis was retracted: live run-mode/replay logs
+# confirmed FULL replay. This checks descriptor selection, not GPU execution.
 #
 # Run:  /mnt/hoard/vllm/venv/bin/python -m pytest \
 #          tests/v1/worker/test_int8_decode_cudagraph_dispatch.py -x -v
@@ -45,12 +42,16 @@ DQL = NUM_SPEC + 1  # uniform_decode_query_len = 3
 
 def build_cfg() -> VllmConfig:
     mc = ModelConfig(
-        model=MODEL, tokenizer=MODEL, dtype="bfloat16",
-        max_model_len=262144, trust_remote_code=True,
+        model=MODEL,
+        tokenizer=MODEL,
+        dtype="bfloat16",
+        max_model_len=262144,
+        trust_remote_code=True,
     )
     pc = ParallelConfig(tensor_parallel_size=4)
-    sc = SchedulerConfig(max_num_seqs=MAXSEQS, max_model_len=262144,
-                         is_encoder_decoder=False)
+    sc = SchedulerConfig(
+        max_num_seqs=MAXSEQS, max_model_len=262144, is_encoder_decoder=False
+    )
     spec = SpeculativeConfig(method="ngram", num_speculative_tokens=NUM_SPEC)
     cc = CompilationConfig(
         mode=3,
@@ -58,8 +59,11 @@ def build_cfg() -> VllmConfig:
         cudagraph_capture_sizes=list(CAPTURE_SIZES),
     )
     return VllmConfig(
-        model_config=mc, parallel_config=pc, scheduler_config=sc,
-        speculative_config=spec, compilation_config=cc,
+        model_config=mc,
+        parallel_config=pc,
+        scheduler_config=sc,
+        speculative_config=spec,
+        compilation_config=cc,
         cache_config=CacheConfig(cache_dtype="bfloat16"),
     )
 
@@ -73,22 +77,24 @@ def cpu_manager(monkeypatch):
     pp = types.SimpleNamespace(is_first_rank=True, is_last_rank=True)
     monkeypatch.setattr(cu, "get_pp_group", lambda: pp)
     monkeypatch.setattr(
-        cu.current_platform, "get_global_graph_pool",
+        cu.current_platform,
+        "get_global_graph_pool",
         classmethod(lambda cls: None).__get__(type(cu.current_platform)),
     )
 
     def make(min_cg_support: AttentionCGSupport):
         cfg = build_cfg()
         resolved = cfg.compilation_config.resolve_cudagraph_mode_and_sizes(
-            min_cg_support, "GDNAttentionMetadata",
+            min_cg_support,
+            "GDNAttentionMetadata",
             uniform_decode_query_len=DQL,
-            use_v2_model_runner=True,
             max_num_reqs=MAXSEQS,
         )
         from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 
-        mgr = ModelCudaGraphManager(cfg, torch.device("cpu"), resolved,
-                                    decode_query_len=DQL)
+        mgr = ModelCudaGraphManager(
+            cfg, torch.device("cpu"), resolved, decode_query_lens={DQL: MAXSEQS}
+        )
         # capture() normally flips this; dispatch() consults it.
         mgr._graphs_captured = True
         return resolved, mgr
@@ -96,11 +102,14 @@ def cpu_manager(monkeypatch):
     return make
 
 
-@pytest.mark.parametrize("min_cg_support, expect_decode", [
-    (AttentionCGSupport.UNIFORM_BATCH, CUDAGraphMode.FULL),
-    (AttentionCGSupport.ALWAYS, CUDAGraphMode.FULL),
-    (AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE, CUDAGraphMode.PIECEWISE),
-])
+@pytest.mark.parametrize(
+    "min_cg_support, expect_decode",
+    [
+        (AttentionCGSupport.UNIFORM_BATCH, CUDAGraphMode.FULL),
+        (AttentionCGSupport.ALWAYS, CUDAGraphMode.FULL),
+        (AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE, CUDAGraphMode.PIECEWISE),
+    ],
+)
 def test_resolved_mode(cpu_manager, min_cg_support, expect_decode):
     resolved, _ = cpu_manager(min_cg_support)
     assert resolved.decode_mode() == expect_decode, (
@@ -113,8 +122,12 @@ def test_manager_captures_full_decode_ladder_and_dispatches(cpu_manager):
     resolved, mgr = cpu_manager(AttentionCGSupport.UNIFORM_BATCH)
     assert resolved.decode_mode() == CUDAGraphMode.FULL
 
-    full = [d for mode, ds in mgr._capture_descs.items()
-            if mode == CUDAGraphMode.FULL for d in ds]
+    full = [
+        d
+        for mode, ds in mgr._capture_descs.items()
+        if mode == CUDAGraphMode.FULL
+        for d in ds
+    ]
     sizes = sorted({d.num_tokens for d in full})
     assert sizes == [3, 6, 9, 12], (
         f"expected FULL decode ladder [3,6,9,12] for MAXSEQS={MAXSEQS} "

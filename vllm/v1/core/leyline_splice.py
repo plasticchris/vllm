@@ -6,8 +6,8 @@ Planning pins only immutable donor blocks. Destination validation and publicatio
 are atomic, after allocation; failure leaves no worker operations behind.
 """
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -76,7 +76,14 @@ def prepare_splice(
     extra = (params.extra_args or {}) if params is not None else {}
     if extra.get("kv_splice_mode", "off") != "amortize":
         return None
-    if not manager.kv_cache_config.has_mamba_layers:
+    from vllm.v1.core.leyline_relative import (
+        has_relative_cache_groups, is_relative_topology, prepare_relative_splice,
+    )
+    relative = is_relative_topology(manager.kv_cache_config)
+    if has_relative_cache_groups(manager.kv_cache_config) and not relative:
+        _fallback(request, "unsupported_relative_cache_topology")
+        return None
+    if not manager.kv_cache_config.has_mamba_layers and not relative:
         return None
     directives = request.kv_splice_directives
     if not directives:
@@ -84,7 +91,8 @@ def prepare_splice(
     if len(directives) != 1:
         _fallback(request, "multiple_spans")
         return None
-    if not manager.enable_caching or request.skip_reading_prefix_cache:
+    # Bounded prompt-scoring/cache-skip requests must not jump past their limit.
+    if not manager.enable_caching or request.prefix_cache_hit_limit is not None:
         _fallback(request, "caching_disabled")
         return None
     if request.mm_features or request.prompt_embeds is not None:
@@ -123,6 +131,9 @@ def prepare_splice(
     ):
         _fallback(request, "token_mismatch_or_invalid_span")
         return None
+
+    if relative:
+        return prepare_relative_splice(manager, request, s, e, r, length)
 
     groups = manager.kv_cache_config.kv_cache_groups
     managers = manager.coordinator.single_type_managers
@@ -202,8 +213,7 @@ def prepare_splice(
                 break
             states.append((gid, found[0], block_size))
         if len(states) == len(mamba) and all(
-            manager.block_pool.get_cached_block(resolved[bidx], [gid])
-            for gid, _ in fa
+            manager.block_pool.get_cached_block(resolved[bidx], [gid]) for gid, _ in fa
         ):
             break
         boundary -= block_size
@@ -290,10 +300,19 @@ def commit_splice(
                 _fallback(request, "destination_not_private")
                 return False
             count = min(size - done, mgr.block_size - offset)
-            splices.append(KVCacheBlockSplice(
-                src.block_id, dst.block_id, src_offset + done,
-                src_offset + done + count, offset, offset + count, plan.delta,
-            ))
+            splices.append(
+                KVCacheBlockSplice(
+                    src.block_id,
+                    dst.block_id,
+                    src_offset + done,
+                    src_offset + done + count,
+                    offset,
+                    offset + count,
+                    plan.delta,
+                    kv_cache_group_id=gid,
+                    req_id=request.request_id,
+                )
+            )
             destinations.append(dst)
             done += count
     for gid, src, block_size in plan.states:
@@ -308,9 +327,15 @@ def commit_splice(
         if dst.is_null or dst.ref_cnt != 1 or dst.block_hash is not None:
             _fallback(request, "state_destination_not_private")
             return False
-        transplants.append(MambaStateTransplant(
-            request.request_id, gid, src.block_id, dst.block_id, idx,
-        ))
+        transplants.append(
+            MambaStateTransplant(
+                request.request_id,
+                gid,
+                src.block_id,
+                dst.block_id,
+                idx,
+            )
+        )
         destinations.append(dst)
     # Publication starts here; no fallible lookups follow. Keep every endpoint
     # alive until the scheduler's processed-step fence acknowledges the drains.

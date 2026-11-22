@@ -6,6 +6,7 @@ import os
 from collections.abc import Iterable, Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     is_fp8,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_reduce_scatter,
@@ -272,7 +274,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     @classmethod
     def _nth_prime_after(cls, start: int, count: int) -> int:
-        """Return the ``count``-th prime strictly greater than ``start``."""
+        """Return the `count`-th prime strictly greater than `start`."""
         prime = int(start)
         for _ in range(count):
             candidate = prime + 1
@@ -1011,7 +1013,7 @@ def qwen4_exp_amd_ple_ngram_embedding(
 ) -> None:
     """Run the large PLE embedding lookup outside Inductor's FX graph.
 
-    Keeping the embedding weight in ``static_forward_context`` prevents AOT
+    Keeping the embedding weight in `static_forward_context` prevents AOT
     compile-time autotuning from materializing a synthetic copy of the weight.
     """
     layer = get_forward_context().no_compile_layers[layer_name]
