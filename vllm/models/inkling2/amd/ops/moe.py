@@ -196,6 +196,8 @@ def expert_gemm(
     launch_config=None,
     fast_decode=False,
     codebook=None,
+    *,
+    sparse_output=False,
 ):
     if launch_config is None and OPTIMIZED:
         k = weight.shape[2] * (2 if nvfp4 else 1)
@@ -222,7 +224,9 @@ def expert_gemm(
     sorted_ids, experts, padded = layout
     n = weight.shape[1]
     k = weight.shape[2] * (2 if nvfp4 else 1)
-    out = torch.zeros((rows, n), dtype=x.dtype, device=x.device)
+    # With sparse_output, consumers must never read rows of nonlocal routes.
+    allocate = torch.empty if sparse_output else torch.zeros
+    out = allocate((rows, n), dtype=x.dtype, device=x.device)
     if rows:
         _expert_gemm[(triton.cdiv(sorted_ids.numel(), bm), triton.cdiv(n, bn))](
             x,
@@ -256,13 +260,18 @@ def _situ(
     X,
     Gamma,
     Out,
+    Local,
     N: tl.constexpr,
     ROWS: tl.constexpr,
     GATE: tl.constexpr,
     UP: tl.constexpr,
     BLOCK: tl.constexpr,
+    SPARSE: tl.constexpr,
 ):
     row = tl.program_id(0)
+    if SPARSE:
+        if tl.load(Local + row) < 0:
+            return
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     gate = tl.load(X + row * (2 * N) + 2 * col, col < N, other=0).to(tl.float32)
     up = tl.load(X + row * (2 * N) + 2 * col + 1, col < N, other=0).to(tl.float32)
@@ -274,12 +283,13 @@ def _situ(
     tl.store(Out + row * N + col, result.to(Out.dtype.element_ty), col < N)
 
 
-def situ(x, gammas, gate_cap, up_cap):
+def situ(x, gammas, gate_cap, up_cap, *, local=None):
     rows, twice_n = x.shape
     n = twice_n // 2
     out = torch.empty((rows, n), dtype=x.dtype, device=x.device)
     if rows:
         _situ[(rows, triton.cdiv(n, 128))](
-            x, gammas, out, n, rows, gate_cap, up_cap, 128, num_warps=4
+            x, gammas, out, local, n, rows, gate_cap, up_cap, 128,
+            SPARSE=local is not None, num_warps=4,
         )
     return out

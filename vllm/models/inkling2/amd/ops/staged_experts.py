@@ -93,7 +93,7 @@ def _gemm(
 
 
 def staged_expert_gemm(
-    x, weight, scale, global_scale, ids, input_div, nvfp4, layout=None
+    x, weight, scale, global_scale, ids, input_div, nvfp4, layout=None, *, sparse_output=False
 ):
     if x.dtype != torch.bfloat16 or not x.is_contiguous():
         raise ValueError("staged expert path requires contiguous BF16 input")
@@ -117,7 +117,9 @@ def staged_expert_gemm(
         INTEGER_DECODE=INTEGER_FP4,
         num_warps=4,
     )
-    out = torch.zeros((ids.numel(), n), device=x.device, dtype=x.dtype)
+    # Nonlocal rows are left untouched only for masked consumers.
+    allocate = torch.empty if sparse_output else torch.zeros
+    out = allocate((ids.numel(), n), device=x.device, dtype=x.dtype)
     if ids.numel():
         si, ei, pad = layout
         _gemm[(triton.cdiv(si.numel(), bm), triton.cdiv(n, bn))](

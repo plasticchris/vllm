@@ -24,6 +24,7 @@ from .ops.codebook import build_mx_codebook
 FUSED_COMBINE = os.environ.get("INKLING_FUSED_COMBINE", "0") == "1"
 STAGE_EXPERTS = os.environ.get("INKLING_STAGE_EXPERTS", "off")
 MX_CODEBOOK = os.environ.get("INKLING_MX_CODEBOOK", "0") == "1"
+SPARSE_EXPERT_OUTPUT = os.environ.get("INKLING_SPARSE_EXPERT_OUTPUT", "0") == "1"
 
 QuantFormat = Literal["nvfp4", "mxfp8"]
 
@@ -124,6 +125,11 @@ class Inkling2Experts(nn.Module):
     def forward(self, x, ids, weights):
         local = ids - self.ep_rank * self.num_experts
         local = torch.where((local >= 0) & (local < self.num_experts), local, -1)
+        fused_combine = (
+            FUSED_COMBINE and self.topk == 8 and x.shape[-1] == 2304
+            and x.dtype == torch.bfloat16
+        )
+        sparse = SPARSE_EXPERT_OUTPUT and fused_combine and self.ep_size > 1
 
         def project(inp, name, divisor, layout=None):
             stage = x.shape[0] >= 2048 and (
@@ -140,20 +146,17 @@ class Inkling2Experts(nn.Module):
                 divisor,
                 self.nvfp4,
                 layout,
+                sparse_output=sparse,
                 **extra,
             )
 
         up, layout = project(x, "w13", self.topk)
-        activated = situ(up, weights.reshape(-1), self.gate_cap, self.up_cap)
+        mask = local if sparse else None
+        activated = situ(up, weights.reshape(-1), self.gate_cap, self.up_cap, local=mask)
         down, _ = project(activated, "w2", 1, layout)
         outputs = down.view(x.shape[0], self.topk, x.shape[-1])
-        if (
-            FUSED_COMBINE
-            and self.topk == 8
-            and x.shape[-1] == 2304
-            and x.dtype == torch.bfloat16
-        ):
-            return combine_experts(outputs)
+        if fused_combine:
+            return combine_experts(outputs, local=mask)
         return outputs.float().sum(1).to(x.dtype)
 
 
