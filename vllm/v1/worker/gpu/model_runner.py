@@ -47,6 +47,7 @@ from vllm.distributed.aux_output_connector.worker import (
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tp_group,
     is_global_first_rank,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -241,6 +242,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
+        self.inkling_peer_push = None
+        if peer_rows := envs.VLLM_ROCM_INKLING_PEER_PUSH_MAX_ROWS:
+            from vllm.distributed.device_communicators.gfx1100_peer_push import (
+                create_inkling_peer_push,
+            )
+
+            tp = get_tp_group()
+            if tp.inkling_peer_push is not None:
+                raise RuntimeError("Inkling peer push requires one GPU model runner per TP group")
+            self.inkling_peer_push = create_inkling_peer_push(
+                vllm_config, tp, self.device, peer_rows
+            )
+            tp.inkling_peer_push = self.inkling_peer_push
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -2435,6 +2449,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
+            inkling_peer_push=self.inkling_peer_push,
         )
 
         # Collect KV transfer results now; finalize saves after the drafter runs.
@@ -2600,6 +2615,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # https://github.com/ROCm/rocm-systems/issues/13018
             CUDAGraphWrapper.clear_all_graphs()
             BreakableCUDAGraphWrapper.clear_all_graphs()
+        if self.inkling_peer_push is not None:
+            get_tp_group().inkling_peer_push = None
+            self.inkling_peer_push.close()
+            self.inkling_peer_push = None
         if self.aux_output_connector is not None:
             self.aux_output_connector.close()
         set_offloader(None)

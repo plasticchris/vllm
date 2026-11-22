@@ -22,6 +22,7 @@ from vllm.v1.worker.utils import raise_if_nan_logits
 
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
+    from vllm.distributed.device_communicators.gfx1100_peer_push import Gfx1100PeerPush
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
@@ -123,6 +124,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool,
         pending_aux_output: "PendingAuxOutput | None",
+        inkling_peer_push: "Gfx1100PeerPush | None" = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -169,10 +171,19 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
+            self._inkling_peer_fault = (
+                inkling_peer_push.snapshot_async() if inkling_peer_push is not None else None
+            )
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
+        if self._inkling_peer_fault is not None:
+            from vllm.distributed.device_communicators.gfx1100_peer_push import (
+                check_peer_push_fault,
+            )
+
+            check_peer_push_fault(self._inkling_peer_fault)
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.

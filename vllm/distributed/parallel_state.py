@@ -63,6 +63,7 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.gfx1100_peer_push import Gfx1100PeerPush
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -551,6 +552,8 @@ class GroupCoordinator:
 
         self.use_device_communicator = use_device_communicator
         self.device_communicator = None
+        # The optional Inkling target backend is owned by the GPU model runner.
+        self.inkling_peer_push: Gfx1100PeerPush | None = None
         if use_device_communicator and self.world_size > 1:
             device_comm_cls = resolve_obj_by_qualname(
                 current_platform.get_device_communicator_cls()
@@ -688,6 +691,8 @@ class GroupCoordinator:
         maybe_ca_context = nullcontext()
         maybe_fi_pcie_ipc_context: AbstractContextManager[Any] = nullcontext()
         maybe_aiter_ar_context = nullcontext()
+        peer = self.inkling_peer_push
+        maybe_inkling_context = nullcontext() if peer is None else peer.capture(stream)
         from vllm.distributed.device_communicators.cuda_communicator import (
             CudaCommunicator,
         )
@@ -724,6 +729,7 @@ class GroupCoordinator:
             maybe_ca_context,
             maybe_fi_pcie_ipc_context,
             maybe_aiter_ar_context,
+            maybe_inkling_context,
         ):
             yield graph_capture_context
 

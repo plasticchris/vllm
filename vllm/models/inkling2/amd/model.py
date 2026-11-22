@@ -12,10 +12,8 @@ import regex as re
 import torch
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.distributed import (
-    tensor_model_parallel_all_reduce,
-    tensor_model_parallel_all_gather,
-)
+from vllm.distributed import tensor_model_parallel_all_gather
+from .target_collective import target_all_reduce
 from .ops.logits import InklingLogitsProcessor as LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -340,12 +338,10 @@ class Inkling2Model(nn.Module):
                         workspace, *mix_args, x=attn_partial, two_shot=attn_two_shot
                     )
                 else:
-                    attn_reduced = tensor_model_parallel_all_reduce(attn_partial)
+                    attn_reduced = target_all_reduce(attn_partial)
                     mlp_in = layer.attn_sconv.conv_mix(attn_reduced, *mix_args)
             else:
-                attn_out = layer.attn_sconv(
-                    tensor_model_parallel_all_reduce(attn_partial), positions
-                )
+                attn_out = layer.attn_sconv(target_all_reduce(attn_partial), positions)
                 if first:
                     mlp_in = self._mix(
                         stack[: num_blocks + 1], attn_out, mlp_query, layer.mlp_norm

@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
+    VLLM_ROCM_INKLING_PEER_PUSH_MAX_ROWS: int = 0
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -1348,6 +1349,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CudaCommunicator on ROCm. Also enables AITER AG/RS for DP communication.
     "VLLM_ROCM_USE_AITER_CUSTOM_AR": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_CUSTOM_AR", "True").lower() in ("true", "1")
+    ),
+    # Inkling-only, same-host gfx1100 TP4. 0=off, 8=one/eight rows,
+    # 32=also accept 32 rows. Requires the optional built peer-push module.
+    "VLLM_ROCM_INKLING_PEER_PUSH_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_ROCM_INKLING_PEER_PUSH_MAX_ROWS", "0")
     ),
     # Muse Spark on ROCm: dtype of the TP reduction before the post-expert norm.
     "VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE": lambda: os.getenv(

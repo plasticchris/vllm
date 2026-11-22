@@ -17,7 +17,7 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
-from vllm.distributed import tensor_model_parallel_all_reduce
+from .target_collective import target_all_reduce
 
 from ..configs import Inkling2ModelConfig
 from ..quant_config import Inkling2QuantConfig
@@ -272,7 +272,7 @@ class Inkling2LoopModel(Inkling2Model):
                 owner=owner,
             )
         else:
-            attn_reduced = tensor_model_parallel_all_reduce(attn_partial)
+            attn_reduced = target_all_reduce(attn_partial)
             mlp_in = layer.attn_sconv.conv_mix(attn_reduced, *mix_args, owner=owner)
         if messages is not None:
             assert isinstance(layer, Inkling2LoopDecoderLayer)

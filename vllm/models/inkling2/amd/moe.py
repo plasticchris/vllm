@@ -11,7 +11,6 @@ from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
@@ -20,6 +19,7 @@ from .ops.moe import expert_gemm, situ
 from .ops.combine import combine_experts
 from .ops.staged_experts import staged_expert_gemm
 from .ops.codebook import build_mx_codebook
+from .target_collective import target_all_reduce
 
 FUSED_COMBINE = os.environ.get("INKLING_FUSED_COMBINE", "0") == "1"
 STAGE_EXPERTS = os.environ.get("INKLING_STAGE_EXPERTS", "off")
@@ -178,5 +178,5 @@ class Inkling2MoE(nn.Module):
         )
         out = self.experts(x, ids, weights)
         if self.experts.ep_size > 1:
-            out = tensor_model_parallel_all_reduce(out)
+            out = target_all_reduce(out)
         return out
