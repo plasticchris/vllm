@@ -10,7 +10,7 @@ from vllm.triton_utils import triton, tl
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
-from .moe import _e2m1_bits, _e4m3_bits, _e4m3
+from .moe import _e2m1_bits, _e2m1_bf16_bits, _e4m3_bits, _e4m3, INTEGER_FP4
 from .tuning import expert_launch_config
 
 
@@ -25,6 +25,7 @@ def _unpack(
     TOTAL: tl.constexpr,
     NV: tl.constexpr,
     B: tl.constexpr,
+    INTEGER_DECODE: tl.constexpr = False,
 ):
     z = tl.program_id(0) * B + tl.arange(0, B)
     kk = z % K
@@ -36,9 +37,8 @@ def _unpack(
         s = tl.load(
             S.to(tl.pointer_type(tl.uint8)) + nn * (K // 16) + kk // 16, z < TOTAL, 0
         )
-        v = _e2m1_bits(c) * (
-            _e4m3_bits(s) * tl.load(G + ex, ex < TOTAL // N // K, other=1)
-        )
+        val = _e2m1_bf16_bits(c) if INTEGER_DECODE else _e2m1_bits(c)
+        v = val * (_e4m3_bits(s) * tl.load(G + ex, ex < TOTAL // N // K, other=1))
     else:
         raw = tl.load(W.to(tl.pointer_type(tl.uint8)) + z, z < TOTAL, 0)
         s = tl.load(S + nn * (K // 32) + kk // 32, z < TOTAL, 0)
@@ -114,6 +114,7 @@ def staged_expert_gemm(
         dense.numel(),
         nvfp4,
         1024,
+        INTEGER_DECODE=INTEGER_FP4,
         num_warps=4,
     )
     out = torch.zeros((ids.numel(), n), device=x.device, dtype=x.dtype)
